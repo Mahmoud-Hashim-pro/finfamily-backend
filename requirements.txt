@@ -1,0 +1,14 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
+python-dotenv==1.0.1
+pydantic[email]==2.10.4
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+python-jose[cryptography]==3.3.0
+slowapi==0.1.10
+pyotp==2.9.0
+qrcode[pil]==7.4.2
+resend==2.5.1
+openai==1.58.1
