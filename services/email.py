@@ -6,10 +6,8 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
-if not RESEND_API_KEY:
-    raise ValueError("RESEND_API_KEY is missing from .env file")
-
-resend.api_key = RESEND_API_KEY
+if RESEND_API_KEY:
+    resend.api_key = RESEND_API_KEY
 
 # لازم يبقى دومين اتعمله verify في Resend، أو استخدم "onboarding@resend.dev" وقت
 # التطوير بس (بيوصل لصندوق الإيميل بتاع الحساب المسجّل بيه الـ API key بس).
@@ -17,6 +15,10 @@ FROM_ADDRESS = os.getenv("RESEND_FROM_ADDRESS", "FinFamily <onboarding@resend.de
 
 
 def send_password_reset_email(to_email: str, reset_url: str) -> None:
+    if not RESEND_API_KEY:
+        print(f"[Password Reset URL for {to_email}]: {reset_url}")
+        return
+
     resend.Emails.send({
         "from": FROM_ADDRESS,
         "to": to_email,

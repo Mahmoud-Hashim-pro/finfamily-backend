@@ -14,10 +14,22 @@ from api.auth_routes import router as auth_router
 from api.family_routes import router as family_router
 from core.limiter import limiter
 
-# بناء الجداول في الداتا بيز بناءً على الـ Models
-Base.metadata.create_all(bind=engine)
+# بناء الجداول في الداتا بيز بناءً على الـ Models مع حماية من أخطاء الـ Startup
+try:
+    Base.metadata.create_all(bind=engine)
+except Exception as e:
+    print(f"[Notice] Database schema verification: {e}")
 
 app = FastAPI(title="FinFamily API")
+
+@app.get("/")
+def read_root():
+    return {
+        "status": "healthy",
+        "service": "FinFamily API",
+        "docs": "/docs",
+        "version": "1.0.0"
+    }
 
 # Rate limiting — بيحمي بالذات الـ login endpoints من Brute-force
 app.state.limiter = limiter

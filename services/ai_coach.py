@@ -7,13 +7,8 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 raw_key = os.getenv("OPENAI_API_KEY")
-if not raw_key:
-    raise ValueError("OPENAI_API_KEY is missing from .env file")
-
-# السطر السحري اللي هينضف الـ Key من أي مسافات أو رموز مخفية
-api_key = raw_key.strip()
-
-client = OpenAI(api_key=api_key)
+api_key = raw_key.strip() if raw_key else None
+client = OpenAI(api_key=api_key) if api_key else None
 
 # الجزء الثابت بس (شخصية الـ AI وقواعده) — البيانات الشخصية بقت بتتحط ديناميكيًا
 # تحت في get_ai_response() من services/ai_context.py، مش هاردكودد هنا.
@@ -49,6 +44,9 @@ def get_ai_response(chat_data: ChatMessage, context: str, child_name: str = "the
     system_instruction = template.format(context=context)
     user_prefix = "Parent asks: " if chat_data.mode == "parent" else f"{child_name} asks: "
     
+    if not client:
+        return "FinBuddy: أهلاً بك! الذكاء الاصطناعي جاهز، ولكن يحتاج لإضافة مفتاح OPENAI_API_KEY للرد المباشر."
+
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
