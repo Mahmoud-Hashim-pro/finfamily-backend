@@ -745,3 +745,74 @@ def my_badges(child: User = Depends(require_child), db: Session = Depends(get_db
         )
         for bd in BADGE_DEFS
     ]
+
+
+@router.get("/family/overview")
+def get_family_overview(parent: User = Depends(require_parent), db: Session = Depends(get_db)):
+    family = db.query(Family).filter(Family.id == parent.family_id).first()
+    if not family:
+        raise HTTPException(status_code=404, detail="Family not found")
+
+    children = db.query(User).filter(
+        User.family_id == parent.family_id,
+        User.role == UserRole.child
+    ).all()
+
+    total_balance = 0.0
+    children_out = []
+    for c in children:
+        w = db.query(Wallet).filter(Wallet.owner_id == c.id).first()
+        bal = float(w.balance) if w and w.balance else 0.0
+        total_balance += bal
+        children_out.append({
+            "id": c.id,
+            "full_name": c.full_name,
+            "avatar": "👦",
+            "balance": round(bal, 2),
+            "card_status": w.card_status.value if w else "active",
+            "card_number": w.card_number if w else "5061 •••• •••• 0000",
+            "level": c.level,
+            "xp": c.xp,
+        })
+
+    pending_missions = db.query(Mission).filter(
+        Mission.family_id == parent.family_id,
+        Mission.status == MissionStatus.submitted
+    ).count()
+
+    pending_purchases = db.query(CardPurchase).filter(
+        CardPurchase.family_id == parent.family_id,
+        CardPurchase.status == PurchaseStatus.pending
+    ).count()
+
+    recent_txns = db.query(Transaction).filter(
+        Transaction.family_id == parent.family_id
+    ).order_by(Transaction.created_date.desc()).limit(10).all()
+
+    txns_out = []
+    for t in recent_txns:
+        txns_out.append({
+            "id": t.id,
+            "merchant": t.description,
+            "amount": float(t.amount) if t.direction == TransactionDirection.credit else -float(t.amount),
+            "category": t.type.value,
+            "date": t.created_date.strftime("%Y-%m-%d %H:%M"),
+        })
+
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_txns = db.query(Transaction).filter(
+        Transaction.family_id == parent.family_id,
+        Transaction.direction == TransactionDirection.debit,
+        Transaction.created_date >= today_start
+    ).all()
+    total_spent_today = sum(float(t.amount) for t in today_txns)
+
+    return {
+        "family_name": family.name,
+        "family_code": family.family_code,
+        "total_balance": round(total_balance, 2),
+        "total_spent_today": round(total_spent_today, 2),
+        "pending_approvals_count": pending_missions + pending_purchases,
+        "children": children_out,
+        "recent_transactions": txns_out,
+    }

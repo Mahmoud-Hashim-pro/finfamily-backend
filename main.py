@@ -12,6 +12,7 @@ from db.database import engine, Base
 from api.routes import functions_router
 from api.auth_routes import router as auth_router
 from api.family_routes import router as family_router
+from api.admin_routes import router as admin_router
 from core.limiter import limiter
 
 # بناء الجداول في الداتا بيز بناءً على الـ Models مع حماية من أخطاء الـ Startup
@@ -55,3 +56,4 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(family_router)
 app.include_router(functions_router)
+app.include_router(admin_router)
