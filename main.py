@@ -32,6 +32,17 @@ def read_root():
         "version": "1.0.0"
     }
 
+@app.get("/api/app/version")
+@app.get("/app/version")
+def get_app_version():
+    return {
+        "latest_version": "1.0.1",
+        "build_number": 2,
+        "download_url": "https://github.com/Mahmoud-Hashim-pro/finfamily-mobile-app/releases/latest/download/app-release.apk",
+        "release_notes": "تحديث جديد لنظام FinFamily: إزالة البيانات التجريبية، ربط كامل بقاعدة البيانات السحابية، ورفع استقرار النظام.",
+        "is_mandatory": false
+    }
+
 # Rate limiting — بيحمي بالذات الـ login endpoints من Brute-force
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
