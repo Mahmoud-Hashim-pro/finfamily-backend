@@ -36,10 +36,10 @@ def read_root():
 @app.get("/app/version")
 def get_app_version():
     return {
-        "latest_version": "1.0.1",
-        "build_number": 2,
+        "latest_version": "1.0.2",
+        "build_number": 3,
         "download_url": "https://github.com/Mahmoud-Hashim-pro/finfamily-mobile-app/releases/latest/download/app-release.apk",
-        "release_notes": "تحديث جديد لنظام FinFamily: إزالة البيانات التجريبية، ربط كامل بقاعدة البيانات السحابية، ورفع استقرار النظام.",
+        "release_notes": "إضافة لوحة الإدارة والرقابة العليا (Super Admin Console) بالكامل داخل تطبيق الموبايل لمتابعة السيولة، أسطول كروت ميزة، العمليات الحية، ورادار الأمان.",
         "is_mandatory": False
     }
 
