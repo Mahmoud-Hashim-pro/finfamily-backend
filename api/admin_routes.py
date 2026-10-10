@@ -24,8 +24,17 @@ router = APIRouter(prefix="/api/admin", tags=["Admin Portal & Security Operation
 # Admin Access Control & Whitelist
 # ---------------------------------------------------------------------------
 
-DEFAULT_ADMINS = ["modyhashim2006@gmail.com", "pro.mahmoud.h@gmail.com"]
-raw_admins = os.getenv("ADMIN_EMAILS", "modyhashim2006@gmail.com,pro.mahmoud.h@gmail.com")
+DEFAULT_ADMINS = [
+    "modyhashim2006@gmail.com",
+    "pro.mahmoud.h@gmail.com",
+    "bassantmohamedelramlaw@gmail.com",
+    "abdallah.ahmed@finfamily.com",
+    "omar.osama.sw.dev@gmail.com",
+    "ashayman111@gmail.com",
+    "ramezrizkw@gmail.com",
+    "zyad.ahmed.softwareeng@gmail.com",
+]
+raw_admins = os.getenv("ADMIN_EMAILS", ",".join(DEFAULT_ADMINS))
 ADMIN_ALLOWLIST = {e.strip().lower() for e in raw_admins.split(",") if e.strip()}
 ADMIN_ALLOWLIST.update(DEFAULT_ADMINS)
 
@@ -70,10 +79,25 @@ def admin_login(payload: AdminLoginRequest, request: Request, db: Session = Depe
 
     user = db.query(User).filter(func.lower(User.email) == clean_email).first()
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User account not found. Please register the account first in FinFamily."
+        # Auto-provision super admin in FinFamily HQ
+        admin_family = db.query(Family).filter(Family.name == "FinFamily HQ").first()
+        if not admin_family:
+            admin_family = Family(name="FinFamily HQ", family_code="ADMINS")
+            db.add(admin_family)
+            db.commit()
+            db.refresh(admin_family)
+
+        name_part = clean_email.split("@")[0].replace(".", " ").title()
+        user = User(
+            family_id=admin_family.id,
+            role=UserRole.parent,
+            full_name=f"Admin {name_part}",
+            email=clean_email,
+            password_hash=hash_password(payload.password),
         )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
 
     if not user.password_hash or not verify_password(payload.password, user.password_hash):
         raise HTTPException(
