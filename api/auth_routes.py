@@ -12,6 +12,7 @@ from core.security import (
     hash_pin,
     verify_pin,
     create_access_token,
+    decode_access_token,
     generate_reset_token,
     hash_reset_token,
 )
@@ -34,6 +35,7 @@ from schemas.auth import (
     MfaSetupResponse,
     MfaEnableRequest,
     MfaDisableRequest,
+    MfaVerifyRequest,
     ForgotPasswordRequest,
     ForgotPasswordResponse,
     ResetPasswordRequest,
@@ -125,7 +127,8 @@ def login_parent(request: Request, payload: ParentLogin, db: Session = Depends(g
 
         elif not payload.otp_code:
             # مش خطأ — ده رد طبيعي بيقول للفرونت "اطلب الكود دلوقتي" من غير ما نرفض الطلب أو نديله token
-            return ParentLoginResult(mfa_required=True)
+            temp_token = create_access_token(user_id=user.id, family_id=user.family_id, role="mfa_pending")
+            return ParentLoginResult(mfa_required=True, temp_token=temp_token)
 
         elif not mfa.verify_totp(user.mfa_secret, payload.otp_code):
             log_action(
@@ -203,6 +206,7 @@ def list_my_children(user: User = Depends(get_current_user), db: Session = Depen
 # ---------------------------------------------------------------------------
 
 @router.post("/children/lookup", response_model=FamilyChildrenResponse)
+@router.post("/child/lookup", response_model=FamilyChildrenResponse)
 @limiter.limit("20/minute")
 def lookup_family_children(request: Request, payload: ChildLoginLookup, db: Session = Depends(get_db)):
     family = db.query(Family).filter(Family.family_code == payload.family_code.upper()).first()
@@ -214,6 +218,7 @@ def lookup_family_children(request: Request, payload: ChildLoginLookup, db: Sess
 
 
 @router.post("/child-login", response_model=TokenResponse)
+@router.post("/child/login", response_model=TokenResponse)
 @limiter.limit("10/minute")
 def child_login(request: Request, payload: ChildLogin, db: Session = Depends(get_db)):
     family = db.query(Family).filter(Family.family_code == payload.family_code.upper()).first()
@@ -462,6 +467,42 @@ def regenerate_recovery_codes(
     db.commit()
 
     return RecoveryCodesResponse(codes=codes)
+
+
+@router.post("/mfa/verify", response_model=TokenResponse)
+@limiter.limit("10/minute")
+def verify_mfa_login(request: Request, payload: MfaVerifyRequest, db: Session = Depends(get_db)):
+    try:
+        data = decode_access_token(payload.temp_token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired temporary session")
+
+    user_id = data.get("sub")
+    role = data.get("role")
+    if not user_id or role != "mfa_pending":
+        raise HTTPException(status_code=401, detail="Invalid MFA token")
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or not user.mfa_enabled:
+        raise HTTPException(status_code=401, detail="User not found or MFA not enabled")
+
+    if not mfa.verify_totp(user.mfa_secret, payload.code):
+        log_action(
+            db, request=request, action="mfa_failed",
+            actor_id=user.id, actor_role="parent", family_id=user.family_id,
+        )
+        db.commit()
+        raise HTTPException(status_code=401, detail="Invalid authentication code")
+
+    log_action(
+        db, request=request, action="login_success",
+        actor_id=user.id, actor_role="parent", family_id=user.family_id,
+        detail={"mfa_used": True},
+    )
+    db.commit()
+
+    token = create_access_token(user_id=user.id, family_id=user.family_id, role="parent")
+    return TokenResponse(access_token=token, token_type="bearer", user=UserResponse.model_validate(user))
 
 
 # ---------------------------------------------------------------------------

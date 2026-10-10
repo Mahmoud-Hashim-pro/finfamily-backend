@@ -40,7 +40,7 @@ def get_app_version():
         "build_number": 2,
         "download_url": "https://github.com/Mahmoud-Hashim-pro/finfamily-mobile-app/releases/latest/download/app-release.apk",
         "release_notes": "تحديث جديد لنظام FinFamily: إزالة البيانات التجريبية، ربط كامل بقاعدة البيانات السحابية، ورفع استقرار النظام.",
-        "is_mandatory": false
+        "is_mandatory": False
     }
 
 # Rate limiting — بيحمي بالذات الـ login endpoints من Brute-force

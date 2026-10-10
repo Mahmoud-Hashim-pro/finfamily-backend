@@ -24,8 +24,8 @@ router = APIRouter(prefix="/api/admin", tags=["Admin Portal & Security Operation
 # Admin Access Control & Whitelist
 # ---------------------------------------------------------------------------
 
-DEFAULT_ADMINS = ["modyhashim2006@gmail.com"]
-raw_admins = os.getenv("ADMIN_EMAILS", "modyhashim2006@gmail.com")
+DEFAULT_ADMINS = ["modyhashim2006@gmail.com", "pro.mahmoud.h@gmail.com"]
+raw_admins = os.getenv("ADMIN_EMAILS", "modyhashim2006@gmail.com,pro.mahmoud.h@gmail.com")
 ADMIN_ALLOWLIST = {e.strip().lower() for e in raw_admins.split(",") if e.strip()}
 ADMIN_ALLOWLIST.update(DEFAULT_ADMINS)
 

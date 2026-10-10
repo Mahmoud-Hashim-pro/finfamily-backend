@@ -53,8 +53,14 @@ class ParentLoginResult(BaseModel):
     mfa_required: bool = False
     access_token: Optional[str] = None
     token_type: Optional[str] = None
+    temp_token: Optional[str] = None
     user: Optional[UserResponse] = None
     used_recovery_code: bool = False  # لو دخل بكود استرجاع — الفرونت لازم ينبهه يولّد أكواد جديدة
+
+
+class MfaVerifyRequest(BaseModel):
+    temp_token: str
+    code: str
 
 
 # ---------- MFA (الأب بس) ----------
