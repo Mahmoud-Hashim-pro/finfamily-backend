@@ -36,10 +36,10 @@ def read_root():
 @app.get("/app/version")
 def get_app_version():
     return {
-        "latest_version": "1.0.3",
-        "build_number": 4,
+        "latest_version": "1.0.4",
+        "build_number": 5,
         "download_url": "https://github.com/Mahmoud-Hashim-pro/finfamily-mobile-app/releases/latest/download/app-release.apk",
-        "release_notes": "تحديث رمز PIN للأطفال إلى 6 أرقام لتطابق معايير الأمان والباك إند، وتحديث لوحة التحكم تلقائياً عند الرجوع إليها، مع لوحة تحكم السوبر أدمن.",
+        "release_notes": "ميزة التحديث المباشر من داخل التطبيق: تنزيل وتثبيت التحديث بشريط تقدم ذكي ودون الحاجة لفتح المتصفح.",
         "is_mandatory": False
     }
 
