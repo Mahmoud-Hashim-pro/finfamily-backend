@@ -36,10 +36,10 @@ def read_root():
 @app.get("/app/version")
 def get_app_version():
     return {
-        "latest_version": "1.0.4",
-        "build_number": 5,
+        "latest_version": "1.0.5",
+        "build_number": 6,
         "download_url": "https://github.com/Mahmoud-Hashim-pro/finfamily-mobile-app/releases/latest/download/app-release.apk",
-        "release_notes": "ميزة التحديث المباشر من داخل التطبيق: تنزيل وتثبيت التحديث بشريط تقدم ذكي ودون الحاجة لفتح المتصفح.",
+        "release_notes": "إضافة الشاشة الافتتاحية الرسمية (Official Splash Screen) بجودة فائقة وتأثير انتقال سينمائي سلس، مع شاشات الطفل الحية.",
         "is_mandatory": False
     }
 
