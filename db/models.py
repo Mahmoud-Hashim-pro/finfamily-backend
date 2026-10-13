@@ -5,7 +5,7 @@ import string
 from datetime import datetime
 import enum
 
-from sqlalchemy import Column, String, DateTime, Enum, ForeignKey, Float, Integer, JSON, Boolean, UniqueConstraint
+from sqlalchemy import Column, String, DateTime, Enum, ForeignKey, Float, Integer, JSON, Boolean, UniqueConstraint, Numeric
 from sqlalchemy.orm import relationship, synonym
 
 from .database import Base
@@ -138,12 +138,12 @@ class Wallet(Base):
     owner_id = Column(String, ForeignKey("users.id"), unique=True, nullable=False, index=True)
     owner = relationship("User", back_populates="wallet")
 
-    balance = Column(Float, default=0.0)          # الكوينز/الفلوس المتاحة للصرف
-    savings_balance = Column(Float, default=0.0)  # إجمالي الادخار عبر كل الأهداف
+    balance = Column(Numeric(12, 2), default=0.0)          # الكوينز/الفلوس المتاحة للصرف
+    savings_balance = Column(Numeric(12, 2), default=0.0)  # إجمالي الادخار عبر كل الأهداف
 
-    daily_limit = Column(Float, nullable=True)
-    weekly_limit = Column(Float, nullable=True)
-    monthly_limit = Column(Float, nullable=True)
+    daily_limit = Column(Numeric(12, 2), nullable=True)
+    weekly_limit = Column(Numeric(12, 2), nullable=True)
+    monthly_limit = Column(Numeric(12, 2), nullable=True)
     blocked_categories = Column(JSON, default=list)  # ["Entertainment", ...]
 
     card_status = Column(Enum(CardStatus), default=CardStatus.active)
@@ -169,8 +169,8 @@ class SavingsGoal(Base):
     name = Column(String, nullable=False)
     icon = Column(String, default="🎯")
     color = Column(String, default="#00B894")
-    target = Column(Float, nullable=False)
-    current = Column(Float, default=0.0)
+    target = Column(Numeric(12, 2), nullable=False)
+    current = Column(Numeric(12, 2), default=0.0)
 
     created_date = Column(DateTime, default=datetime.utcnow)
     updated_date = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -196,7 +196,7 @@ class Mission(Base):
     title = Column(String, nullable=False)
     category = Column(String, default="Home")
     icon = Column(String, default="✅")
-    reward = Column(Float, nullable=False)  # قيمة المكافأة (chore) أو التكلفة (redemption)
+    reward = Column(Numeric(12, 2), nullable=False)  # قيمة المكافأة (chore) أو التكلفة (redemption)
     due_label = Column(String, nullable=True)  # نص وصفي زي "Today" / "Tomorrow" (مش تاريخ دقيق دلوقتي)
 
     reviewed_by_id = Column(String, nullable=True)
@@ -219,7 +219,7 @@ class Transaction(Base):
 
     type = Column(Enum(TransactionType), nullable=False)
     direction = Column(Enum(TransactionDirection), nullable=False)
-    amount = Column(Float, nullable=False)
+    amount = Column(Numeric(12, 2), nullable=False)
     description = Column(String, nullable=False)
 
     created_date = Column(DateTime, default=datetime.utcnow)
@@ -244,7 +244,7 @@ class CardPurchase(Base):
     merchant = Column(String, nullable=False)
     category = Column(String, default="Other")
     location = Column(String, nullable=True)
-    amount = Column(Float, nullable=False)
+    amount = Column(Numeric(12, 2), nullable=False)
 
     status = Column(Enum(PurchaseStatus), nullable=False, default=PurchaseStatus.pending)
     decline_reason = Column(String, nullable=True)  # ليه اترفضت فورًا (فئة محظورة / كارت مجمد...)
@@ -272,7 +272,7 @@ class GameCompletion(Base):
     total = Column(Float, nullable=False)
 
     xp_awarded = Column(Integer, default=0)
-    coins_awarded = Column(Float, default=0)
+    coins_awarded = Column(Numeric(12, 2), default=0.0)
     was_rewarded = Column(Boolean, default=True)  # False لو ده تكرار نفس اللعبة في نفس اليوم
     reward_date = Column(String, nullable=True, index=True)  # YYYY-MM-DD لو أخد مكافأة، None لو تكرار
     completion_date = Column(String, nullable=True, index=True)  # YYYY-MM-DD (alias/daily completion date)
@@ -362,3 +362,34 @@ class MfaRecoveryCode(Base):
     used_date = Column(DateTime, nullable=True)
 
     created_date = Column(DateTime, default=datetime.utcnow)
+
+
+class IdempotencyRecord(Base):
+    """
+    سجل فريد ومحصن (Atomic & Unique) لمنع العمليات المالية المتكررة الناتجة عن التزامن أو انقطاع الشبكة.
+    """
+    __tablename__ = "idempotency_records"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
+    key = Column(String(128), unique=True, index=True, nullable=False)
+    family_id = Column(String, ForeignKey("families.id"), nullable=True, index=True)
+    user_id = Column(String, ForeignKey("users.id"), nullable=True, index=True)
+    action = Column(String, nullable=False)
+    created_date = Column(DateTime, default=datetime.utcnow)
+
+
+class LessonCompletion(Base):
+    """
+    سجل إتمام الدروس التعليمية المالية للطفل لمنع تكرار مكافآت الـ XP وتوثيق التقدم في السيرفر.
+    """
+    __tablename__ = "lesson_completions"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
+    child_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    lesson_id = Column(String, nullable=False, index=True)
+    xp_awarded = Column(Integer, default=0)
+    created_date = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("child_id", "lesson_id", name="uq_child_lesson"),
+    )

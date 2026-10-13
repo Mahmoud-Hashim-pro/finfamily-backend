@@ -61,7 +61,7 @@ def read_root():
         "status": status_str,
         "service": "FinFamily API",
         "docs": None if is_production else "/docs",
-        "version": os.getenv("APP_VERSION", "1.0.5")
+        "version": os.getenv("APP_VERSION", "1.0.6")
     }
     return JSONResponse(
         status_code=200 if status_str == "healthy" else 503,
@@ -72,18 +72,19 @@ def read_root():
 @app.get("/api/app/version")
 @app.get("/app/version")
 def get_app_version():
-    version = os.getenv("APP_VERSION", "1.0.5")
-    build_num = int(os.getenv("APP_BUILD_NUMBER", "6"))
+    version = os.getenv("APP_VERSION", "1.0.6")
+    build_num = int(os.getenv("APP_BUILD_NUMBER", "7"))
     min_version = os.getenv("MIN_SUPPORTED_VERSION", "1.0.0")
     download_url = os.getenv(
         "APP_DOWNLOAD_URL",
-        "https://github.com/Mahmoud-Hashim-pro/finfamily-mobile-app/releases/latest/download/app-release.apk"
+        "https://github.com/Mahmoud-Hashim-pro/finfamily-mobile-app/releases/download/v1.0.6/FinFamily-v1.0.6.apk"
     )
     is_mandatory = os.getenv("APP_IS_MANDATORY", "false").strip().lower() in ("true", "1", "yes")
     release_notes = os.getenv(
         "APP_RELEASE_NOTES",
-        "إضافة الشاشة الافتتاحية الرسمية (Official Splash Screen) بجودة فائقة وتأثير انتقال سينمائي سلس، مع شاشات الطفل الحية."
+        "إصدار رسمي v1.0.6: تحصين العمليات المالية بالتزامن الدقيق، حماية مكافآت الألعاب في السيرفر، وتحديثات شاملة للأمان وكارت ميزة التعليمي."
     )
+    file_hash = os.getenv("APP_SHA256", "")
 
     return {
         "version": version,
@@ -93,7 +94,8 @@ def get_app_version():
         "min_supported_version": min_version,
         "download_url": download_url,
         "release_notes": release_notes,
-        "is_mandatory": is_mandatory
+        "is_mandatory": is_mandatory,
+        "sha256": file_hash,
     }
 
 # Rate limiting — بيحمي بالذات الـ login endpoints من Brute-force

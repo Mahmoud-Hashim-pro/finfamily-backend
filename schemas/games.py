@@ -8,8 +8,9 @@ from schemas.badges import BadgeOut
 
 class GameCompleteRequest(BaseModel):
     game_id: str
-    score: float = Field(ge=0)
-    total: float = Field(gt=0)
+    score: float = Field(ge=0, default=0.0)
+    total: float = Field(gt=0, default=1.0)
+    selected_option: str | None = None
 
 
 class GameCompleteResponse(BaseModel):

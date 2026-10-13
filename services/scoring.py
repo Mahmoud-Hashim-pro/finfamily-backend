@@ -35,9 +35,11 @@ def compute_financial_score(db: Session, wallet: Wallet, child: User) -> int:
     score = 50.0
 
     # 1) نسبة الادخار
-    total_funds = wallet.balance + wallet.savings_balance
+    bal = float(wallet.balance or 0)
+    sav = float(wallet.savings_balance or 0)
+    total_funds = bal + sav
     if total_funds > 0:
-        savings_ratio = wallet.savings_balance / total_funds
+        savings_ratio = sav / total_funds
         score += savings_ratio * 20
 
     # 2) الالتزام بتنفيذ المهام (chores بس، مش طلبات الصرف)
@@ -62,11 +64,15 @@ def compute_financial_score(db: Session, wallet: Wallet, child: User) -> int:
     # 4) الالتزام بحدود الصرف — خصم لو الطفل تخطى أي حد حدده الأب (بيشمل طلبات الصرف ومشتريات الكارت مع بعض)
     now = datetime.utcnow()
     penalty = 0
-    if wallet.daily_limit is not None and _debit_spend_since(db, wallet.id, now - timedelta(days=1)) > wallet.daily_limit:
+    d_lim = float(wallet.daily_limit) if wallet.daily_limit is not None else None
+    w_lim = float(wallet.weekly_limit) if wallet.weekly_limit is not None else None
+    m_lim = float(wallet.monthly_limit) if wallet.monthly_limit is not None else None
+
+    if d_lim is not None and _debit_spend_since(db, wallet.id, now - timedelta(days=1)) > d_lim:
         penalty += 7
-    if wallet.weekly_limit is not None and _debit_spend_since(db, wallet.id, now - timedelta(days=7)) > wallet.weekly_limit:
+    if w_lim is not None and _debit_spend_since(db, wallet.id, now - timedelta(days=7)) > w_lim:
         penalty += 7
-    if wallet.monthly_limit is not None and _debit_spend_since(db, wallet.id, now - timedelta(days=30)) > wallet.monthly_limit:
+    if m_lim is not None and _debit_spend_since(db, wallet.id, now - timedelta(days=30)) > m_lim:
         penalty += 6
     score -= penalty
 

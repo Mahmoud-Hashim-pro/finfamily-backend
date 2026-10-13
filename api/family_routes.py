@@ -3,14 +3,16 @@ from datetime import datetime, timedelta
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from sqlalchemy.exc import IntegrityError
 from db.database import get_db
 from db.models import (
     Family, User, UserRole, Wallet, SavingsGoal, Mission, MissionKind, MissionStatus,
     Transaction, TransactionType, TransactionDirection,
     CardStatus, CardPurchase, PurchaseStatus, _generate_card_number,
-    GameCompletion, AuditLog, UserBadge,
+    GameCompletion, AuditLog, UserBadge, IdempotencyRecord, LessonCompletion,
 )
 from core.deps import get_current_user, require_parent, require_child
 from core.audit import log_action
@@ -50,6 +52,16 @@ def validate_money(amount: float) -> float:
             detail="Amount must be a finite number greater than 0 and up to 1,000,000",
         )
     return round(amount, 2)
+
+
+from decimal import Decimal
+
+def to_decimal(val) -> Decimal:
+    if val is None:
+        return Decimal("0.00")
+    if isinstance(val, Decimal):
+        return val
+    return Decimal(str(round(float(val), 2)))
 
 
 def _get_family_child(db: Session, family_id: str, child_id: str) -> User:
@@ -101,14 +113,18 @@ def _over_any_limit(db: Session, wallet: Wallet, extra_amount: float) -> bool:
     """
     now = datetime.utcnow()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    extra_dec = to_decimal(extra_amount)
     if wallet.daily_limit is not None:
-        if wallet.daily_limit == 0.0 or _debit_spend_since(db, wallet.id, today_start) + extra_amount > wallet.daily_limit:
+        lim = to_decimal(wallet.daily_limit)
+        if lim == Decimal("0.00") or to_decimal(_debit_spend_since(db, wallet.id, today_start)) + extra_dec > lim:
             return True
     if wallet.weekly_limit is not None:
-        if wallet.weekly_limit == 0.0 or _debit_spend_since(db, wallet.id, now - timedelta(days=7)) + extra_amount > wallet.weekly_limit:
+        lim = to_decimal(wallet.weekly_limit)
+        if lim == Decimal("0.00") or to_decimal(_debit_spend_since(db, wallet.id, now - timedelta(days=7))) + extra_dec > lim:
             return True
     if wallet.monthly_limit is not None:
-        if wallet.monthly_limit == 0.0 or _debit_spend_since(db, wallet.id, now - timedelta(days=30)) + extra_amount > wallet.monthly_limit:
+        lim = to_decimal(wallet.monthly_limit)
+        if lim == Decimal("0.00") or to_decimal(_debit_spend_since(db, wallet.id, now - timedelta(days=30))) + extra_dec > lim:
             return True
     return False
 
@@ -252,24 +268,28 @@ def send_allowance(
 
     wallet = _get_wallet_for(db, child, for_update=True)
 
-    # BUG-074: Support optional idempotency key on allowance transfers
+    # Dedicated atomic idempotency check via IdempotencyRecord with UNIQUE constraint
     idempotency_key = request.headers.get("X-Idempotency-Key") or request.headers.get("Idempotency-Key") or payload.idempotency_key
     if idempotency_key:
-        recent_logs = (
-            db.query(AuditLog)
-            .filter(
-                AuditLog.family_id == parent.family_id,
-                AuditLog.action == "allowance_sent",
-            )
-            .order_by(AuditLog.created_date.desc())
-            .limit(100)
-            .all()
-        )
-        for log_entry in recent_logs:
-            if log_entry.detail and log_entry.detail.get("idempotency_key") == idempotency_key:
-                return _wallet_out(db, wallet, child)
+        clean_key = str(idempotency_key).strip()
+        existing_rec = db.query(IdempotencyRecord).filter(IdempotencyRecord.key == clean_key).first()
+        if existing_rec:
+            return _wallet_out(db, wallet, child)
 
-    wallet.balance = round(wallet.balance + payload.amount, 2)
+        try:
+            db.add(IdempotencyRecord(
+                key=clean_key,
+                family_id=parent.family_id,
+                user_id=parent.id,
+                action="allowance_sent",
+            ))
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            wallet = _get_wallet_for(db, child, for_update=False)
+            return _wallet_out(db, wallet, child)
+
+    wallet.balance = round(to_decimal(wallet.balance) + to_decimal(payload.amount), 2)
     _log_transaction(
         db, wallet, parent.family_id,
         TransactionType.allowance, TransactionDirection.credit,
@@ -327,17 +347,17 @@ def deposit_to_goal(
     if not goal:
         raise HTTPException(status_code=404, detail="Savings goal not found")
 
-    if wallet.balance < payload.amount:
+    if to_decimal(wallet.balance) < to_decimal(payload.amount):
         raise HTTPException(status_code=400, detail="Not enough balance in wallet")
 
     # BUG-030: enforce goal target cap
-    if round(goal.current + payload.amount, 2) > goal.target:
+    if round(to_decimal(goal.current) + to_decimal(payload.amount), 2) > to_decimal(goal.target):
         raise HTTPException(status_code=400, detail="Deposit exceeds savings goal target")
 
     # التحويل: من الرصيد المتاح إلى هدف الادخار
-    wallet.balance = round(wallet.balance - payload.amount, 2)
-    wallet.savings_balance = round(wallet.savings_balance + payload.amount, 2)
-    goal.current = round(goal.current + payload.amount, 2)
+    wallet.balance = round(to_decimal(wallet.balance) - to_decimal(payload.amount), 2)
+    wallet.savings_balance = round(to_decimal(wallet.savings_balance) + to_decimal(payload.amount), 2)
+    goal.current = round(to_decimal(goal.current) + to_decimal(payload.amount), 2)
 
     _log_transaction(
         db, wallet, child.family_id,
@@ -368,13 +388,13 @@ def withdraw_from_goal(
     if not goal:
         raise HTTPException(status_code=404, detail="Savings goal not found")
 
-    if goal.current < payload.amount:
+    if to_decimal(goal.current) < to_decimal(payload.amount):
         raise HTTPException(status_code=400, detail="Not enough savings in this goal")
 
     # التحويل العكسي: من هدف الادخار إلى الرصيد المتاح
-    goal.current = round(goal.current - payload.amount, 2)
-    wallet.savings_balance = round(max(0.0, wallet.savings_balance - payload.amount), 2)
-    wallet.balance = round(wallet.balance + payload.amount, 2)
+    goal.current = round(to_decimal(goal.current) - to_decimal(payload.amount), 2)
+    wallet.savings_balance = round(max(Decimal("0.00"), to_decimal(wallet.savings_balance) - to_decimal(payload.amount)), 2)
+    wallet.balance = round(to_decimal(wallet.balance) + to_decimal(payload.amount), 2)
 
     _log_transaction(
         db, wallet, child.family_id,
@@ -401,10 +421,10 @@ def delete_goal(
     if not goal:
         raise HTTPException(status_code=404, detail="Savings goal not found")
 
-    refund_amount = round(goal.current, 2)
-    if refund_amount > 0:
-        wallet.balance = round(wallet.balance + refund_amount, 2)
-        wallet.savings_balance = round(max(0.0, wallet.savings_balance - refund_amount), 2)
+    refund_amount = round(to_decimal(goal.current), 2)
+    if refund_amount > Decimal("0.00"):
+        wallet.balance = round(to_decimal(wallet.balance) + refund_amount, 2)
+        wallet.savings_balance = round(max(Decimal("0.00"), to_decimal(wallet.savings_balance) - refund_amount), 2)
         _log_transaction(
             db, wallet, child.family_id,
             TransactionType.savings_transfer, TransactionDirection.credit,
@@ -513,7 +533,7 @@ def review_mission(
         mission.status = MissionStatus.rejected
     else:
         if mission.kind == MissionKind.chore:
-            wallet.balance = round(wallet.balance + mission.reward, 2)
+            wallet.balance = round(to_decimal(wallet.balance) + to_decimal(mission.reward), 2)
             apply_xp(child, int(mission.reward))
             _log_transaction(
                 db, wallet, parent.family_id,
@@ -521,9 +541,9 @@ def review_mission(
                 mission.reward, mission.title, mission_id=mission.id,
             )
         else:  # redemption
-            if wallet.balance < mission.reward:
+            if to_decimal(wallet.balance) < to_decimal(mission.reward):
                 raise HTTPException(status_code=400, detail="Child doesn't have enough balance for this redemption")
-            wallet.balance = round(wallet.balance - mission.reward, 2)
+            wallet.balance = round(to_decimal(wallet.balance) - to_decimal(mission.reward), 2)
             _log_transaction(
                 db, wallet, parent.family_id,
                 TransactionType.redemption, TransactionDirection.debit,
@@ -624,12 +644,12 @@ def make_purchase(payload: CardPurchaseCreate, child: User = Depends(require_chi
         purchase = _instant(PurchaseStatus.rejected, f"Card is {wallet.card_status.value}")
     elif payload.category in (wallet.blocked_categories or []):
         purchase = _instant(PurchaseStatus.rejected, f"{payload.category} is a blocked category")
-    elif wallet.balance < payload.amount:
+    elif to_decimal(wallet.balance) < to_decimal(payload.amount):
         purchase = _instant(PurchaseStatus.rejected, "Not enough balance")
     elif _over_any_limit(db, wallet, payload.amount):
         purchase = _instant(PurchaseStatus.pending)
     else:
-        wallet.balance = round(wallet.balance - payload.amount, 2)
+        wallet.balance = round(to_decimal(wallet.balance) - to_decimal(payload.amount), 2)
         purchase = _instant(PurchaseStatus.completed)
         _log_transaction(
             db, wallet, child.family_id,
@@ -669,10 +689,10 @@ def review_purchase(
             raise HTTPException(status_code=400, detail=f"Card is {wallet.card_status.value}")
         if purchase.category in (wallet.blocked_categories or []):
             raise HTTPException(status_code=400, detail=f"{purchase.category} is a blocked category")
-        if wallet.balance < purchase.amount:
+        if to_decimal(wallet.balance) < to_decimal(purchase.amount):
             raise HTTPException(status_code=400, detail="Child doesn't have enough balance anymore")
 
-        wallet.balance = round(wallet.balance - purchase.amount, 2)
+        wallet.balance = round(to_decimal(wallet.balance) - to_decimal(purchase.amount), 2)
         purchase.status = PurchaseStatus.completed
         _log_transaction(
             db, wallet, parent.family_id,
@@ -810,7 +830,7 @@ def list_audit_logs(
 
 @router.post("/games/complete", response_model=GameCompleteResponse)
 def complete_game(payload: GameCompleteRequest, child: User = Depends(require_child), db: Session = Depends(get_db)):
-    result = compute_reward(payload.game_id, payload.score, payload.total)
+    result = compute_reward(payload.game_id, payload.score, payload.total, payload.selected_option)
     if not result:
         raise HTTPException(status_code=404, detail="Unknown game_id")
     title, xp_awarded, coins_awarded = result
@@ -836,7 +856,7 @@ def complete_game(payload: GameCompleteRequest, child: User = Depends(require_ch
     if already_today:
         xp_awarded, coins_awarded = 0, 0
     else:
-        wallet.balance = round(wallet.balance + coins_awarded, 2)
+        wallet.balance = round(to_decimal(wallet.balance) + to_decimal(coins_awarded), 2)
         leveled_up = apply_xp(child, xp_awarded)
         _log_transaction(
             db, wallet, child.family_id,
@@ -863,7 +883,7 @@ def complete_game(payload: GameCompleteRequest, child: User = Depends(require_ch
     perfect_bonus_xp, perfect_bonus_coins = 0, 0
     if any(b["id"] == "perfect_day" for b in newly_unlocked):
         perfect_bonus_xp, perfect_bonus_coins = PERFECT_DAY_BONUS_XP, PERFECT_DAY_BONUS_COINS
-        wallet.balance = round(wallet.balance + perfect_bonus_coins, 2)
+        wallet.balance = round(to_decimal(wallet.balance) + to_decimal(perfect_bonus_coins), 2)
         if apply_xp(child, perfect_bonus_xp):
             leveled_up = True
         _log_transaction(
@@ -895,6 +915,72 @@ def complete_game(payload: GameCompleteRequest, child: User = Depends(require_ch
         perfect_day_bonus_xp=perfect_bonus_xp,
         perfect_day_bonus_coins=perfect_bonus_coins,
     )
+
+
+class LessonCompleteRequest(BaseModel):
+    lesson_id: str
+    xp: int = Field(ge=0, le=500, default=20)
+
+
+@router.get("/lessons/completed", response_model=List[str])
+def get_completed_lessons(child: User = Depends(require_child), db: Session = Depends(get_db)):
+    """
+    Returns list of completed lesson IDs for the current authenticated child.
+    """
+    records = db.query(LessonCompletion).filter(LessonCompletion.child_id == child.id).all()
+    return [r.lesson_id for r in records]
+
+
+@router.post("/lessons/complete")
+def complete_lesson(payload: LessonCompleteRequest, child: User = Depends(require_child), db: Session = Depends(get_db)):
+    """
+    Records lesson completion in DB, awards XP once per lesson atomically, and touches streak.
+    """
+    clean_id = payload.lesson_id.strip()
+    existing = db.query(LessonCompletion).filter(
+        LessonCompletion.child_id == child.id,
+        LessonCompletion.lesson_id == clean_id,
+    ).first()
+
+    if existing:
+        return {
+            "lesson_id": clean_id,
+            "already_completed": True,
+            "xp_awarded": 0,
+            "current_xp": child.xp,
+            "current_level": child.level,
+        }
+
+    try:
+        db.add(LessonCompletion(
+            child_id=child.id,
+            lesson_id=clean_id,
+            xp_awarded=payload.xp,
+        ))
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        return {
+            "lesson_id": clean_id,
+            "already_completed": True,
+            "xp_awarded": 0,
+            "current_xp": child.xp,
+            "current_level": child.level,
+        }
+
+    leveled_up = apply_xp(child, payload.xp)
+    touch_streak(child)
+    db.commit()
+    db.refresh(child)
+
+    return {
+        "lesson_id": clean_id,
+        "already_completed": False,
+        "xp_awarded": payload.xp,
+        "leveled_up": leveled_up,
+        "current_xp": child.xp,
+        "current_level": child.level,
+    }
 
 
 @router.get("/badges/mine", response_model=List[BadgeOut])
