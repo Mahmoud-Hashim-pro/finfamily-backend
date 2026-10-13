@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional, List
 
-from pydantic import BaseModel, EmailStr, ConfigDict, Field
+from pydantic import BaseModel, EmailStr, ConfigDict, Field, field_validator
 
 from db.models import UserRole
 
@@ -13,6 +13,7 @@ class UserResponse(BaseModel):
     family_id: str
     role: UserRole
     full_name: str
+    avatar_url: Optional[str] = None
     email: Optional[EmailStr] = None
     xp: int = 0
     level: int = 1
@@ -32,17 +33,38 @@ class TokenResponse(BaseModel):
 # ---------- Parent registration / login ----------
 
 class ParentRegister(BaseModel):
-    family_name: str = Field(min_length=1)
-    full_name: str = Field(min_length=1)
-    email: EmailStr
-    password: str = Field(min_length=8)
+    family_name: str = Field(min_length=1, max_length=100)
+    full_name: str = Field(min_length=1, max_length=100)
+    email: EmailStr = Field(max_length=255)
+    password: str = Field(min_length=8, max_length=72)
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, v):
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
+
+    @field_validator("password", mode="after")
+    @classmethod
+    def check_password_bytes(cls, v: str) -> str:
+        if v and len(v.encode("utf-8")) > 72:
+            raise ValueError("Password must not exceed 72 bytes")
+        return v
 
 
 class ParentLogin(BaseModel):
-    email: EmailStr
-    password: str
-    otp_code: Optional[str] = None       # كود TOTP عادي من تطبيق الـ Authenticator
-    recovery_code: Optional[str] = None  # بديل لو فقد جهاز الـ Authenticator (زي "7K4M-QX2P")
+    email: EmailStr = Field(max_length=255)
+    password: str = Field(min_length=1, max_length=72)
+    otp_code: Optional[str] = Field(default=None, max_length=16)       # كود TOTP عادي من تطبيق الـ Authenticator
+    recovery_code: Optional[str] = Field(default=None, max_length=64)  # بديل لو فقد جهاز الـ Authenticator (زي "7K4M-QX2P-...")
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, v):
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
 
 
 class ParentLoginResult(BaseModel):
@@ -59,8 +81,8 @@ class ParentLoginResult(BaseModel):
 
 
 class MfaVerifyRequest(BaseModel):
-    temp_token: str
-    code: str
+    temp_token: str = Field(min_length=1, max_length=2048)
+    code: str = Field(min_length=6, max_length=16)
 
 
 # ---------- MFA (الأب بس) ----------
@@ -75,12 +97,18 @@ class MfaSetupResponse(BaseModel):
     qr_code_data_uri: str    # data:image/png;base64,... يتحط مباشرة في <img>
 
 
+class MfaSetupRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=72)
+
+
 class MfaEnableRequest(BaseModel):
     code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
 
 
 class MfaDisableRequest(BaseModel):
-    password: str  # تأكيد بالباسورد الحالي قبل ما نقفل MFA
+    password: str = Field(min_length=1, max_length=72)  # تأكيد بالباسورد الحالي
+    code: Optional[str] = Field(default=None, max_length=16)  # TOTP code second factor (BUG-116)
+    recovery_code: Optional[str] = Field(default=None, max_length=64)  # Recovery code alternative (BUG-116)
 
 
 class RecoveryCodesResponse(BaseModel):
@@ -92,10 +120,17 @@ class RecoveryCodesStatus(BaseModel):
     remaining: int
 
 
-# ---------- Forgot / reset password (الأب بس) ----------
+# ---------- Forgot / reset / change password (الأب بس) ----------
 
 class ForgotPasswordRequest(BaseModel):
-    email: EmailStr
+    email: EmailStr = Field(max_length=255)
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, v):
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
 
 
 class ForgotPasswordResponse(BaseModel):
@@ -105,20 +140,47 @@ class ForgotPasswordResponse(BaseModel):
 
 
 class ResetPasswordRequest(BaseModel):
-    token: str
-    new_password: str = Field(min_length=8)
+    token: str = Field(min_length=1, max_length=255)
+    new_password: str = Field(min_length=8, max_length=72)
+
+    @field_validator("new_password", mode="after")
+    @classmethod
+    def check_password_bytes(cls, v: str) -> str:
+        if v and len(v.encode("utf-8")) > 72:
+            raise ValueError("Password must not exceed 72 bytes")
+        return v
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=72)
+    new_password: str = Field(min_length=8, max_length=72)
+
+    @field_validator("new_password", mode="after")
+    @classmethod
+    def check_password_bytes(cls, v: str) -> str:
+        if v and len(v.encode("utf-8")) > 72:
+            raise ValueError("Password must not exceed 72 bytes")
+        return v
 
 
 # ---------- Child management (done by the parent) ----------
 
 class ChildCreate(BaseModel):
-    full_name: str = Field(min_length=1)
+    full_name: str = Field(min_length=1, max_length=100)
     pin: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")  # 6 أرقام بالظبط — 4 كانت ضعيفة لتطبيق فيه فلوس
+
+
+class ChildResetPinRequest(BaseModel):
+    child_id: Optional[str] = Field(default=None, max_length=100)
+    new_pin: Optional[str] = Field(default=None, min_length=6, max_length=6, pattern=r"^\d{6}$")
+    pin: Optional[str] = Field(default=None, min_length=6, max_length=6, pattern=r"^\d{6}$")
+
 
 
 class ChildSummary(BaseModel):
     id: str
     full_name: str
+    avatar_url: Optional[str] = None
     xp: int = 0
     level: int = 1
     streak: int = 0
@@ -126,9 +188,22 @@ class ChildSummary(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class ChildPublicSummary(BaseModel):
+    id: str
+    full_name: str
+    avatar_url: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class FamilyChildrenResponse(BaseModel):
     family_name: str
     children: List[ChildSummary]
+
+
+class FamilyPublicChildrenResponse(BaseModel):
+    family_name: str
+    children: List[ChildPublicSummary]
 
 
 # ---------- Child login ----------
@@ -139,5 +214,5 @@ class ChildLoginLookup(BaseModel):
 
 class ChildLogin(BaseModel):
     family_code: str = Field(min_length=6, max_length=6)
-    child_id: str
-    pin: str
+    child_id: str = Field(min_length=1, max_length=100)
+    pin: str = Field(min_length=1, max_length=10)

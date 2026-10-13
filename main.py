@@ -1,4 +1,5 @@
 import os
+import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,7 +7,10 @@ from slowapi.errors import RateLimitExceeded
 from slowapi import _rate_limit_exceeded_handler
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=False)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("finfamily")
 
 from db.database import engine, Base
 from api.routes import functions_router
@@ -15,32 +19,81 @@ from api.family_routes import router as family_router
 from api.admin_routes import router as admin_router
 from core.limiter import limiter
 
-# بناء الجداول في الداتا بيز بناءً على الـ Models مع حماية من أخطاء الـ Startup
-try:
-    Base.metadata.create_all(bind=engine)
-except Exception as e:
-    print(f"[Notice] Database schema verification: {e}")
+is_production = os.getenv("ENVIRONMENT", os.getenv("ENV", "development")).strip().lower() in ("production", "prod")
 
-app = FastAPI(title="FinFamily API")
+app = FastAPI(
+    title="FinFamily API",
+    docs_url=None if is_production else "/docs",
+    redoc_url=None if is_production else "/redoc",
+    openapi_url=None if is_production else "/openapi.json"
+)
+
+db_healthy = True
+
+@app.on_event("startup")
+def startup_db_init():
+    global db_healthy
+    try:
+        Base.metadata.create_all(bind=engine)
+        db_healthy = True
+        logger.info("Database schema verified and initialized successfully.")
+    except Exception as e:
+        db_healthy = False
+        logger.error(f"Database initialization failed during startup: {e}", exc_info=True)
+        if is_production:
+            raise RuntimeError(f"Database initialization failed in production: {e}") from e
 
 @app.get("/")
 def read_root():
-    return {
-        "status": "healthy",
-        "service": "FinFamily API",
-        "docs": "/docs",
-        "version": "1.0.0"
-    }
+    is_live = False
+    try:
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        is_live = True
+    except Exception as e:
+        logger.warning(f"Active health check ping failed: {e}")
+        is_live = False
 
+    status_str = "healthy" if (db_healthy and is_live) else "unhealthy"
+    from fastapi.responses import JSONResponse
+    content = {
+        "status": status_str,
+        "service": "FinFamily API",
+        "docs": None if is_production else "/docs",
+        "version": os.getenv("APP_VERSION", "1.0.5")
+    }
+    return JSONResponse(
+        status_code=200 if status_str == "healthy" else 503,
+        content=content
+    )
+
+@app.get("/api/version")
 @app.get("/api/app/version")
 @app.get("/app/version")
 def get_app_version():
+    version = os.getenv("APP_VERSION", "1.0.5")
+    build_num = int(os.getenv("APP_BUILD_NUMBER", "6"))
+    min_version = os.getenv("MIN_SUPPORTED_VERSION", "1.0.0")
+    download_url = os.getenv(
+        "APP_DOWNLOAD_URL",
+        "https://github.com/Mahmoud-Hashim-pro/finfamily-mobile-app/releases/latest/download/app-release.apk"
+    )
+    is_mandatory = os.getenv("APP_IS_MANDATORY", "false").strip().lower() in ("true", "1", "yes")
+    release_notes = os.getenv(
+        "APP_RELEASE_NOTES",
+        "إضافة الشاشة الافتتاحية الرسمية (Official Splash Screen) بجودة فائقة وتأثير انتقال سينمائي سلس، مع شاشات الطفل الحية."
+    )
+
     return {
-        "latest_version": "1.0.5",
-        "build_number": 6,
-        "download_url": "https://github.com/Mahmoud-Hashim-pro/finfamily-mobile-app/releases/latest/download/app-release.apk",
-        "release_notes": "إضافة الشاشة الافتتاحية الرسمية (Official Splash Screen) بجودة فائقة وتأثير انتقال سينمائي سلس، مع شاشات الطفل الحية.",
-        "is_mandatory": False
+        "version": version,
+        "build": build_num,
+        "latest_version": version,
+        "build_number": build_num,
+        "min_supported_version": min_version,
+        "download_url": download_url,
+        "release_notes": release_notes,
+        "is_mandatory": is_mandatory
     }
 
 # Rate limiting — بيحمي بالذات الـ login endpoints من Brute-force

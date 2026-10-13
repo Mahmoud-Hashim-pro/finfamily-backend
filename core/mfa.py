@@ -1,9 +1,15 @@
 import base64
+import hashlib
 import io
+import os
 import secrets
+from datetime import datetime, timezone
+from typing import Optional
 
 import pyotp
 import qrcode
+from cryptography.fernet import Fernet
+from passlib.context import CryptContext
 
 ISSUER_NAME = "FinFamily"
 
@@ -11,19 +17,58 @@ ISSUER_NAME = "FinFamily"
 RECOVERY_CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
 RECOVERY_CODES_COUNT = 10
 
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+# ---------- MFA Secrets Encryption at Rest (BUG-012) ----------
+
+def _get_fernet() -> Fernet:
+    raw_key = (
+        os.getenv("MFA_ENCRYPTION_KEY")
+        or os.getenv("JWT_SECRET")
+        or "finfamily-mfa-default-encryption-secret-key-2026"
+    )
+    derived = base64.urlsafe_b64encode(hashlib.sha256(raw_key.encode("utf-8")).digest())
+    return Fernet(derived)
+
+
+def encrypt_mfa_secret(secret: Optional[str]) -> Optional[str]:
+    """Encrypt TOTP secret before persisting in the database (BUG-012)."""
+    if not secret:
+        return secret
+    if secret.startswith("enc:"):
+        return secret
+    fernet = _get_fernet()
+    encrypted = fernet.encrypt(secret.encode("utf-8")).decode("ascii")
+    return f"enc:{encrypted}"
+
+
+def decrypt_mfa_secret(stored_val: Optional[str]) -> Optional[str]:
+    """Decrypt TOTP secret retrieved from database (BUG-012). Supports legacy plaintext."""
+    if not stored_val:
+        return stored_val
+    if not stored_val.startswith("enc:"):
+        return stored_val
+    try:
+        fernet = _get_fernet()
+        return fernet.decrypt(stored_val[4:].encode("ascii")).decode("utf-8")
+    except Exception:
+        return stored_val
+
 
 def generate_secret() -> str:
-    """سيكريت عشوائي (base32) — ده اللي بيتخزن، والتطبيق (Google/Microsoft Authenticator) بيولّد الأكواد منه."""
+    """سيكريت عشوائي (base32) — ده اللي بيتخزن، والتطبيق بيولّد الأكواد منه."""
     return pyotp.random_base32()
 
 
 def provisioning_uri(secret: str, account_email: str) -> str:
     """otpauth:// URI اللي تطبيق الـ Authenticator بيفهمه (سواء من QR أو إدخال يدوي)."""
-    return pyotp.totp.TOTP(secret).provisioning_uri(name=account_email, issuer_name=ISSUER_NAME)
+    plain_secret = decrypt_mfa_secret(secret) or secret
+    return pyotp.totp.TOTP(plain_secret).provisioning_uri(name=account_email, issuer_name=ISSUER_NAME)
 
 
 def generate_qr_data_uri(uri: str) -> str:
-    """QR code كصورة PNG جاهزة تتعرض مباشرة في <img src="..."> من غير أي endpoint إضافي للصورة."""
+    """QR code كصورة PNG جاهزة تتعرض مباشرة في <img src="...">."""
     img = qrcode.make(uri)
     buffer = io.BytesIO()
     img.save(buffer, format="PNG")
@@ -31,28 +76,69 @@ def generate_qr_data_uri(uri: str) -> str:
     return f"data:image/png;base64,{encoded}"
 
 
-def verify_totp(secret: str, code: str) -> bool:
+# In-memory store for last used timesteps per user to prevent TOTP replay (BUG-117)
+_LAST_USED_TIMESTEPS: dict[str, int] = {}
+
+
+def verify_totp(secret: str, code: str, user_id: Optional[str] = None) -> bool:
     """
-    valid_window=1 يعني بيقبل الكود بتاع 30 ثانية اللي فاتت أو الجاية كمان،
-    عشان لو ساعة موبايل الأب مش مظبوطة بالظبط أو كان بيكتب وهو بيتأخر شوية.
+    valid_window=1 مع التحقق من عدم إعادة استخدام نفس الكود في نافذة الصلاحية (BUG-117).
     """
     if not code or not code.isdigit():
         return False
-    return pyotp.totp.TOTP(secret).verify(code, valid_window=1)
+    plain_secret = decrypt_mfa_secret(secret) or secret
+    totp = pyotp.totp.TOTP(plain_secret)
+    now = datetime.now(timezone.utc)
+    current_tc = totp.timecode(now)
+
+    for offset in (0, -1, 1):
+        target_tc = current_tc + offset
+        if totp.generate_otp(target_tc) == code:
+            if user_id:
+                last_tc = _LAST_USED_TIMESTEPS.get(user_id)
+                if last_tc is not None and target_tc <= last_tc:
+                    return False  # Replay rejected!
+                _LAST_USED_TIMESTEPS[user_id] = target_tc
+            return True
+
+    return False
 
 
 def generate_recovery_codes(count: int = RECOVERY_CODES_COUNT) -> list[str]:
     """
-    بتولّد أكواد استرجاع لمرة واحدة (زي "7K4M-QX2P") — بتتعرض للأب مرة واحدة بس وقت
-    التفعيل، وبعد كده بيتخزن الـ hash بتاعها فقط (مفيش رجوع تاني نشوف الكود الأصلي).
+    BUG-118 (P2): Generate 16-character recovery codes (5^16 = ~80-bit entropy).
+    Formatted as XXXX-XXXX-XXXX-XXXX.
     """
     codes = []
     for _ in range(count):
-        raw = "".join(secrets.choice(RECOVERY_CODE_ALPHABET) for _ in range(8))
-        codes.append(f"{raw[:4]}-{raw[4:]}")
+        raw = "".join(secrets.choice(RECOVERY_CODE_ALPHABET) for _ in range(16))
+        codes.append(f"{raw[:4]}-{raw[4:8]}-{raw[8:12]}-{raw[12:]}")
     return codes
 
 
 def normalize_recovery_code(code: str) -> str:
     """توحيد الشكل قبل المقارنة — الأب ممكن يكتبها بحروف صغيرة أو من غير الشرطة."""
     return code.strip().upper().replace(" ", "").replace("-", "")
+
+
+def hash_recovery_code(code: str) -> str:
+    """
+    Fast, secure sha256 hash with prefix for O(1) indexed lookup without CPU amplification (BUG-118).
+    """
+    normalized = normalize_recovery_code(code)
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def verify_recovery_code(plain_code: str, stored_hash: str) -> bool:
+    """
+    Verify recovery code with fast SHA-256 comparison and legacy bcrypt fallback (BUG-118).
+    """
+    normalized = normalize_recovery_code(plain_code)
+    if stored_hash.startswith("sha256:"):
+        expected = f"sha256:{hashlib.sha256(normalized.encode('utf-8')).hexdigest()}"
+        return secrets.compare_digest(stored_hash, expected)
+    try:
+        return pwd_context.verify(normalized, stored_hash)
+    except Exception:
+        return False

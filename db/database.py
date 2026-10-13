@@ -4,12 +4,42 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from dotenv import load_dotenv
 
 # تحميل المتغيرات من ملف الـ .env
-load_dotenv()
+load_dotenv(override=False)
 
 SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL")
 
-# بناء الـ Engine اللي بيشغل الاتصال بـ PostgreSQL
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
+# Validate DATABASE_URL configuration
+if not SQLALCHEMY_DATABASE_URL:
+    env = os.getenv("ENVIRONMENT", os.getenv("ENV", "development")).strip().lower()
+    if env in ("production", "prod"):
+        raise RuntimeError("DATABASE_URL environment variable is required in production and cannot be empty.")
+    # Safe fallback for local development and ephemeral test environments
+    SQLALCHEMY_DATABASE_URL = "sqlite:///./finfamily.db"
+
+is_sqlite = SQLALCHEMY_DATABASE_URL.startswith("sqlite")
+connect_args = {}
+engine_kwargs = {
+    "pool_pre_ping": True,
+    "pool_recycle": 300,
+}
+
+if is_sqlite:
+    connect_args["check_same_thread"] = False
+    if ":memory:" in SQLALCHEMY_DATABASE_URL:
+        from sqlalchemy.pool import StaticPool
+        engine_kwargs["poolclass"] = StaticPool
+else:
+    # PostgreSQL / Neon pooling configuration
+    engine_kwargs["pool_size"] = int(os.getenv("DB_POOL_SIZE", "10"))
+    engine_kwargs["max_overflow"] = int(os.getenv("DB_MAX_OVERFLOW", "20"))
+    engine_kwargs["pool_timeout"] = int(os.getenv("DB_POOL_TIMEOUT", "30"))
+
+# Build Engine with connection pooling
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL,
+    connect_args=connect_args,
+    **engine_kwargs
+)
 
 # تجهيز الـ Session اللي هنستخدمها لإدارة العمليات مع كل Request
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

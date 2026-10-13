@@ -1,11 +1,29 @@
 from datetime import datetime, timedelta
+import logging
 import os
+import secrets
+import string
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from db.database import get_db
-from db.models import User, Family, UserRole, Wallet, PasswordResetToken, MfaRecoveryCode
+from db.models import (
+    User,
+    Family,
+    UserRole,
+    Wallet,
+    PasswordResetToken,
+    MfaRecoveryCode,
+    Mission,
+    Transaction,
+    CardPurchase,
+    GameCompletion,
+    AuditLog,
+)
 from core.security import (
     hash_password,
     verify_password,
@@ -20,7 +38,10 @@ from core.deps import get_current_user, require_parent
 from core.limiter import limiter
 from core.audit import log_action
 from core import mfa
-from services.email import send_password_reset_email
+from services.email import (
+    send_password_reset_email,
+    send_password_changed_notification,
+)
 from schemas.auth import (
     ParentRegister,
     ParentLogin,
@@ -30,23 +51,93 @@ from schemas.auth import (
     ChildLogin,
     TokenResponse,
     UserResponse,
+    ChildSummary,
+    ChildPublicSummary,
     FamilyChildrenResponse,
+    FamilyPublicChildrenResponse,
     MfaStatus,
     MfaSetupResponse,
+    MfaSetupRequest,
     MfaEnableRequest,
     MfaDisableRequest,
     MfaVerifyRequest,
     ForgotPasswordRequest,
     ForgotPasswordResponse,
     ResetPasswordRequest,
+    ChangePasswordRequest,
+    ChildResetPinRequest,
     RecoveryCodesResponse,
     RecoveryCodesStatus,
 )
 
+logger = logging.getLogger("finfamily.auth")
+
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 
-RESET_TOKEN_EXPIRE_MINUTES = 30
+RESET_TOKEN_EXPIRE_MINUTES = 15  # BUG-069: Bound token lifetime
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+
+# BUG-113 (P2): Constant-time dummy hash for unknown email login attempts
+DUMMY_PASSWORD_HASH = hash_password("dummy_password_for_constant_timing_check_123")
+
+# In-memory tracking for recovery code brute-force lockout per account (BUG-118)
+_FAILED_RECOVERY_ATTEMPTS: dict[str, list[datetime]] = {}
+
+
+def is_admin_email(email: str) -> bool:
+    """
+    BUG-002 (P0) & BUG-006 (P0): Check if an email is in the admin allowlist.
+    Normalizes case and whitespace.
+    """
+    clean = email.strip().lower()
+    raw_admins = os.getenv("ADMIN_EMAILS", "")
+    env_admins = {e.strip().lower() for e in raw_admins.split(",") if e.strip()}
+    known_admins = {
+        "modyhashim2006@gmail.com",
+        "pro.mahmoud.h@gmail.com",
+        "bassantmohamedelramlaw@gmail.com",
+        "abdallah.ahmed@finfamily.com",
+        "omar.osama.sw.dev@gmail.com",
+        "ashayman111@gmail.com",
+        "ramezrizkw@gmail.com",
+        "zyad.ahmed.softwareeng@gmail.com",
+    }
+    return clean in env_admins or clean in known_admins
+
+
+def _check_recovery_code_lockout(user_id: str) -> None:
+    now = datetime.utcnow()
+    attempts = _FAILED_RECOVERY_ATTEMPTS.get(user_id, [])
+    # Keep attempts from last 15 minutes
+    valid_attempts = [t for t in attempts if (now - t).total_seconds() < 900]
+    _FAILED_RECOVERY_ATTEMPTS[user_id] = valid_attempts
+    if len(valid_attempts) >= 5:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed recovery code attempts. Account temporarily locked for 15 minutes.",
+        )
+
+
+def _record_failed_recovery_attempt(user_id: str) -> None:
+    now = datetime.utcnow()
+    attempts = _FAILED_RECOVERY_ATTEMPTS.get(user_id, [])
+    attempts.append(now)
+    _FAILED_RECOVERY_ATTEMPTS[user_id] = attempts
+
+
+def _clear_failed_recovery_attempts(user_id: str) -> None:
+    _FAILED_RECOVERY_ATTEMPTS.pop(user_id, None)
+
+
+def generate_unique_family_code(db: Session, length: int = 6, max_attempts: int = 10) -> str:
+    """Generate a unique uppercase alphanumeric family code with collision retry loop (BUG-112)."""
+    alphabet = string.ascii_uppercase + string.digits
+    for _ in range(max_attempts):
+        code = "".join(secrets.choice(alphabet) for _ in range(length))
+        if not db.query(Family).filter(Family.family_code == code).first():
+            return code
+    raise RuntimeError("Failed to generate a unique family code after multiple attempts")
+
 
 
 # ---------------------------------------------------------------------------
@@ -56,46 +147,80 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 @router.post("/register", response_model=TokenResponse)
 @limiter.limit("5/hour")
 def register_parent(request: Request, payload: ParentRegister, db: Session = Depends(get_db)):
-    existing = db.query(User).filter(User.email == payload.email).first()
+    clean_email = payload.email.strip().lower()
+
+    # BUG-002 (P0) & BUG-006 (P0): Block public registration of allowlisted admin emails
+    if is_admin_email(clean_email):
+        raise HTTPException(status_code=400, detail="Admin email reserved")
+
+    # BUG-052 (P1): Enforce lowercase email uniqueness check
+    existing = db.query(User).filter(func.lower(User.email) == clean_email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
 
-    # كل أب بيبدأ عيلة جديدة بيه؛ الكود ده هو اللي هيديه لابنه وقت ما يضيفه
-    family = Family(name=payload.family_name)
-    db.add(family)
-    db.flush()  # عشان ناخد family.id قبل الـ commit
+    # BUG-112 (P2): Generate family code using secrets.choice with retry collision loop
+    code = generate_unique_family_code(db)
 
-    parent = User(
+    # BUG-067 (P2): Single atomic transaction for family, user, and audit with IntegrityError handling
+    try:
+        family = Family(name=payload.family_name.strip(), family_code=code)
+        db.add(family)
+        db.flush()
+
+        parent = User(
+            family_id=family.id,
+            role=UserRole.parent,
+            full_name=payload.full_name.strip(),
+            email=clean_email,
+            password_hash=hash_password(payload.password),
+            token_version=1,
+        )
+        db.add(parent)
+        db.flush()
+
+        log_action(
+            db, request=request, action="parent_registered",
+            actor_id=parent.id, actor_role="parent", family_id=family.id,
+            target_type="family", target_id=family.id,
+        )
+        db.commit()
+        db.refresh(parent)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    token = create_access_token(
+        user_id=parent.id,
         family_id=family.id,
-        role=UserRole.parent,
-        full_name=payload.full_name,
-        email=payload.email,
-        password_hash=hash_password(payload.password),
+        role="parent",
+        email=parent.email,
+        token_version=getattr(parent, "token_version", 1),
     )
-    db.add(parent)
-    db.commit()
-    db.refresh(parent)
-
-    log_action(
-        db, request=request, action="parent_registered",
-        actor_id=parent.id, actor_role="parent", family_id=family.id,
-        target_type="family", target_id=family.id,
-    )
-    db.commit()
-
-    token = create_access_token(user_id=parent.id, family_id=family.id, role="parent")
     return TokenResponse(access_token=token, user=UserResponse.model_validate(parent))
 
 
 @router.post("/login", response_model=ParentLoginResult)
 @limiter.limit("5/minute")
 def login_parent(request: Request, payload: ParentLogin, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == payload.email, User.role == UserRole.parent).first()
-    if not user or not user.password_hash or not verify_password(payload.password, user.password_hash):
-        # رسالة واحدة عامة لإيميل غلط أو باسورد غلط — عشان محدش يعرف يستنتج إن الإيميل ده مسجل أصلاً
+    clean_email = payload.email.strip().lower()
+    user = db.query(User).filter(func.lower(User.email) == clean_email, User.role == UserRole.parent).first()
+
+    # BUG-113 (P2): Constant-time dummy hash verification if user not found to prevent timing enumeration
+    if not user:
+        verify_password(payload.password, DUMMY_PASSWORD_HASH)
         log_action(
             db, request=request, action="login_failed",
-            detail={"email": payload.email, "role": "parent"},
+            detail={"email": clean_email, "role": "parent"},
+        )
+        db.commit()
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    if not user.password_hash or not verify_password(payload.password, user.password_hash):
+        # BUG-131 (P2): Attribute failed login attempt to the family when account exists
+        log_action(
+            db, request=request, action="login_failed",
+            actor_id=user.id, actor_role="parent", family_id=user.family_id,
+            detail={"email": clean_email, "role": "parent"},
         )
         db.commit()
         raise HTTPException(status_code=401, detail="Invalid email or password")
@@ -105,11 +230,13 @@ def login_parent(request: Request, payload: ParentLogin, db: Session = Depends(g
     # الباسورد صح. لو الأب مفعّل MFA، الخطوة دي مش كفاية لوحدها.
     if user.mfa_enabled:
         if payload.recovery_code:
-            # بديل TOTP — لو فقد جهاز الـ Authenticator بتاعه
+            # BUG-118 (P2): Enforce per-account lockout on recovery code brute force
+            _check_recovery_code_lockout(user.id)
             normalized = mfa.normalize_recovery_code(payload.recovery_code)
             candidates = db.query(MfaRecoveryCode).filter(MfaRecoveryCode.user_id == user.id, MfaRecoveryCode.used == False).all()  # noqa: E712
-            match = next((c for c in candidates if verify_password(normalized, c.code_hash)), None)
+            match = next((c for c in candidates if mfa.verify_recovery_code(normalized, c.code_hash)), None)
             if not match:
+                _record_failed_recovery_attempt(user.id)
                 log_action(
                     db, request=request, action="mfa_recovery_failed",
                     actor_id=user.id, actor_role="parent", family_id=user.family_id,
@@ -117,8 +244,17 @@ def login_parent(request: Request, payload: ParentLogin, db: Session = Depends(g
                 db.commit()
                 raise HTTPException(status_code=401, detail="Invalid or already-used recovery code")
 
-            match.used = True
-            match.used_date = datetime.utcnow()
+            # BUG-119 (P2): Consume recovery code atomically with atomic UPDATE ... WHERE used=false
+            updated = (
+                db.query(MfaRecoveryCode)
+                .filter(MfaRecoveryCode.id == match.id, MfaRecoveryCode.used == False)  # noqa: E712
+                .update({"used": True, "used_date": datetime.utcnow()})
+            )
+            if updated != 1:
+                db.rollback()
+                raise HTTPException(status_code=401, detail="Invalid or already-used recovery code")
+
+            _clear_failed_recovery_attempts(user.id)
             used_recovery_code = True
             log_action(
                 db, request=request, action="mfa_recovery_used",
@@ -126,11 +262,19 @@ def login_parent(request: Request, payload: ParentLogin, db: Session = Depends(g
             )
 
         elif not payload.otp_code:
-            # مش خطأ — ده رد طبيعي بيقول للفرونت "اطلب الكود دلوقتي" من غير ما نرفض الطلب أو نديله token
-            temp_token = create_access_token(user_id=user.id, family_id=user.family_id, role="mfa_pending")
+            # BUG-001 (P0): mfa_pending tokens expire in 5 min, have type mfa_challenge, and mfa_pending=True
+            temp_token = create_access_token(
+                user_id=user.id,
+                family_id=user.family_id,
+                role="mfa_pending",
+                token_type="mfa_challenge",
+                mfa_pending=True,
+                expires_delta=timedelta(minutes=5),
+            )
             return ParentLoginResult(mfa_required=True, temp_token=temp_token)
 
-        elif not mfa.verify_totp(user.mfa_secret, payload.otp_code):
+        elif not mfa.verify_totp(user.mfa_secret, payload.otp_code, user_id=user.id):
+            # BUG-117 (P2): Verify TOTP code with replay prevention
             log_action(
                 db, request=request, action="mfa_failed",
                 actor_id=user.id, actor_role="parent", family_id=user.family_id,
@@ -145,8 +289,20 @@ def login_parent(request: Request, payload: ParentLogin, db: Session = Depends(g
     )
     db.commit()
 
-    token = create_access_token(user_id=user.id, family_id=user.family_id, role="parent")
-    return ParentLoginResult(access_token=token, token_type="bearer", user=UserResponse.model_validate(user), used_recovery_code=used_recovery_code)
+    token = create_access_token(
+        user_id=user.id,
+        family_id=user.family_id,
+        role="parent",
+        email=user.email,
+        token_version=getattr(user, "token_version", 1),
+    )
+    return ParentLoginResult(
+        access_token=token,
+        token_type="bearer",
+        user=UserResponse.model_validate(user),
+        used_recovery_code=used_recovery_code,
+    )
+
 
 
 # ---------------------------------------------------------------------------
@@ -163,11 +319,12 @@ def create_child(
     child = User(
         family_id=parent.family_id,
         role=UserRole.child,
-        full_name=payload.full_name,
+        full_name=payload.full_name.strip(),
         pin_hash=hash_pin(payload.pin),
+        token_version=1,
     )
     db.add(child)
-    db.flush()  # عشان ناخد child.id قبل ما نعمل الـ Wallet بتاعته
+    db.flush()
 
     wallet = Wallet(owner_id=child.id)
     db.add(wallet)
@@ -194,8 +351,6 @@ def get_family_code(parent: User = Depends(require_parent), db: Session = Depend
 
 @router.get("/family/children", response_model=FamilyChildrenResponse)
 def list_my_children(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    # مفتوح للأب والطفل الاتنين — الاستعلام أصلاً محصور بـ family_id بتاع اللي بيطلب،
-    # يعني الطفل بيشوف بس إخواته في نفس عيلته، مش أي عيلة تانية.
     family = db.query(Family).filter(Family.id == user.family_id).first()
     children = db.query(User).filter(User.family_id == family.id, User.role == UserRole.child).all()
     return FamilyChildrenResponse(family_name=family.name, children=children)
@@ -205,36 +360,57 @@ def list_my_children(user: User = Depends(get_current_user), db: Session = Depen
 # Child: lookup family by code, then log in with PIN
 # ---------------------------------------------------------------------------
 
-@router.post("/children/lookup", response_model=FamilyChildrenResponse)
-@router.post("/child/lookup", response_model=FamilyChildrenResponse)
+@router.post("/children/lookup", response_model=FamilyPublicChildrenResponse)
+@router.post("/child/lookup", response_model=FamilyPublicChildrenResponse)
 @limiter.limit("20/minute")
 def lookup_family_children(request: Request, payload: ChildLoginLookup, db: Session = Depends(get_db)):
-    family = db.query(Family).filter(Family.family_code == payload.family_code.upper()).first()
+    clean_family_code = payload.family_code.strip().upper()
+    family = db.query(Family).filter(Family.family_code == clean_family_code).first()
     if not family:
         raise HTTPException(status_code=404, detail="Family code not found")
 
     children = db.query(User).filter(User.family_id == family.id, User.role == UserRole.child).all()
-    return FamilyChildrenResponse(family_name=family.name, children=children)
+    # BUG-010 (P1): Return only non-sensitive public child fields (id, full_name, avatar_url)
+    return FamilyPublicChildrenResponse(
+        family_name=family.name,
+        children=[
+            ChildPublicSummary(
+                id=c.id,
+                full_name=c.full_name,
+                avatar_url=getattr(c, "avatar_url", None),
+            )
+            for c in children
+        ],
+    )
 
 
 @router.post("/child-login", response_model=TokenResponse)
 @router.post("/child/login", response_model=TokenResponse)
+@router.post("/children/login", response_model=TokenResponse)
 @limiter.limit("10/minute")
 def child_login(request: Request, payload: ChildLogin, db: Session = Depends(get_db)):
-    family = db.query(Family).filter(Family.family_code == payload.family_code.upper()).first()
+    clean_family_code = payload.family_code.strip().upper()
+    family = db.query(Family).filter(Family.family_code == clean_family_code).first()
     if not family:
         raise HTTPException(status_code=404, detail="Family code not found")
 
+    # BUG-014 (P1), BUG-053 (P1), BUG-058 (P1): with_for_update() row lock against race conditions
     child = (
         db.query(User)
         .filter(User.id == payload.child_id, User.family_id == family.id, User.role == UserRole.child)
+        .with_for_update()
         .first()
     )
 
-    # قفل مؤقت لو فيه محاولات فاشلة كتير على الطفل ده تحديدًا — بغض النظر عن الـ IP
-    if child and child.pin_locked_until and child.pin_locked_until > datetime.utcnow():
-        remaining = int((child.pin_locked_until - datetime.utcnow()).total_seconds() / 60) + 1
-        raise HTTPException(status_code=429, detail=f"Too many attempts. Try again in {remaining} minute(s).")
+    # BUG-014 (P1): Reset failed_pin_attempts when lockout expires before evaluating new attempt
+    if child and child.pin_locked_until:
+        if child.pin_locked_until <= datetime.utcnow():
+            child.failed_pin_attempts = 0
+            child.pin_locked_until = None
+            db.commit()
+        else:
+            remaining = int((child.pin_locked_until - datetime.utcnow()).total_seconds() / 60) + 1
+            raise HTTPException(status_code=429, detail=f"Too many attempts. Try again in {remaining} minute(s).")
 
     if not child or not child.pin_hash or not verify_pin(payload.pin, child.pin_hash):
         if child:
@@ -258,22 +434,51 @@ def child_login(request: Request, payload: ChildLogin, db: Session = Depends(get
     )
     db.commit()
 
-    token = create_access_token(user_id=child.id, family_id=family.id, role="child")
+    token = create_access_token(
+        user_id=child.id,
+        family_id=family.id,
+        role="child",
+        token_version=getattr(child, "token_version", 1),
+    )
     return TokenResponse(access_token=token, user=UserResponse.model_validate(child))
 
 
 # ---------------------------------------------------------------------------
-# Parent: forgot / reset password
+# Parent: forgot / reset / change password
 # ---------------------------------------------------------------------------
 
 @router.post("/forgot-password", response_model=ForgotPasswordResponse)
 @limiter.limit("3/hour")
 def forgot_password(request: Request, payload: ForgotPasswordRequest, db: Session = Depends(get_db)):
     generic_response = ForgotPasswordResponse()
+    clean_email = payload.email.strip().lower()
 
-    user = db.query(User).filter(User.email == payload.email, User.role == UserRole.parent).first()
+    # BUG-006 (P0), BUG-052 (P1), BUG-114 (P2)
+    user = db.query(User).filter(func.lower(User.email) == clean_email, User.role == UserRole.parent).first()
     if not user:
-        # نفس الرد بالظبط لو الإيميل مش موجود — عشان محدش يعرف يستنتج إن الإيميل ده مسجل ولا لأ
+        return generic_response
+
+    # BUG-114 (P2): Per-email throttling (max 3/hour and max 1 per 2 minutes)
+    recent = (
+        db.query(PasswordResetToken)
+        .filter(
+            PasswordResetToken.user_id == user.id,
+            PasswordResetToken.created_date > datetime.utcnow() - timedelta(minutes=2),
+        )
+        .first()
+    )
+    if recent:
+        return generic_response
+
+    hourly_count = (
+        db.query(PasswordResetToken)
+        .filter(
+            PasswordResetToken.user_id == user.id,
+            PasswordResetToken.created_date > datetime.utcnow() - timedelta(hours=1),
+        )
+        .count()
+    )
+    if hourly_count >= 3:
         return generic_response
 
     raw_token = generate_reset_token()
@@ -291,12 +496,11 @@ def forgot_password(request: Request, payload: ForgotPasswordRequest, db: Sessio
     db.commit()
 
     reset_url = f"{FRONTEND_URL}/reset-password?token={raw_token}"
+    # BUG-068 (P2): Observability on password-reset email delivery failures
     try:
         send_password_reset_email(user.email, reset_url)
-    except Exception:
-        # ماينفعش نفشل الطلب ونوري للمستخدم إن الإيميل فشل — هيسرّب إن الإيميل ده
-        # فعلاً مسجل (لو مش موجود، مكناش هنوصل للسطر ده أصلاً). نرجّع نفس الرد العام دايمًا.
-        pass
+    except Exception as e:
+        logger.error(f"Failed to dispatch password reset email to {user.email}: {e}", exc_info=True)
 
     return generic_response
 
@@ -304,28 +508,37 @@ def forgot_password(request: Request, payload: ForgotPasswordRequest, db: Sessio
 @router.post("/reset-password", response_model=ForgotPasswordResponse)
 @limiter.limit("10/hour")
 def reset_password(request: Request, payload: ResetPasswordRequest, db: Session = Depends(get_db)):
-    token_hash = hash_reset_token(payload.token)
-    reset = db.query(PasswordResetToken).filter(PasswordResetToken.token_hash == token_hash).first()
+    token_hash = hash_reset_token(payload.token.strip())
 
-    if not reset or reset.used or reset.expires_at < datetime.utcnow():
+    # BUG-119 (P2): Atomically consume reset token with atomic UPDATE ... WHERE used=false
+    updated = (
+        db.query(PasswordResetToken)
+        .filter(
+            PasswordResetToken.token_hash == token_hash,
+            PasswordResetToken.used == False,  # noqa: E712
+            PasswordResetToken.expires_at >= datetime.utcnow(),
+        )
+        .update({"used": True})
+    )
+    if updated != 1:
+        db.rollback()
         raise HTTPException(status_code=400, detail="This reset link is invalid or has expired.")
 
+    reset = db.query(PasswordResetToken).filter(PasswordResetToken.token_hash == token_hash).first()
     user = db.query(User).filter(User.id == reset.user_id, User.role == UserRole.parent).first()
     if not user:
         raise HTTPException(status_code=400, detail="This reset link is invalid or has expired.")
 
     user.password_hash = hash_password(payload.new_password)
-    reset.used = True
 
-    # أي روابط تانية لسه صالحة لنفس الأب (لو طلب أكتر من مرة) — تتقفل كمان،
-    # عشان محدش يقدر يستخدم لينك قديم بعد ما الباسورد اتغيّرت فعلاً
-    other_tokens = (
-        db.query(PasswordResetToken)
-        .filter(PasswordResetToken.user_id == user.id, PasswordResetToken.used == False)  # noqa: E712
-        .all()
-    )
-    for t in other_tokens:
-        t.used = True
+    # BUG-009 (P1): Invalidate active JWTs on password reset by incrementing token_version
+    user.token_version = (getattr(user, "token_version", 1) or 1) + 1
+
+    # Invalidate any other active reset tokens for this user
+    db.query(PasswordResetToken).filter(
+        PasswordResetToken.user_id == user.id,
+        PasswordResetToken.used == False,  # noqa: E712
+    ).update({"used": True})
 
     log_action(
         db, request=request, action="password_reset_completed",
@@ -333,7 +546,151 @@ def reset_password(request: Request, payload: ResetPasswordRequest, db: Session 
     )
     db.commit()
 
+    # BUG-114 (P2): Send security notification email after password change
+    send_password_changed_notification(user.email)
+
     return ForgotPasswordResponse(message="Your password has been reset. You can log in now.")
+
+
+@router.post("/change-password")
+@router.post("/parent/change-password")
+@limiter.limit("5/minute")
+def change_password(
+    request: Request,
+    payload: ChangePasswordRequest,
+    parent: User = Depends(require_parent),
+    db: Session = Depends(get_db),
+):
+    """BUG-057 (P1) & BUG-140 (P2): Authenticated parent password change with session invalidation."""
+    if not verify_password(payload.current_password, parent.password_hash):
+        raise HTTPException(status_code=401, detail="Incorrect current password")
+
+    parent.password_hash = hash_password(payload.new_password)
+    # BUG-009 (P1): Revoke existing tokens by incrementing token_version
+    parent.token_version = (getattr(parent, "token_version", 1) or 1) + 1
+
+    log_action(
+        db, request=request, action="password_changed",
+        actor_id=parent.id, actor_role="parent", family_id=parent.family_id,
+    )
+    db.commit()
+
+    # BUG-114 (P2): Send security notification email after password change
+    send_password_changed_notification(parent.email)
+
+    return {"message": "Password changed successfully"}
+
+
+# ---------------------------------------------------------------------------
+# Parent: reset child PIN & delete child & delete account (BUG-057, BUG-140)
+# ---------------------------------------------------------------------------
+
+@router.post("/children/{child_id}/reset-pin")
+@router.post("/parent/reset-child-pin")
+@router.post("/parent/children/{child_id}/reset-pin")
+@limiter.limit("10/minute")
+def reset_child_pin(
+    request: Request,
+    payload: ChildResetPinRequest,
+    child_id: Optional[str] = None,
+    parent: User = Depends(require_parent),
+    db: Session = Depends(get_db),
+):
+    """BUG-057 (P1) & BUG-140 (P2): Parent resets child PIN."""
+    target_child_id = child_id or payload.child_id
+    if not target_child_id:
+        raise HTTPException(status_code=400, detail="Child ID is required")
+
+    pin_to_set = payload.new_pin or payload.pin
+    if not pin_to_set:
+        raise HTTPException(status_code=400, detail="New PIN is required")
+
+    child = (
+        db.query(User)
+        .filter(User.id == target_child_id, User.family_id == parent.family_id, User.role == UserRole.child)
+        .with_for_update()
+        .first()
+    )
+    if not child:
+        raise HTTPException(status_code=404, detail="Child not found")
+
+    child.pin_hash = hash_pin(pin_to_set)
+    child.failed_pin_attempts = 0
+    child.pin_locked_until = None
+    child.token_version = (getattr(child, "token_version", 1) or 1) + 1
+
+    log_action(
+        db, request=request, action="child_pin_reset",
+        actor_id=parent.id, actor_role="parent", family_id=parent.family_id,
+        target_type="user", target_id=child.id,
+    )
+    db.commit()
+
+    return {"message": "Child PIN reset successfully"}
+
+
+@router.delete("/children/{child_id}")
+@router.delete("/parent/child/{child_id}")
+@router.delete("/parent/children/{child_id}")
+def delete_child(
+    request: Request,
+    child_id: str,
+    parent: User = Depends(require_parent),
+    db: Session = Depends(get_db),
+):
+    """BUG-057 (P1) & BUG-140 (P2): Parent deletes child and cascades related data."""
+    child = (
+        db.query(User)
+        .filter(User.id == child_id, User.family_id == parent.family_id, User.role == UserRole.child)
+        .first()
+    )
+    if not child:
+        raise HTTPException(status_code=404, detail="Child not found")
+
+    # Clean up dependent records
+    db.query(GameCompletion).filter(GameCompletion.child_id == child.id).delete(synchronize_session=False)
+    db.query(CardPurchase).filter(CardPurchase.child_id == child.id).delete(synchronize_session=False)
+    db.query(Mission).filter((Mission.assigned_to_id == child.id) | (Mission.created_by_id == child.id)).delete(synchronize_session=False)
+    db.query(AuditLog).filter(AuditLog.actor_id == child.id).update({"actor_id": None}, synchronize_session=False)
+
+    db.delete(child)
+    log_action(
+        db, request=request, action="child_deleted",
+        actor_id=parent.id, actor_role="parent", family_id=parent.family_id,
+        target_type="user", target_id=child_id,
+    )
+    db.commit()
+
+    return {"message": "Child deleted successfully"}
+
+
+@router.delete("/account")
+@router.delete("/parent/account")
+def delete_account(
+    request: Request,
+    parent: User = Depends(require_parent),
+    db: Session = Depends(get_db),
+):
+    """BUG-057 (P1) & BUG-140 (P2): Parent deletes account and family."""
+    family_id = parent.family_id
+    family_users = db.query(User).filter(User.family_id == family_id).all()
+    user_ids = [u.id for u in family_users]
+
+    if user_ids:
+        db.query(GameCompletion).filter(GameCompletion.child_id.in_(user_ids)).delete(synchronize_session=False)
+        db.query(CardPurchase).filter((CardPurchase.child_id.in_(user_ids)) | (CardPurchase.family_id == family_id)).delete(synchronize_session=False)
+        db.query(Mission).filter((Mission.family_id == family_id) | (Mission.assigned_to_id.in_(user_ids)) | (Mission.created_by_id.in_(user_ids))).delete(synchronize_session=False)
+        db.query(Transaction).filter(Transaction.family_id == family_id).delete(synchronize_session=False)
+        db.query(PasswordResetToken).filter(PasswordResetToken.user_id.in_(user_ids)).delete(synchronize_session=False)
+        db.query(MfaRecoveryCode).filter(MfaRecoveryCode.user_id.in_(user_ids)).delete(synchronize_session=False)
+        db.query(AuditLog).filter(AuditLog.family_id == family_id).delete(synchronize_session=False)
+
+    family = db.query(Family).filter(Family.id == family_id).first()
+    if family:
+        db.delete(family)
+    db.commit()
+
+    return {"message": "Account deleted successfully"}
 
 
 # ---------------------------------------------------------------------------
@@ -341,12 +698,11 @@ def reset_password(request: Request, payload: ResetPasswordRequest, db: Session 
 # ---------------------------------------------------------------------------
 
 def _issue_recovery_codes(db: Session, parent: User) -> list:
-    """بتمسح أي أكواد استرجاع قديمة (مستخدمة أو لأ) وتولّد سيت جديد بالكامل — بترجع النسخة الأصلية (plain) مرة واحدة بس."""
+    """بتمسح أي أكواد استرجاع قديمة وتولّد سيت جديد بالكامل مع تشفير الـ hash (BUG-118)."""
     db.query(MfaRecoveryCode).filter(MfaRecoveryCode.user_id == parent.id).delete()
     codes = mfa.generate_recovery_codes()
     for code in codes:
-        normalized = mfa.normalize_recovery_code(code)
-        db.add(MfaRecoveryCode(user_id=parent.id, code_hash=hash_password(normalized)))
+        db.add(MfaRecoveryCode(user_id=parent.id, code_hash=mfa.hash_recovery_code(code)))
     return codes
 
 
@@ -356,21 +712,25 @@ def mfa_status(parent: User = Depends(require_parent)):
 
 
 @router.post("/mfa/setup", response_model=MfaSetupResponse)
+@limiter.limit("5/minute")
 def mfa_setup(
     request: Request,
+    payload: MfaSetupRequest,
     parent: User = Depends(require_parent),
     db: Session = Depends(get_db),
 ):
     """
-    بيولّد سيكريت جديد و QR code يتمسح بتطبيق الـ Authenticator.
-    السيكريت بيتخزن كـ "pending" بس — مش هيتفعّل غير لما الأب يأكّد بكود
-    صحيح عن طريق /mfa/enable، عشان محدش يقفل نفسه برة حسابه بغلط.
+    BUG-015 (P1): Verify current password before issuing MFA secret.
+    BUG-012 (P1): Encrypt pending MFA secret at rest.
     """
     if parent.mfa_enabled:
         raise HTTPException(status_code=400, detail="MFA is already enabled. Disable it first to re-setup.")
 
+    if not verify_password(payload.password, parent.password_hash):
+        raise HTTPException(status_code=401, detail="Incorrect password")
+
     secret = mfa.generate_secret()
-    parent.mfa_pending_secret = secret
+    parent.mfa_pending_secret = mfa.encrypt_mfa_secret(secret)
     db.commit()
 
     uri = mfa.provisioning_uri(secret, parent.email)
@@ -392,7 +752,8 @@ def mfa_enable(
     if not parent.mfa_pending_secret:
         raise HTTPException(status_code=400, detail="No MFA setup in progress. Call /mfa/setup first.")
 
-    if not mfa.verify_totp(parent.mfa_pending_secret, payload.code):
+    plain_secret = mfa.decrypt_mfa_secret(parent.mfa_pending_secret)
+    if not mfa.verify_totp(plain_secret, payload.code):
         raise HTTPException(status_code=400, detail="Invalid code. Please try again.")
 
     parent.mfa_secret = parent.mfa_pending_secret
@@ -418,9 +779,35 @@ def mfa_disable(
     parent: User = Depends(require_parent),
     db: Session = Depends(get_db),
 ):
-    # تأكيد بالباسورد الحالي — عشان لو حد سرق جلسة الأب (token) مايقدرش يقفل MFA بسهولة
+    """
+    BUG-116 (P2): Require password AND a second factor (valid OTP or recovery code) to disable MFA.
+    """
     if not verify_password(payload.password, parent.password_hash):
         raise HTTPException(status_code=401, detail="Incorrect password")
+
+    mfa_verified = False
+    if payload.code:
+        plain_secret = mfa.decrypt_mfa_secret(parent.mfa_secret)
+        if mfa.verify_totp(plain_secret, payload.code, user_id=parent.id):
+            mfa_verified = True
+    elif payload.recovery_code:
+        normalized = mfa.normalize_recovery_code(payload.recovery_code)
+        candidates = db.query(MfaRecoveryCode).filter(MfaRecoveryCode.user_id == parent.id, MfaRecoveryCode.used == False).all()  # noqa: E712
+        match = next((c for c in candidates if mfa.verify_recovery_code(normalized, c.code_hash)), None)
+        if match:
+            updated = (
+                db.query(MfaRecoveryCode)
+                .filter(MfaRecoveryCode.id == match.id, MfaRecoveryCode.used == False)  # noqa: E712
+                .update({"used": True, "used_date": datetime.utcnow()})
+            )
+            if updated == 1:
+                mfa_verified = True
+
+    if not mfa_verified:
+        raise HTTPException(
+            status_code=401,
+            detail="Valid second factor (OTP code or recovery code) is required to disable MFA",
+        )
 
     parent.mfa_enabled = False
     parent.mfa_secret = None
@@ -448,15 +835,41 @@ def recovery_codes_status(parent: User = Depends(require_parent), db: Session = 
 @router.post("/mfa/recovery-codes/regenerate", response_model=RecoveryCodesResponse)
 def regenerate_recovery_codes(
     request: Request,
-    payload: MfaDisableRequest,  # نفس شكل الطلب (باسورد بس) — بنعيد استخدامه هنا
+    payload: MfaDisableRequest,
     parent: User = Depends(require_parent),
     db: Session = Depends(get_db),
 ):
-    """بيلغي كل الأكواد القديمة (المستخدمة وغير المستخدمة) ويولّد سيت جديد — مفيد لو الأب قرّب يخلّص أكواده."""
+    """
+    BUG-116 (P2): Require password AND a second factor to regenerate recovery codes.
+    """
     if not parent.mfa_enabled:
         raise HTTPException(status_code=400, detail="MFA is not enabled")
     if not verify_password(payload.password, parent.password_hash):
         raise HTTPException(status_code=401, detail="Incorrect password")
+
+    mfa_verified = False
+    if payload.code:
+        plain_secret = mfa.decrypt_mfa_secret(parent.mfa_secret)
+        if mfa.verify_totp(plain_secret, payload.code, user_id=parent.id):
+            mfa_verified = True
+    elif payload.recovery_code:
+        normalized = mfa.normalize_recovery_code(payload.recovery_code)
+        candidates = db.query(MfaRecoveryCode).filter(MfaRecoveryCode.user_id == parent.id, MfaRecoveryCode.used == False).all()  # noqa: E712
+        match = next((c for c in candidates if mfa.verify_recovery_code(normalized, c.code_hash)), None)
+        if match:
+            updated = (
+                db.query(MfaRecoveryCode)
+                .filter(MfaRecoveryCode.id == match.id, MfaRecoveryCode.used == False)  # noqa: E712
+                .update({"used": True, "used_date": datetime.utcnow()})
+            )
+            if updated == 1:
+                mfa_verified = True
+
+    if not mfa_verified:
+        raise HTTPException(
+            status_code=401,
+            detail="Valid second factor (OTP code or recovery code) is required to regenerate recovery codes",
+        )
 
     codes = _issue_recovery_codes(db, parent)
 
@@ -479,14 +892,17 @@ def verify_mfa_login(request: Request, payload: MfaVerifyRequest, db: Session = 
 
     user_id = data.get("sub")
     role = data.get("role")
-    if not user_id or role != "mfa_pending":
+    token_type = data.get("type")
+    if not user_id or (role != "mfa_pending" and token_type != "mfa_challenge"):
         raise HTTPException(status_code=401, detail="Invalid MFA token")
 
     user = db.query(User).filter(User.id == user_id).first()
     if not user or not user.mfa_enabled:
         raise HTTPException(status_code=401, detail="User not found or MFA not enabled")
 
-    if not mfa.verify_totp(user.mfa_secret, payload.code):
+    # BUG-117 (P2): Verify TOTP code with replay prevention
+    plain_secret = mfa.decrypt_mfa_secret(user.mfa_secret)
+    if not mfa.verify_totp(plain_secret, payload.code, user_id=user.id):
         log_action(
             db, request=request, action="mfa_failed",
             actor_id=user.id, actor_role="parent", family_id=user.family_id,
@@ -501,7 +917,13 @@ def verify_mfa_login(request: Request, payload: MfaVerifyRequest, db: Session = 
     )
     db.commit()
 
-    token = create_access_token(user_id=user.id, family_id=user.family_id, role="parent")
+    token = create_access_token(
+        user_id=user.id,
+        family_id=user.family_id,
+        role="parent",
+        email=user.email,
+        token_version=getattr(user, "token_version", 1),
+    )
     return TokenResponse(access_token=token, token_type="bearer", user=UserResponse.model_validate(user))
 
 

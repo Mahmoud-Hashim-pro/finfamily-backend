@@ -1,3 +1,5 @@
+import os
+import ipaddress
 from typing import Optional
 
 from fastapi import Request
@@ -6,15 +8,49 @@ from sqlalchemy.orm import Session
 from db.models import AuditLog
 
 
+TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "false").strip().lower() in ("true", "1", "yes")
+
+
+def sanitize_ip(raw: Optional[str]) -> Optional[str]:
+    """Sanitize and validate IPv4 or IPv6 address."""
+    if not raw:
+        return None
+    cleaned = raw.strip()
+    if cleaned.startswith("[") and "]" in cleaned:
+        cleaned = cleaned[1:cleaned.index("]")]
+    elif ":" in cleaned and cleaned.count(":") == 1:
+        cleaned = cleaned.split(":")[0]
+
+    try:
+        return str(ipaddress.ip_address(cleaned))
+    except ValueError:
+        return None
+
+
 def _client_ip(request: Optional[Request]) -> Optional[str]:
     if request is None:
         return None
-    # لو السيرفر ورا Load Balancer/Reverse Proxy، الـ IP الحقيقي بيبقى في
-    # X-Forwarded-For مش في request.client.host (ده هيبقى IP بتاع الـ Proxy نفسه).
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else None
+
+    # BUG-066 (P2): Do not trust client-supplied forwarded headers unless behind trusted proxies
+    if TRUST_PROXY_HEADERS:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            first_ip = forwarded.split(",")[0].strip()
+            sanitized = sanitize_ip(first_ip)
+            if sanitized:
+                return sanitized
+
+        real_ip = request.headers.get("x-real-ip")
+        if real_ip:
+            sanitized = sanitize_ip(real_ip)
+            if sanitized:
+                return sanitized
+
+    if request.client and request.client.host:
+        return sanitize_ip(request.client.host)
+
+    return None
+
 
 
 def log_action(

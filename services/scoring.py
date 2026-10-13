@@ -62,11 +62,11 @@ def compute_financial_score(db: Session, wallet: Wallet, child: User) -> int:
     # 4) الالتزام بحدود الصرف — خصم لو الطفل تخطى أي حد حدده الأب (بيشمل طلبات الصرف ومشتريات الكارت مع بعض)
     now = datetime.utcnow()
     penalty = 0
-    if wallet.daily_limit and _debit_spend_since(db, wallet.id, now - timedelta(days=1)) > wallet.daily_limit:
+    if wallet.daily_limit is not None and _debit_spend_since(db, wallet.id, now - timedelta(days=1)) > wallet.daily_limit:
         penalty += 7
-    if wallet.weekly_limit and _debit_spend_since(db, wallet.id, now - timedelta(days=7)) > wallet.weekly_limit:
+    if wallet.weekly_limit is not None and _debit_spend_since(db, wallet.id, now - timedelta(days=7)) > wallet.weekly_limit:
         penalty += 7
-    if wallet.monthly_limit and _debit_spend_since(db, wallet.id, now - timedelta(days=30)) > wallet.monthly_limit:
+    if wallet.monthly_limit is not None and _debit_spend_since(db, wallet.id, now - timedelta(days=30)) > wallet.monthly_limit:
         penalty += 6
     score -= penalty
 

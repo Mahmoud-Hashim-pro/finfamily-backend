@@ -1,11 +1,12 @@
 import uuid
 import random
+import secrets
 import string
 from datetime import datetime
 import enum
 
-from sqlalchemy import Column, String, DateTime, Enum, ForeignKey, Float, Integer, JSON, Boolean
-from sqlalchemy.orm import relationship
+from sqlalchemy import Column, String, DateTime, Enum, ForeignKey, Float, Integer, JSON, Boolean, UniqueConstraint
+from sqlalchemy.orm import relationship, synonym
 
 from .database import Base
 
@@ -13,6 +14,7 @@ from .database import Base
 class UserRole(str, enum.Enum):
     parent = "parent"
     child = "child"
+    admin = "admin"
 
 
 class CardStatus(str, enum.Enum):
@@ -54,9 +56,10 @@ class PurchaseStatus(str, enum.Enum):
     rejected = "rejected"    # الأب رفضها، أو الفئة محظورة، أو الكارت مجمد/متعطل
 
 
-def _generate_family_code():
+def _generate_family_code(length: int = 6) -> str:
     # كود قصير سهل إن الأب يقوله لابنه (زي كود دعوة)
-    return "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
 def _generate_card_number():
@@ -104,6 +107,10 @@ class User(Base):
     level = Column(Integer, default=1)
     streak = Column(Integer, default=0)
     last_active_date = Column(DateTime, nullable=True)  # آخر يوم اتحسب فيه نشاط للـ streak
+    avatar_url = Column(String, nullable=True)
+
+    # Token versioning for instant revocation on password/pin reset
+    token_version = Column(Integer, default=1, nullable=False)
 
     # قفل مؤقت ضد تخمين الـ PIN (الطفل بس) — منفصل عن rate limiting بالـ IP،
     # عشان يحمي حتى لو حد جرب من أجهزة/شبكات مختلفة على نفس الطفل بالظبط
@@ -142,6 +149,7 @@ class Wallet(Base):
     card_status = Column(Enum(CardStatus), default=CardStatus.active)
     card_number = Column(String, default=_generate_card_number)  # وهمي بالكامل — مفيش تكامل حقيقي مع Meeza
     card_theme = Column(String, default="blue")  # الطفل هو اللي بيختاره من صفحته
+    is_simulated = Column(Boolean, default=True, nullable=False)  # BUG-098: Simulated Meeza learning card
 
     created_date = Column(DateTime, default=datetime.utcnow)
     updated_date = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -229,6 +237,8 @@ class CardPurchase(Base):
     family_id = Column(String, ForeignKey("families.id"), nullable=False, index=True)
     child_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
     wallet_id = Column(String, ForeignKey("wallets.id"), nullable=False, index=True)
+    family = relationship("Family", foreign_keys=[family_id])
+    child = relationship("User", foreign_keys=[child_id])
     wallet = relationship("Wallet", back_populates="card_purchases")
 
     merchant = Column(String, nullable=False)
@@ -238,6 +248,7 @@ class CardPurchase(Base):
 
     status = Column(Enum(PurchaseStatus), nullable=False, default=PurchaseStatus.pending)
     decline_reason = Column(String, nullable=True)  # ليه اترفضت فورًا (فئة محظورة / كارت مجمد...)
+    is_simulated = Column(Boolean, default=True, nullable=False)  # BUG-098: Simulated card transaction
 
     reviewed_by_id = Column(String, nullable=True)
     reviewed_date = Column(DateTime, nullable=True)
@@ -263,8 +274,17 @@ class GameCompletion(Base):
     xp_awarded = Column(Integer, default=0)
     coins_awarded = Column(Float, default=0)
     was_rewarded = Column(Boolean, default=True)  # False لو ده تكرار نفس اللعبة في نفس اليوم
+    reward_date = Column(String, nullable=True, index=True)  # YYYY-MM-DD لو أخد مكافأة، None لو تكرار
+    completion_date = Column(String, nullable=True, index=True)  # YYYY-MM-DD (alias/daily completion date)
+
+    user_id = synonym("child_id")
 
     created_date = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("child_id", "game_id", "reward_date", name="uq_game_reward_daily"),
+        UniqueConstraint("child_id", "game_id", "completion_date", name="uq_game_completion_daily"),
+    )
 
 
 class AuditLog(Base):
@@ -302,6 +322,10 @@ class UserBadge(Base):
 
     badge_id = Column(String, nullable=False)  # مفتاح من BADGE_DEFS، زي "first_chore"
     unlocked_date = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "badge_id", name="uq_user_badge"),
+    )
 
 
 class PasswordResetToken(Base):

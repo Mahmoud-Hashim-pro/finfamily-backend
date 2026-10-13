@@ -3,7 +3,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from db.models import User, UserBadge, Mission, MissionKind, MissionStatus, GameCompletion, Wallet
-from services.games import GAME_CATALOG
+from services.games import GAME_CATALOG, is_passing_game
 
 BADGE_DEFS = [
     {"id": "first_chore", "name": "First Steps", "icon": "🥇", "desc": "Completed your first approved chore"},
@@ -26,22 +26,29 @@ def _has_first_chore(db: Session, child: User) -> bool:
 
 
 def _has_game_explorer(db: Session, child: User) -> bool:
-    played = {
-        row[0] for row in db.query(GameCompletion.game_id).filter(GameCompletion.child_id == child.id).distinct().all()
-    }
-    return set(GAME_CATALOG.keys()).issubset(played)
+    rows = (
+        db.query(GameCompletion.game_id, GameCompletion.score, GameCompletion.total)
+        .filter(GameCompletion.child_id == child.id, GameCompletion.score > 0, GameCompletion.total > 0)
+        .all()
+    )
+    passed = {r[0] for r in rows if is_passing_game(r[1], r[2])}
+    return set(GAME_CATALOG.keys()).issubset(passed)
 
 
 def _has_perfect_day(db: Session, child: User) -> bool:
     today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    played_today = {
-        row[0]
-        for row in db.query(GameCompletion.game_id)
-        .filter(GameCompletion.child_id == child.id, GameCompletion.created_date >= today_start)
-        .distinct()
+    rows = (
+        db.query(GameCompletion.game_id, GameCompletion.score, GameCompletion.total)
+        .filter(
+            GameCompletion.child_id == child.id,
+            GameCompletion.created_date >= today_start,
+            GameCompletion.score > 0,
+            GameCompletion.total > 0,
+        )
         .all()
-    }
-    return set(GAME_CATALOG.keys()).issubset(played_today)
+    )
+    passed_today = {r[0] for r in rows if is_passing_game(r[1], r[2])}
+    return set(GAME_CATALOG.keys()).issubset(passed_today)
 
 
 def _has_week_streak(db: Session, child: User) -> bool:
@@ -91,6 +98,7 @@ def check_and_award_badges(db: Session, child: User) -> list[dict]:
             continue
         if _CHECKS[bd["id"]](db, child):
             db.add(UserBadge(user_id=child.id, badge_id=bd["id"]))
+            already.add(bd["id"])
             newly_unlocked.append(bd)
 
     return newly_unlocked

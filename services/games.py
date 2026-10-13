@@ -34,3 +34,13 @@ def compute_reward(game_id: str, score: float, total: float):
     xp_awarded = round(game["base_xp"] * ratio)
     coins_awarded = round(xp_awarded * 0.5)
     return game["title"], xp_awarded, coins_awarded
+
+
+def is_passing_game(score: float, total: float) -> bool:
+    """
+    BUG-027 & BUG-054: Checks if a game run meets passing requirements:
+    score > 0 and passing score ratio (score / total >= 0.5).
+    """
+    if score is None or total is None or total <= 0 or score <= 0:
+        return False
+    return (score / total) >= 0.5

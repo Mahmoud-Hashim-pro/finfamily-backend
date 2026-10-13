@@ -28,6 +28,17 @@ def get_current_user(
             detail="Invalid or expired token",
         )
 
+    # BUG-001 (P0): Reject temporary MFA challenge / pending tokens on all normal endpoints
+    if (
+        payload.get("role") == "mfa_pending"
+        or payload.get("type") == "mfa_challenge"
+        or payload.get("mfa_pending") is True
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="MFA verification required",
+        )
+
     user_id = payload.get("sub")
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
@@ -36,11 +47,21 @@ def get_current_user(
             detail="User no longer exists",
         )
 
+    # BUG-009 (P1): Verify token_version matches user.token_version
+    token_version = payload.get("token_version")
+    user_token_version = getattr(user, "token_version", 1) or 1
+    if token_version is None or token_version != user_token_version:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been revoked",
+        )
+
     return user
 
 
 def require_parent(user: User = Depends(get_current_user)) -> User:
-    if user.role != "parent":
+    role_str = user.role.value if hasattr(user.role, "value") else str(user.role)
+    if role_str != "parent":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Parent access only",
@@ -49,7 +70,8 @@ def require_parent(user: User = Depends(get_current_user)) -> User:
 
 
 def require_child(user: User = Depends(get_current_user)) -> User:
-    if user.role != "child":
+    role_str = user.role.value if hasattr(user.role, "value") else str(user.role)
+    if role_str != "child":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Child access only",

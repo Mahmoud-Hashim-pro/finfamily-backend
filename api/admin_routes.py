@@ -1,11 +1,12 @@
 import os
+import logging
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from db.database import get_db, engine
 from db.models import (
@@ -17,31 +18,46 @@ from core.security import (
     verify_password, create_access_token, hash_password
 )
 from core.deps import get_current_user
+from core.limiter import limiter
+from core.audit import _client_ip
+
+logger = logging.getLogger("finfamily.admin")
 
 router = APIRouter(prefix="/api/admin", tags=["Admin Portal & Security Operations"])
 
 # ---------------------------------------------------------------------------
-# Admin Access Control & Whitelist
+# Admin Access Control & Whitelist (Solely from ADMIN_EMAILS environment variable)
 # ---------------------------------------------------------------------------
 
-DEFAULT_ADMINS = [
-    "modyhashim2006@gmail.com",
-    "pro.mahmoud.h@gmail.com",
-    "bassantmohamedelramlaw@gmail.com",
-    "abdallah.ahmed@finfamily.com",
-    "omar.osama.sw.dev@gmail.com",
-    "ashayman111@gmail.com",
-    "ramezrizkw@gmail.com",
-    "zyad.ahmed.softwareeng@gmail.com",
-]
-raw_admins = os.getenv("ADMIN_EMAILS", ",".join(DEFAULT_ADMINS))
-ADMIN_ALLOWLIST = {e.strip().lower() for e in raw_admins.split(",") if e.strip()}
-ADMIN_ALLOWLIST.update(DEFAULT_ADMINS)
+def get_admin_allowlist() -> set:
+    """
+    Returns the set of authorized admin email addresses.
+    Loaded solely from the ADMIN_EMAILS environment variable.
+    If ADMIN_EMAILS is unset or empty, no admin emails are authorized.
+    """
+    raw_admins = os.getenv("ADMIN_EMAILS", "")
+    if not raw_admins:
+        return set()
+    return {e.strip().lower() for e in raw_admins.split(",") if e.strip()}
+
+
+class _AdminAllowlistProxy(set):
+    """Dynamic set proxy that evaluates against the current ADMIN_EMAILS environment variable."""
+    def __contains__(self, item):
+        return (item.strip().lower() if isinstance(item, str) else item) in get_admin_allowlist()
+    def __iter__(self):
+        return iter(get_admin_allowlist())
+    def __len__(self):
+        return len(get_admin_allowlist())
+
+
+ADMIN_ALLOWLIST = _AdminAllowlistProxy()
 
 
 def require_admin(user: User = Depends(get_current_user)) -> User:
     """Ensure the requester is in the authorized admin allowlist."""
-    if not user.email or user.email.lower() not in ADMIN_ALLOWLIST:
+    allowlist = get_admin_allowlist()
+    if not user.email or user.email.lower() not in allowlist:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied: Admin privileges required."
@@ -68,46 +84,67 @@ class SecurityBeaconRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 @router.post("/auth/login")
-def admin_login(payload: AdminLoginRequest, request: Request, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+def admin_login(request: Request, payload: AdminLoginRequest, db: Session = Depends(get_db)):
     clean_email = payload.email.strip().lower()
-    
-    if clean_email not in ADMIN_ALLOWLIST:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Unauthorized: This email is not on the FinFamily administration whitelist."
-        )
+    client_ip = _client_ip(request) or (request.client.host if request.client else "unknown")
+    allowlist = get_admin_allowlist()
 
-    user = db.query(User).filter(func.lower(User.email) == clean_email).first()
-    if not user:
-        # Auto-provision super admin in FinFamily HQ
-        admin_family = db.query(Family).filter(Family.name == "FinFamily HQ").first()
-        if not admin_family:
-            admin_family = Family(name="FinFamily HQ", family_code="ADMINS")
-            db.add(admin_family)
-            db.commit()
-            db.refresh(admin_family)
-
-        name_part = clean_email.split("@")[0].replace(".", " ").title()
-        user = User(
-            family_id=admin_family.id,
-            role=UserRole.parent,
-            full_name=f"Admin {name_part}",
-            email=clean_email,
-            password_hash=hash_password(payload.password),
+    # Reject non-allowlisted emails with generic 401 (same as invalid credentials) to prevent account enumeration
+    if clean_email not in allowlist:
+        audit = AuditLog(
+            family_id=None,
+            actor_id=None,
+            actor_role="admin",
+            action="admin_login_failed",
+            target_type="admin_console",
+            target_id=None,
+            ip_address=client_ip,
+            detail={"email": clean_email, "reason": "unauthorized_email", "timestamp": datetime.utcnow().isoformat()}
         )
-        db.add(user)
+        db.add(audit)
         db.commit()
-        db.refresh(user)
-
-    if not user.password_hash or not verify_password(payload.password, user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid admin credentials."
         )
 
-    # Issue full admin access token (valid for 24 hours)
+    user = db.query(User).filter(func.lower(User.email) == clean_email).first()
+    if not user or not user.password_hash or not verify_password(payload.password, user.password_hash):
+        audit = AuditLog(
+            family_id=user.family_id if user else None,
+            actor_id=user.id if user else None,
+            actor_role="admin",
+            action="admin_login_failed",
+            target_type="admin_console",
+            target_id=user.id if user else None,
+            ip_address=client_ip,
+            detail={"email": clean_email, "reason": "invalid_credentials", "timestamp": datetime.utcnow().isoformat()}
+        )
+        db.add(audit)
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid admin credentials."
+        )
+
+    # Enforce MFA challenge if admin account has MFA enabled
+    if user.mfa_enabled:
+        temp_token = create_access_token(
+            data={"sub": user.id, "role": "mfa_pending", "email": clean_email, "type": "mfa_challenge"},
+            expires_delta=timedelta(minutes=5)
+        )
+        return {
+            "mfa_required": True,
+            "access_token": temp_token,
+            "token_type": "bearer",
+            "message": "MFA verification required."
+        }
+
+    # Issue full admin access token (valid for 24 hours) with token version
+    token_version = getattr(user, "token_version", 1)
     token = create_access_token(
-        data={"sub": user.id, "role": "admin", "email": clean_email},
+        data={"sub": user.id, "role": "admin", "email": clean_email, "token_version": token_version},
         expires_delta=timedelta(hours=24)
     )
 
@@ -119,7 +156,7 @@ def admin_login(payload: AdminLoginRequest, request: Request, db: Session = Depe
         action="admin_login_success",
         target_type="admin_console",
         target_id=user.id,
-        ip_address=request.client.host if request.client else "unknown",
+        ip_address=client_ip,
         detail={"email": clean_email, "timestamp": datetime.utcnow().isoformat()}
     )
     db.add(audit)
@@ -168,14 +205,22 @@ def get_admin_overview(admin: User = Depends(require_admin), db: Session = Depen
     rejected_purchases = db.query(CardPurchase).filter(CardPurchase.status == PurchaseStatus.rejected).count()
     pending_purchases = db.query(CardPurchase).filter(CardPurchase.status == PurchaseStatus.pending).count()
 
-    # Security alerts in last 24 hours
+    # Security alerts in last 24 hours (including all tampering and auth failure variants)
     since_24h = datetime.utcnow() - timedelta(hours=24)
     security_alerts_24h = db.query(AuditLog).filter(
-        AuditLog.action.in_([
-            "login_failed", "pin_locked", "card_frozen", "devtools_tampering_detected", "suspicious_activity"
-        ]),
+        (AuditLog.action.in_([
+            "login_failed", "admin_login_failed", "pin_locked", "card_frozen", "devtools_tampering_detected", "suspicious_activity"
+        ])) | (AuditLog.action.like("tampering_%")) | (AuditLog.action.like("untrusted_tampering_%")),
         AuditLog.created_date >= since_24h
     ).count()
+
+    total_decided = completed_purchases + rejected_purchases
+    if total_decided > 0:
+        success_rate = round((completed_purchases / total_decided * 100), 1)
+    elif total_card_purchases == 0:
+        success_rate = 100.0
+    else:
+        success_rate = 0.0
 
     return {
         "status": "online",
@@ -202,11 +247,11 @@ def get_admin_overview(admin: User = Depends(require_admin), db: Session = Depen
             "completed": completed_purchases,
             "pending": pending_purchases,
             "rejected": rejected_purchases,
-            "success_rate_percent": round((completed_purchases / total_card_purchases * 100), 1) if total_card_purchases > 0 else 100.0,
+            "success_rate_percent": success_rate,
         },
         "security": {
             "alerts_24h": security_alerts_24h,
-            "allowlist_size": len(ADMIN_ALLOWLIST),
+            "allowlist_size": len(get_admin_allowlist()),
         }
     }
 
@@ -224,14 +269,21 @@ def get_admin_transactions(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db)
 ):
-    query = db.query(CardPurchase)
+    query = db.query(CardPurchase).options(
+        joinedload(CardPurchase.child),
+        joinedload(CardPurchase.family),
+        joinedload(CardPurchase.wallet),
+    )
 
     if status_filter and status_filter.lower() != "all":
         try:
             enum_status = PurchaseStatus(status_filter.lower())
             query = query.filter(CardPurchase.status == enum_status)
         except ValueError:
-            pass
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid status filter '{status_filter}'. Allowed values: all, completed, pending, rejected"
+            )
 
     if search:
         search_term = f"%{search}%"
@@ -245,9 +297,9 @@ def get_admin_transactions(
 
     results = []
     for p in purchases:
-        child = db.query(User).filter(User.id == p.child_id).first()
-        family = db.query(Family).filter(Family.id == p.family_id).first()
-        wallet = db.query(Wallet).filter(Wallet.id == p.wallet_id).first()
+        child = p.child
+        family = p.family
+        wallet = p.wallet
 
         results.append({
             "id": p.id,
@@ -282,22 +334,27 @@ def get_admin_cards(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db)
 ):
-    query = db.query(Wallet)
+    query = db.query(Wallet).options(
+        joinedload(Wallet.owner).joinedload(User.family)
+    )
 
     if status_filter and status_filter.lower() != "all":
         try:
             c_status = CardStatus(status_filter.lower())
             query = query.filter(Wallet.card_status == c_status)
         except ValueError:
-            pass
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid status filter '{status_filter}'. Allowed values: all, active, frozen, deactivated"
+            )
 
     total = query.count()
     wallets = query.order_by(Wallet.created_date.desc()).offset(offset).limit(limit).all()
 
     items = []
     for w in wallets:
-        owner = db.query(User).filter(User.id == w.owner_id).first()
-        family = db.query(Family).filter(Family.id == owner.family_id).first() if owner else None
+        owner = w.owner
+        family = owner.family if owner else None
         
         items.append({
             "wallet_id": w.id,
@@ -327,7 +384,7 @@ def update_card_status_as_admin(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db)
 ):
-    wallet = db.query(Wallet).filter(Wallet.id == wallet_id).first()
+    wallet = db.query(Wallet).options(joinedload(Wallet.owner)).filter(Wallet.id == wallet_id).first()
     if not wallet:
         raise HTTPException(status_code=404, detail="Wallet/Card not found")
 
@@ -335,15 +392,18 @@ def update_card_status_as_admin(
     wallet.card_status = payload.card_status
     wallet.updated_date = datetime.utcnow()
 
-    # Log administrative card intervention
+    client_ip = _client_ip(request) or (request.client.host if request.client else "unknown")
+    target_family_id = wallet.owner.family_id if (wallet.owner and wallet.owner.family_id) else None
+
+    # Log administrative card intervention attributed to the affected family
     audit = AuditLog(
-        family_id=None,
+        family_id=target_family_id,
         actor_id=admin.id,
         actor_role="admin",
         action="admin_card_status_override",
         target_type="wallet",
         target_id=wallet.id,
-        ip_address=request.client.host if request.client else "unknown",
+        ip_address=client_ip,
         detail={
             "old_status": old_status,
             "new_status": payload.card_status.value,
@@ -365,36 +425,50 @@ def update_card_status_as_admin(
 # 5. Neon Database Telemetry & Connection Health
 # ---------------------------------------------------------------------------
 
+@router.get("/health/db")
 @router.get("/database/health")
 def get_database_health(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     start_time = datetime.utcnow()
     
-    # Ping database with a simple query
+    # Ping database with an active check
     try:
-        db.execute(func.now())
+        from sqlalchemy import text
+        db.execute(text("SELECT 1"))
         db_ping_ms = round((datetime.utcnow() - start_time).total_seconds() * 1000, 2)
-        connection_status = "connected"
+        connection_status = "healthy"
     except Exception as e:
-        db_ping_ms = -1
-        connection_status = f"unhealthy: {str(e)}"
+        db.rollback()
+        logger.error(f"Database health check failed: {e}")
+        return {
+            "status": "unhealthy",
+            "error": "Database unavailable",
+            "connection": "unhealthy",
+            "latency_ms": -1,
+            "timestamp": datetime.utcnow().isoformat(),
+            "table_row_counts": {}
+        }
 
-    # Record counts across core tables
-    table_stats = {
-        "families": db.query(Family).count(),
-        "users": db.query(User).count(),
-        "wallets": db.query(Wallet).count(),
-        "transactions": db.query(Transaction).count(),
-        "card_purchases": db.query(CardPurchase).count(),
-        "missions": db.query(Mission).count(),
-        "savings_goals": db.query(SavingsGoal).count(),
-        "audit_logs": db.query(AuditLog).count(),
-    }
+    # Record counts across core tables with rollback protection
+    try:
+        table_stats = {
+            "families": db.query(Family).count(),
+            "users": db.query(User).count(),
+            "wallets": db.query(Wallet).count(),
+            "transactions": db.query(Transaction).count(),
+            "card_purchases": db.query(CardPurchase).count(),
+            "missions": db.query(Mission).count(),
+            "savings_goals": db.query(SavingsGoal).count(),
+            "audit_logs": db.query(AuditLog).count(),
+        }
+    except Exception as e:
+        db.rollback()
+        logger.warning(f"Failed to query table counts during database health check: {e}")
+        table_stats = {}
 
     return {
-        "provider": "Neon PostgreSQL (Serverless Frankfurt)",
+        "status": "healthy",
         "connection": connection_status,
         "latency_ms": db_ping_ms,
-        "pooler_active": True,
         "timestamp": datetime.utcnow().isoformat(),
         "table_row_counts": table_stats
     }
@@ -410,18 +484,22 @@ def get_security_alerts(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db)
 ):
-    # 1. Accounts currently locked due to failed PIN/Password attempts
-    locked_children = db.query(User).filter(
-        (User.failed_pin_attempts > 0) | (User.pin_locked_until != None)
+    # 1. Accounts currently actively locked due to failed PIN attempts
+    now_utc = datetime.utcnow()
+    locked_children = db.query(User).options(
+        joinedload(User.family)
+    ).filter(
+        User.pin_locked_until != None,
+        User.pin_locked_until > now_utc
     ).all()
 
     locked_items = []
     for c in locked_children:
-        family = db.query(Family).filter(Family.id == c.family_id).first()
+        family = c.family
         locked_items.append({
             "user_id": c.id,
             "full_name": c.full_name,
-            "role": c.role.value,
+            "role": c.role.value if hasattr(c.role, "value") else str(c.role),
             "family_name": family.name if family else "Unknown",
             "failed_attempts": c.failed_pin_attempts,
             "locked_until": c.pin_locked_until.isoformat() if c.pin_locked_until else None,
@@ -451,23 +529,70 @@ def get_security_alerts(
     }
 
 
-@router.post("/security/beacon")
-def record_security_beacon(payload: SecurityBeaconRequest, request: Request, db: Session = Depends(get_db)):
-    """Receives client-side tampering and DevTools intrusion reports."""
-    client_ip = request.client.host if request.client else "unknown"
+ALLOWED_BEACON_EVENTS = {
+    "devtools_opened",
+    "unauthorized_tampering",
+    "suspicious_request",
+    "automated_health_check_test",
+    "debugger_detected",
+    "emulator_detected",
+    "integrity_failure"
+}
 
+
+@router.post("/security/beacon")
+@limiter.limit("10/minute")
+def record_security_beacon(request: Request, payload: SecurityBeaconRequest, db: Session = Depends(get_db)):
+    """Receives bounded, rate-limited client-side intrusion reports labeled as untrusted."""
+    if not payload.event_type or len(payload.event_type.strip()) == 0 or len(payload.event_type) > 64:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="event_type is required and must not exceed 64 characters."
+        )
+
+    clean_event = payload.event_type.strip().lower()
+    if clean_event not in ALLOWED_BEACON_EVENTS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid event_type '{payload.event_type}'. Must be one of: {', '.join(sorted(ALLOWED_BEACON_EVENTS))}"
+        )
+
+    if payload.details is not None:
+        if len(payload.details) > 20:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Payload details dictionary exceeds maximum limit of 20 keys."
+            )
+        import json
+        try:
+            serialized = json.dumps(payload.details)
+            if len(serialized) > 4096:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Payload details size exceeds maximum allowed limit (4 KB)."
+                )
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid payload details format."
+            )
+
+    client_ip = _client_ip(request) or (request.client.host if request.client else "unknown")
+
+    # Store with untrusted attribution label so client reports are never confused with verified incidents
     beacon_log = AuditLog(
         family_id=None,
         actor_id=None,
-        actor_role="client_beacon",
-        action=f"tampering_{payload.event_type}",
+        actor_role="untrusted_client_beacon",
+        action=f"untrusted_tampering_{clean_event[:50]}",
         target_type="browser_client",
         target_id=None,
         ip_address=client_ip,
         detail={
-            "event": payload.event_type,
+            "untrusted_client_report": True,
+            "event": clean_event,
             "payload": payload.details or {},
-            "user_agent": request.headers.get("user-agent", "unknown"),
+            "user_agent": (request.headers.get("user-agent") or "unknown")[:256],
             "timestamp": datetime.utcnow().isoformat(),
         }
     )

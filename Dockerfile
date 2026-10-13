@@ -1,23 +1,41 @@
-FROM python:3.10-slim
-
-# متغيرات بايثون قياسية عشان اللوجز تظهر فورًا (مفيدة وقت الـ debugging على Azure)
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+# Stage 1: Build stage with compilation tools
+FROM python:3.10-slim AS builder
 
 WORKDIR /app
 
-# مكتبات نظام لازمة لبناء psycopg2-binary وbcrypt/cryptography وقت الـ pip install
+# Install system dependencies required for building wheels
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# بنسخ requirements لوحدها الأول عشان Docker يعمل cache للطبقة دي — لو الكود
-# اتغيّر بس requirements.txt لأ، مش هيعيد تثبيت كل المكتبات تاني من الصفر
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
-COPY . .
+# Stage 2: Hardened runtime stage (no gcc or compilers)
+FROM python:3.10-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Install only the runtime PostgreSQL shared library
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy pre-installed Python packages from builder stage
+COPY --from=builder /install /usr/local
+
+# Create unprivileged system user and group (non-root)
+RUN useradd -m -r -u 1001 -s /sbin/nologin appuser
+
+COPY . /app
+
+RUN chown -R appuser:appuser /app
+
+USER appuser
 
 EXPOSE 8000
 

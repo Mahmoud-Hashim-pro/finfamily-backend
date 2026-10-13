@@ -27,8 +27,8 @@ def run_tests():
 
     # 3. Parent Login
     login_payload = {
-        "email": "modyhashim2006@gmail.com",
-        "password": "Admin@FinFamily2026!"
+        "email": os.getenv("TEST_ADMIN_EMAIL", "admin@finfamily.test"),
+        "password": os.getenv("TEST_ADMIN_PASSWORD", "Test@AdminPass123")
     }
     res = client.post("/api/auth/login", json=login_payload)
     assert res.status_code == 200, f"Parent login failed: {res.text}"
