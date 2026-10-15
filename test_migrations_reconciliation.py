@@ -184,6 +184,44 @@ def test_migration_upgrade_from_legacy_schema():
                     created_date TIMESTAMP
                 );
             """))
+
+            # Seed realistic legacy data before upgrade
+            conn.execute(sa.text("""
+                INSERT INTO families (id, name, family_code, created_date)
+                VALUES ('fam_1', 'Hashim Family', 'HASHIM01', '2026-01-01 12:00:00');
+            """))
+            conn.execute(sa.text("""
+                INSERT INTO users (id, family_id, role, full_name, email, password_hash, pin_hash, xp, level, streak, is_active, created_date)
+                VALUES 
+                ('user_p1', 'fam_1', 'parent', 'Mahmoud Hashim', 'parent@example.com', 'hashed_pw', NULL, 0, 1, 0, 1, '2026-01-01 12:00:00'),
+                ('user_c1', 'fam_1', 'child', 'Karim Hashim', NULL, NULL, 'hashed_pin', 250, 4, 7, 1, '2026-01-02 12:00:00');
+            """))
+            conn.execute(sa.text("""
+                INSERT INTO wallets (id, owner_id, balance, savings_balance, card_status, created_date)
+                VALUES ('wallet_c1', 'user_c1', 1250.75, 450.50, 'active', '2026-01-02 12:00:00');
+            """))
+            conn.execute(sa.text("""
+                INSERT INTO savings_goals (id, wallet_id, name, target, current, status, created_date)
+                VALUES ('goal_1', 'wallet_c1', 'New Bicycle', 2000.0, 450.50, 'in_progress', '2026-01-05 12:00:00');
+            """))
+            conn.execute(sa.text("""
+                INSERT INTO missions (id, family_id, assigned_to_id, title, kind, reward, status, created_date)
+                VALUES ('mission_1', 'fam_1', 'user_c1', 'Clean Bedroom', 'chore', 50.0, 'completed', '2026-01-06 12:00:00');
+            """))
+            conn.execute(sa.text("""
+                INSERT INTO transactions (id, wallet_id, family_id, type, direction, amount, description, created_date)
+                VALUES 
+                ('tx_1', 'wallet_c1', 'fam_1', 'allowance', 'credit', 200.00, 'Weekly allowance', '2026-01-07 12:00:00'),
+                ('tx_2', 'wallet_c1', 'fam_1', 'purchase', 'debit', 45.25, 'Bookstore purchase', '2026-01-08 12:00:00');
+            """))
+            conn.execute(sa.text("""
+                INSERT INTO card_purchases (id, family_id, child_id, wallet_id, merchant, amount, status, created_date)
+                VALUES ('cp_1', 'fam_1', 'user_c1', 'wallet_c1', 'Jarir Bookstore', 45.25, 'approved', '2026-01-08 12:00:00');
+            """))
+            conn.execute(sa.text("""
+                INSERT INTO game_completions (id, child_id, game_id, score, total, xp_awarded, coins_awarded, was_rewarded, reward_date, created_date)
+                VALUES ('gc_1', 'user_c1', 'budget_hero', 100.0, 100.0, 50, 25.0, 1, '2026-10-15', '2026-10-15 12:00:00');
+            """))
         engine.dispose()
 
         # Run Alembic upgrade head
@@ -211,6 +249,86 @@ def test_migration_upgrade_from_legacy_schema():
         assert "daily_limit" in wallet_cols
         assert "weekly_limit" in wallet_cols
         assert "monthly_limit" in wallet_cols
+
+        # Verify complete data and relationship preservation after upgrade
+        with engine.begin() as conn:
+            # Families
+            fam = conn.execute(sa.text("SELECT id, name, family_code FROM families WHERE id = 'fam_1'")).fetchone()
+            assert fam is not None, "Family record missing after migration"
+            assert fam[1] == 'Hashim Family'
+            assert fam[2] == 'HASHIM01'
+
+            # Users
+            users = conn.execute(sa.text("SELECT id, role, full_name, email, xp, level, streak, token_version FROM users ORDER BY id")).fetchall()
+            assert len(users) == 2, f"Expected 2 users, found {len(users)}"
+            child_u = next(u for u in users if u[1] == 'child')
+            parent_u = next(u for u in users if u[1] == 'parent')
+            assert parent_u[2] == 'Mahmoud Hashim'
+            assert parent_u[3] == 'parent@example.com'
+            assert child_u[2] == 'Karim Hashim'
+            assert child_u[4] == 250
+            assert child_u[5] == 4
+            assert child_u[6] == 7
+
+            # Wallets: verify balance and savings_balance numeric conversion
+            w = conn.execute(sa.text("SELECT id, owner_id, balance, savings_balance, card_status, daily_limit FROM wallets WHERE id = 'wallet_c1'")).fetchone()
+            assert w is not None, "Wallet record missing after migration"
+            assert w[1] == 'user_c1'
+            assert round(float(w[2]), 2) == 1250.75
+            assert round(float(w[3]), 2) == 450.50
+            assert w[4] == 'active'
+            assert w[5] is None  # new column initialized safely
+
+            # Savings goals
+            goal = conn.execute(sa.text("SELECT id, wallet_id, name, target, current, status FROM savings_goals WHERE id = 'goal_1'")).fetchone()
+            assert goal is not None, "SavingsGoal record missing after migration"
+            assert goal[1] == 'wallet_c1'
+            assert goal[2] == 'New Bicycle'
+            assert round(float(goal[3]), 2) == 2000.00
+            assert round(float(goal[4]), 2) == 450.50
+
+            # Missions
+            m = conn.execute(sa.text("SELECT id, family_id, assigned_to_id, title, reward, status FROM missions WHERE id = 'mission_1'")).fetchone()
+            assert m is not None, "Mission record missing after migration"
+            assert m[1] == 'fam_1'
+            assert m[2] == 'user_c1'
+            assert round(float(m[4]), 2) == 50.00
+            assert m[5] == 'completed'
+
+            # Transactions
+            txs = conn.execute(sa.text("SELECT id, type, direction, amount, description FROM transactions ORDER BY id")).fetchall()
+            assert len(txs) == 2, f"Expected 2 transactions, found {len(txs)}"
+            assert round(float(txs[0][3]), 2) == 200.00
+            assert round(float(txs[1][3]), 2) == 45.25
+
+            # Card Purchases
+            cp = conn.execute(sa.text("SELECT id, merchant, amount, status FROM card_purchases WHERE id = 'cp_1'")).fetchone()
+            assert cp is not None, "CardPurchase record missing after migration"
+            assert cp[1] == 'Jarir Bookstore'
+            assert round(float(cp[2]), 2) == 45.25
+            assert cp[3] == 'approved'
+
+            # Game Completions
+            gc = conn.execute(sa.text("SELECT id, game_id, score, xp_awarded, coins_awarded FROM game_completions WHERE id = 'gc_1'")).fetchone()
+            assert gc is not None, "GameCompletion record missing after migration"
+            assert gc[1] == 'budget_hero'
+            assert round(float(gc[2]), 2) == 100.0
+            assert gc[3] == 50
+            assert round(float(gc[4]), 2) == 25.0
+
+            # Verify that existing users can integrate seamlessly with new tables
+            conn.execute(sa.text("""
+                INSERT INTO idempotency_records (id, key, user_id, action, payload_hash)
+                VALUES ('idem_rec_1', 'idem_test_key_1', 'user_p1', 'allowance_transfer', 'dummy_hash_123');
+            """))
+            conn.execute(sa.text("""
+                INSERT INTO lesson_completions (id, child_id, lesson_id, xp_awarded)
+                VALUES ('lc_1', 'user_c1', 'saving_basics', 20);
+            """))
+            idem_count = conn.execute(sa.text("SELECT COUNT(*) FROM idempotency_records")).scalar()
+            assert idem_count == 1
+            lc_count = conn.execute(sa.text("SELECT COUNT(*) FROM lesson_completions")).scalar()
+            assert lc_count == 1
 
         if 'engine' in locals():
             engine.dispose()
