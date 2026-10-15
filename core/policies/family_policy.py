@@ -62,11 +62,11 @@ def require_family_wallet(
     """
     q = (
         db.query(Wallet, User.family_id)
-        .outerjoin(User, Wallet.owner_id == User.id)
+        .join(User, Wallet.owner_id == User.id)
         .filter(Wallet.id == wallet_id)
     )
     if for_update:
-        q = q.with_for_update()
+        q = q.with_for_update(of=Wallet)
     row = q.first()
 
     if not row:
@@ -173,12 +173,12 @@ def require_family_goal(
     """
     q = (
         db.query(SavingsGoal, User.family_id)
-        .outerjoin(Wallet, SavingsGoal.wallet_id == Wallet.id)
-        .outerjoin(User, Wallet.owner_id == User.id)
+        .join(Wallet, SavingsGoal.wallet_id == Wallet.id)
+        .join(User, Wallet.owner_id == User.id)
         .filter(SavingsGoal.id == goal_id)
     )
     if for_update:
-        q = q.with_for_update()
+        q = q.with_for_update(of=SavingsGoal)
     row = q.first()
 
     if not row:
