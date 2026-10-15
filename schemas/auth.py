@@ -19,6 +19,7 @@ class UserResponse(BaseModel):
     level: int = 1
     streak: int = 0
     mfa_enabled: bool = False
+    is_active: bool = True
     created_date: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -78,6 +79,39 @@ class ParentLoginResult(BaseModel):
     temp_token: Optional[str] = None
     user: Optional[UserResponse] = None
     used_recovery_code: bool = False  # لو دخل بكود استرجاع — الفرونت لازم ينبهه يولّد أكواد جديدة
+
+
+class GoogleLoginRequest(BaseModel):
+    id_token: Optional[str] = None
+    email: Optional[EmailStr] = None
+    name: Optional[str] = None
+    full_name: Optional[str] = None
+    family_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, v):
+        if isinstance(v, str):
+            clean = v.strip().lower()
+            return clean if clean else None
+        return v
+
+
+class GoogleAuthRequest(BaseModel):
+    email: EmailStr = Field(max_length=255)
+    full_name: Optional[str] = Field(default=None, max_length=100)
+    name: Optional[str] = Field(default=None, max_length=100)
+    family_name: Optional[str] = Field(default=None, max_length=100)
+    avatar_url: Optional[str] = None
+    id_token: Optional[str] = None
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, v):
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
 
 
 class MfaVerifyRequest(BaseModel):

@@ -1,0 +1,217 @@
+"""initial_numeric_and_isolation
+
+Revision ID: 0001_initial_numeric_and_isolation
+Revises:
+Create Date: 2026-10-15 14:00:00.000000
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision: str = '0001_initial_numeric_and_isolation'
+down_revision: Union[str, None] = None
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    # 1. Create idempotency_records table
+    op.create_table(
+        'idempotency_records',
+        sa.Column('id', sa.String(), nullable=False),
+        sa.Column('key', sa.String(length=128), nullable=False),
+        sa.Column('family_id', sa.String(), nullable=True),
+        sa.Column('user_id', sa.String(), nullable=True),
+        sa.Column('action', sa.String(), nullable=False),
+        sa.Column('created_date', sa.DateTime(), nullable=True),
+        sa.ForeignKeyConstraint(['family_id'], ['families.id'], ),
+        sa.ForeignKeyConstraint(['user_id'], ['users.id'], ),
+        sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_idempotency_records_id'), 'idempotency_records', ['id'], unique=False)
+    op.create_index(op.f('ix_idempotency_records_key'), 'idempotency_records', ['key'], unique=True)
+    op.create_index(op.f('ix_idempotency_records_family_id'), 'idempotency_records', ['family_id'], unique=False)
+    op.create_index(op.f('ix_idempotency_records_user_id'), 'idempotency_records', ['user_id'], unique=False)
+
+    # 2. Create lesson_completions table
+    op.create_table(
+        'lesson_completions',
+        sa.Column('id', sa.String(), nullable=False),
+        sa.Column('child_id', sa.String(), nullable=False),
+        sa.Column('lesson_id', sa.String(), nullable=False),
+        sa.Column('xp_awarded', sa.Integer(), nullable=True),
+        sa.Column('created_date', sa.DateTime(), nullable=True),
+        sa.ForeignKeyConstraint(['child_id'], ['users.id'], ),
+        sa.PrimaryKeyConstraint('id'),
+        sa.UniqueConstraint('child_id', 'lesson_id', name='uq_child_lesson')
+    )
+    op.create_index(op.f('ix_lesson_completions_id'), 'lesson_completions', ['id'], unique=False)
+    op.create_index(op.f('ix_lesson_completions_child_id'), 'lesson_completions', ['child_id'], unique=False)
+    op.create_index(op.f('ix_lesson_completions_lesson_id'), 'lesson_completions', ['lesson_id'], unique=False)
+
+    # 3. Upgrade financial columns from Float to Numeric(12, 2)
+    # wallets
+    with op.batch_alter_table('wallets', schema=None) as batch_op:
+        batch_op.alter_column('balance',
+                   existing_type=sa.Float(),
+                   type_=sa.Numeric(precision=12, scale=2),
+                   existing_nullable=True,
+                   postgresql_using='balance::numeric(12, 2)')
+        batch_op.alter_column('savings_balance',
+                   existing_type=sa.Float(),
+                   type_=sa.Numeric(precision=12, scale=2),
+                   existing_nullable=True,
+                   postgresql_using='savings_balance::numeric(12, 2)')
+        batch_op.alter_column('daily_limit',
+                   existing_type=sa.Float(),
+                   type_=sa.Numeric(precision=12, scale=2),
+                   existing_nullable=True,
+                   postgresql_using='daily_limit::numeric(12, 2)')
+        batch_op.alter_column('weekly_limit',
+                   existing_type=sa.Float(),
+                   type_=sa.Numeric(precision=12, scale=2),
+                   existing_nullable=True,
+                   postgresql_using='weekly_limit::numeric(12, 2)')
+        batch_op.alter_column('monthly_limit',
+                   existing_type=sa.Float(),
+                   type_=sa.Numeric(precision=12, scale=2),
+                   existing_nullable=True,
+                   postgresql_using='monthly_limit::numeric(12, 2)')
+
+    # savings_goals
+    with op.batch_alter_table('savings_goals', schema=None) as batch_op:
+        batch_op.alter_column('target',
+                   existing_type=sa.Float(),
+                   type_=sa.Numeric(precision=12, scale=2),
+                   existing_nullable=False,
+                   postgresql_using='target::numeric(12, 2)')
+        batch_op.alter_column('current',
+                   existing_type=sa.Float(),
+                   type_=sa.Numeric(precision=12, scale=2),
+                   existing_nullable=True,
+                   postgresql_using='current::numeric(12, 2)')
+
+    # missions
+    with op.batch_alter_table('missions', schema=None) as batch_op:
+        batch_op.alter_column('reward',
+                   existing_type=sa.Float(),
+                   type_=sa.Numeric(precision=12, scale=2),
+                   existing_nullable=False,
+                   postgresql_using='reward::numeric(12, 2)')
+
+    # transactions
+    with op.batch_alter_table('transactions', schema=None) as batch_op:
+        batch_op.alter_column('amount',
+                   existing_type=sa.Float(),
+                   type_=sa.Numeric(precision=12, scale=2),
+                   existing_nullable=False,
+                   postgresql_using='amount::numeric(12, 2)')
+
+    # card_purchases
+    with op.batch_alter_table('card_purchases', schema=None) as batch_op:
+        batch_op.alter_column('amount',
+                   existing_type=sa.Float(),
+                   type_=sa.Numeric(precision=12, scale=2),
+                   existing_nullable=False,
+                   postgresql_using='amount::numeric(12, 2)')
+
+    # game_completions
+    with op.batch_alter_table('game_completions', schema=None) as batch_op:
+        batch_op.alter_column('coins_awarded',
+                   existing_type=sa.Float(),
+                   type_=sa.Numeric(precision=12, scale=2),
+                   existing_nullable=True,
+                   postgresql_using='coins_awarded::numeric(12, 2)')
+
+
+def downgrade() -> None:
+    # 1. Downgrade financial columns from Numeric(12, 2) back to Float
+    # game_completions
+    with op.batch_alter_table('game_completions', schema=None) as batch_op:
+        batch_op.alter_column('coins_awarded',
+                   existing_type=sa.Numeric(precision=12, scale=2),
+                   type_=sa.Float(),
+                   existing_nullable=True,
+                   postgresql_using='coins_awarded::double precision')
+
+    # card_purchases
+    with op.batch_alter_table('card_purchases', schema=None) as batch_op:
+        batch_op.alter_column('amount',
+                   existing_type=sa.Numeric(precision=12, scale=2),
+                   type_=sa.Float(),
+                   existing_nullable=False,
+                   postgresql_using='amount::double precision')
+
+    # transactions
+    with op.batch_alter_table('transactions', schema=None) as batch_op:
+        batch_op.alter_column('amount',
+                   existing_type=sa.Numeric(precision=12, scale=2),
+                   type_=sa.Float(),
+                   existing_nullable=False,
+                   postgresql_using='amount::double precision')
+
+    # missions
+    with op.batch_alter_table('missions', schema=None) as batch_op:
+        batch_op.alter_column('reward',
+                   existing_type=sa.Numeric(precision=12, scale=2),
+                   type_=sa.Float(),
+                   existing_nullable=False,
+                   postgresql_using='reward::double precision')
+
+    # savings_goals
+    with op.batch_alter_table('savings_goals', schema=None) as batch_op:
+        batch_op.alter_column('current',
+                   existing_type=sa.Numeric(precision=12, scale=2),
+                   type_=sa.Float(),
+                   existing_nullable=True,
+                   postgresql_using='current::double precision')
+        batch_op.alter_column('target',
+                   existing_type=sa.Numeric(precision=12, scale=2),
+                   type_=sa.Float(),
+                   existing_nullable=False,
+                   postgresql_using='target::double precision')
+
+    # wallets
+    with op.batch_alter_table('wallets', schema=None) as batch_op:
+        batch_op.alter_column('monthly_limit',
+                   existing_type=sa.Numeric(precision=12, scale=2),
+                   type_=sa.Float(),
+                   existing_nullable=True,
+                   postgresql_using='monthly_limit::double precision')
+        batch_op.alter_column('weekly_limit',
+                   existing_type=sa.Numeric(precision=12, scale=2),
+                   type_=sa.Float(),
+                   existing_nullable=True,
+                   postgresql_using='weekly_limit::double precision')
+        batch_op.alter_column('daily_limit',
+                   existing_type=sa.Numeric(precision=12, scale=2),
+                   type_=sa.Float(),
+                   existing_nullable=True,
+                   postgresql_using='daily_limit::double precision')
+        batch_op.alter_column('savings_balance',
+                   existing_type=sa.Numeric(precision=12, scale=2),
+                   type_=sa.Float(),
+                   existing_nullable=True,
+                   postgresql_using='savings_balance::double precision')
+        batch_op.alter_column('balance',
+                   existing_type=sa.Numeric(precision=12, scale=2),
+                   type_=sa.Float(),
+                   existing_nullable=True,
+                   postgresql_using='balance::double precision')
+
+    # 2. Drop lesson_completions table
+    op.drop_index(op.f('ix_lesson_completions_lesson_id'), table_name='lesson_completions')
+    op.drop_index(op.f('ix_lesson_completions_child_id'), table_name='lesson_completions')
+    op.drop_index(op.f('ix_lesson_completions_id'), table_name='lesson_completions')
+    op.drop_table('lesson_completions')
+
+    # 3. Drop idempotency_records table
+    op.drop_index(op.f('ix_idempotency_records_user_id'), table_name='idempotency_records')
+    op.drop_index(op.f('ix_idempotency_records_family_id'), table_name='idempotency_records')
+    op.drop_index(op.f('ix_idempotency_records_key'), table_name='idempotency_records')
+    op.drop_index(op.f('ix_idempotency_records_id'), table_name='idempotency_records')
+    op.drop_table('idempotency_records')

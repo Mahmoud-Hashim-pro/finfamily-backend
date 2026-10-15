@@ -108,6 +108,7 @@ class User(Base):
     streak = Column(Integer, default=0)
     last_active_date = Column(DateTime, nullable=True)  # آخر يوم اتحسب فيه نشاط للـ streak
     avatar_url = Column(String, nullable=True)
+    is_active = Column(Boolean, default=True, nullable=False)
 
     # Token versioning for instant revocation on password/pin reset
     token_version = Column(Integer, default=1, nullable=False)

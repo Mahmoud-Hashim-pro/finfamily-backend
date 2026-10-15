@@ -68,11 +68,14 @@ from schemas.auth import (
     ChildResetPinRequest,
     RecoveryCodesResponse,
     RecoveryCodesStatus,
+    GoogleLoginRequest,
+    GoogleAuthRequest,
 )
 
 logger = logging.getLogger("finfamily.auth")
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
+auth_compat_router = APIRouter(prefix="/auth", tags=["Auth"])
 
 RESET_TOKEN_EXPIRE_MINUTES = 15  # BUG-069: Bound token lifetime
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
@@ -302,6 +305,133 @@ def login_parent(request: Request, payload: ParentLogin, db: Session = Depends(g
         user=UserResponse.model_validate(user),
         used_recovery_code=used_recovery_code,
     )
+
+
+@router.post("/google", response_model=TokenResponse)
+@auth_compat_router.post("/google", response_model=TokenResponse)
+@limiter.limit("15/minute")
+def google_auth(request: Request, payload: GoogleLoginRequest, db: Session = Depends(get_db)):
+    target_email = payload.email
+    target_name = payload.full_name or payload.name
+    target_avatar = payload.avatar_url
+    target_family_name = payload.family_name
+
+    if payload.id_token:
+        try:
+            from jose import jwt as jose_jwt
+            decoded = jose_jwt.get_unverified_claims(payload.id_token)
+            if not target_email and decoded.get("email"):
+                target_email = decoded.get("email")
+            if not target_name:
+                target_name = decoded.get("name") or decoded.get("given_name")
+            if not target_avatar:
+                target_avatar = decoded.get("picture")
+        except Exception as ex:
+            logger.warning(f"Could not parse Google id_token: {ex}")
+
+    if not target_email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email is required for Google login",
+        )
+
+    clean_email = str(target_email).strip().lower()
+    raw_name = (target_name or clean_email.split("@")[0].replace(".", " ")).strip()
+    full_name = target_name.strip() if target_name else (raw_name.title() if raw_name else "Parent")
+
+    # Look for existing user
+    user = db.query(User).filter(func.lower(User.email) == clean_email).first()
+    if user:
+        if user.role != UserRole.parent:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only parent accounts can sign in via Google login",
+            )
+        if target_avatar and not user.avatar_url:
+            user.avatar_url = target_avatar
+        if hasattr(user, "is_active") and not user.is_active:
+            user.is_active = True
+        if not user.wallet:
+            wallet = Wallet(owner_id=user.id)
+            db.add(wallet)
+        db.commit()
+        db.refresh(user)
+
+        log_action(
+            db, request=request, action="google_login_success",
+            actor_id=user.id, actor_role="parent",
+            family_id=user.family_id,
+            target_type="user", target_id=user.id,
+            detail={"email": clean_email},
+        )
+        token = create_access_token(
+            user_id=user.id,
+            family_id=user.family_id,
+            role="parent",
+            email=user.email,
+            token_version=getattr(user, "token_version", 1) or 1,
+        )
+        return TokenResponse(access_token=token, token_type="bearer", user=UserResponse.model_validate(user))
+
+    # New email: atomically create a Family (e.g. f"{name}'s Family"), create User with role=UserRole.parent, email, full_name, is_active=True, create their Wallet, and return access_token and user info.
+    if is_admin_email(clean_email):
+        raise HTTPException(status_code=400, detail="Admin email reserved")
+
+    fam_name = target_family_name.strip() if target_family_name else f"{full_name}'s Family"
+    code = generate_unique_family_code(db)
+
+    try:
+        family = Family(name=fam_name, family_code=code)
+        db.add(family)
+        db.flush()
+
+        parent = User(
+            family_id=family.id,
+            role=UserRole.parent,
+            full_name=full_name,
+            email=clean_email,
+            avatar_url=target_avatar,
+            is_active=True,
+            token_version=1,
+        )
+        db.add(parent)
+        db.flush()
+
+        wallet = Wallet(owner_id=parent.id)
+        db.add(wallet)
+        db.flush()
+
+        log_action(
+            db, request=request, action="google_register_success",
+            actor_id=parent.id, actor_role="parent", family_id=family.id,
+            target_type="family", target_id=family.id,
+            detail={"email": clean_email},
+        )
+        db.commit()
+        db.refresh(parent)
+    except IntegrityError:
+        db.rollback()
+        user = db.query(User).filter(func.lower(User.email) == clean_email).first()
+        if user:
+            token = create_access_token(
+                user_id=user.id,
+                family_id=user.family_id,
+                role="parent",
+                email=user.email,
+                token_version=getattr(user, "token_version", 1) or 1,
+            )
+            return TokenResponse(access_token=token, token_type="bearer", user=UserResponse.model_validate(user))
+        raise HTTPException(status_code=400, detail="Google authentication failed")
+
+    token = create_access_token(
+        user_id=parent.id,
+        family_id=family.id,
+        role="parent",
+        email=parent.email,
+        token_version=getattr(parent, "token_version", 1) or 1,
+    )
+    return TokenResponse(access_token=token, token_type="bearer", user=UserResponse.model_validate(parent))
+
 
 
 

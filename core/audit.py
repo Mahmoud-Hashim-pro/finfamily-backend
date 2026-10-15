@@ -53,6 +53,19 @@ def _client_ip(request: Optional[Request]) -> Optional[str]:
 
 
 
+from decimal import Decimal
+
+
+def _make_json_serializable(obj):
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if isinstance(obj, dict):
+        return {k: _make_json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_make_json_serializable(x) for x in obj]
+    return obj
+
+
 def log_action(
     db: Session,
     *,
@@ -87,7 +100,7 @@ def log_action(
         action=action,
         target_type=target_type,
         target_id=target_id,
-        detail=detail,
+        detail=_make_json_serializable(detail) if detail is not None else None,
         ip_address=_client_ip(request),
     )
     db.add(entry)

@@ -16,6 +16,13 @@ from db.models import (
 )
 from core.deps import get_current_user, require_parent, require_child
 from core.audit import log_action
+from core.policies.family_policy import (
+    require_family_child,
+    require_family_wallet,
+    require_family_mission,
+    require_family_purchase,
+    require_family_goal,
+)
 from services.scoring import compute_financial_score, _debit_spend_since
 from services.insights import build_family_insights, build_family_activity
 from services.leveling import apply_xp
@@ -65,14 +72,7 @@ def to_decimal(val) -> Decimal:
 
 
 def _get_family_child(db: Session, family_id: str, child_id: str) -> User:
-    child = (
-        db.query(User)
-        .filter(User.id == child_id, User.family_id == family_id, User.role == UserRole.child)
-        .first()
-    )
-    if not child:
-        raise HTTPException(status_code=404, detail="Child not found in your family")
-    return child
+    return require_family_child(db, family_id, child_id)
 
 
 def _get_wallet_for(db: Session, child: User, for_update: bool = False) -> Wallet:
@@ -83,6 +83,8 @@ def _get_wallet_for(db: Session, child: User, for_update: bool = False) -> Walle
     if not wallet:
         # ماينفعش يحصل عمليًا (بنعمل Wallet تلقائي وقت إنشاء الطفل) — بس تحسبًا
         raise HTTPException(status_code=500, detail="This child has no wallet")
+    if getattr(child, "family_id", None):
+        require_family_wallet(db, child.family_id, wallet.id)
     return wallet
 
 
@@ -140,8 +142,10 @@ def get_my_wallet(child: User = Depends(require_child), db: Session = Depends(ge
 
 @router.get("/wallet/child/{child_id}", response_model=WalletOut)
 def get_child_wallet(child_id: str, parent: User = Depends(require_parent), db: Session = Depends(get_db)):
-    child = _get_family_child(db, parent.family_id, child_id)
-    return _wallet_out(db, _get_wallet_for(db, child), child)
+    child = require_family_child(db, parent.family_id, child_id)
+    wallet = _get_wallet_for(db, child)
+    require_family_wallet(db, parent.family_id, wallet.id)
+    return _wallet_out(db, wallet, child)
 
 
 @router.patch("/wallet/child/{child_id}/limits", response_model=WalletOut)
@@ -152,8 +156,9 @@ def update_child_limits(
     parent: User = Depends(require_parent),
     db: Session = Depends(get_db),
 ):
-    child = _get_family_child(db, parent.family_id, child_id)
+    child = require_family_child(db, parent.family_id, child_id)
     wallet = _get_wallet_for(db, child, for_update=True)
+    require_family_wallet(db, parent.family_id, wallet.id, for_update=True)
 
     if payload.daily_limit is not None:
         wallet.daily_limit = None if payload.daily_limit == -1 else round(payload.daily_limit, 2)
@@ -198,8 +203,9 @@ def update_card_status(
 ):
     # ملحوظة: تغيير حالة الكارت (freeze/unfreeze/deactivate) مسؤولية الأب بس —
     # الطفل معندوش تحكم في كارته من صفحته، غير إنه يشوف الحالة الحالية.
-    child = _get_family_child(db, parent.family_id, child_id)
+    child = require_family_child(db, parent.family_id, child_id)
     wallet = _get_wallet_for(db, child, for_update=True)
+    require_family_wallet(db, parent.family_id, wallet.id, for_update=True)
     old_status = wallet.card_status.value
     wallet.card_status = payload.card_status
 
@@ -223,8 +229,9 @@ def replace_card(
     db: Session = Depends(get_db),
 ):
     """كارت جديد (رقم جديد وهمي) وترجيع الحالة لـ active — بديل لكارت ضاع/اتسرق أو كان deactivated."""
-    child = _get_family_child(db, parent.family_id, child_id)
+    child = require_family_child(db, parent.family_id, child_id)
     wallet = _get_wallet_for(db, child, for_update=True)
+    require_family_wallet(db, parent.family_id, wallet.id, for_update=True)
     wallet.card_number = _generate_card_number()
     wallet.card_status = CardStatus.active
 
@@ -248,6 +255,7 @@ def update_my_card_theme(
 ):
     # الطفل هو اللي بيختار شكل الكارت بتاعه (تخصيص بس، مالهاش علاقة بالأمان)
     wallet = _get_wallet_for(db, child, for_update=True)
+    require_family_wallet(db, child.family_id, wallet.id, for_update=True)
     wallet.card_theme = payload.theme
     db.commit()
     db.refresh(wallet)
@@ -263,10 +271,11 @@ def send_allowance(
     db: Session = Depends(get_db),
 ):
     # إرسال مصروف يدوي فوري ("Disburse Now") — مفيش جدولة/cron لسه، الأب بيدوس والفلوس بتتحط فورًا
-    child = _get_family_child(db, parent.family_id, child_id)
+    child = require_family_child(db, parent.family_id, child_id)
     validate_money(payload.amount)
 
     wallet = _get_wallet_for(db, child, for_update=True)
+    require_family_wallet(db, parent.family_id, wallet.id, for_update=True)
 
     # Dedicated atomic idempotency check via IdempotencyRecord with UNIQUE constraint
     idempotency_key = request.headers.get("X-Idempotency-Key") or request.headers.get("Idempotency-Key") or payload.idempotency_key
@@ -320,6 +329,7 @@ def send_allowance(
 @router.post("/wallet/me/goals", response_model=SavingsGoalOut)
 def create_my_goal(payload: SavingsGoalCreate, child: User = Depends(require_child), db: Session = Depends(get_db)):
     wallet = _get_wallet_for(db, child)
+    require_family_wallet(db, child.family_id, wallet.id)
     validate_money(payload.target)
     goal = SavingsGoal(
         wallet_id=wallet.id,
@@ -343,9 +353,10 @@ def deposit_to_goal(
 ):
     validate_money(payload.amount)
     wallet = _get_wallet_for(db, child, for_update=True)
-    goal = db.query(SavingsGoal).filter(SavingsGoal.id == goal_id, SavingsGoal.wallet_id == wallet.id).with_for_update().first()
-    if not goal:
-        raise HTTPException(status_code=404, detail="Savings goal not found")
+    require_family_wallet(db, child.family_id, wallet.id, for_update=True)
+    goal = require_family_goal(db, child.family_id, goal_id, for_update=True)
+    if goal.wallet_id != wallet.id:
+        raise HTTPException(status_code=403, detail="Savings goal does not belong to your wallet")
 
     if to_decimal(wallet.balance) < to_decimal(payload.amount):
         raise HTTPException(status_code=400, detail="Not enough balance in wallet")
@@ -384,9 +395,10 @@ def withdraw_from_goal(
     """
     validate_money(payload.amount)
     wallet = _get_wallet_for(db, child, for_update=True)
-    goal = db.query(SavingsGoal).filter(SavingsGoal.id == goal_id, SavingsGoal.wallet_id == wallet.id).with_for_update().first()
-    if not goal:
-        raise HTTPException(status_code=404, detail="Savings goal not found")
+    require_family_wallet(db, child.family_id, wallet.id, for_update=True)
+    goal = require_family_goal(db, child.family_id, goal_id, for_update=True)
+    if goal.wallet_id != wallet.id:
+        raise HTTPException(status_code=403, detail="Savings goal does not belong to your wallet")
 
     if to_decimal(goal.current) < to_decimal(payload.amount):
         raise HTTPException(status_code=400, detail="Not enough savings in this goal")
@@ -417,9 +429,10 @@ def delete_goal(
     BUG-031: Delete savings goal, refunding any remaining savings back to wallet.
     """
     wallet = _get_wallet_for(db, child, for_update=True)
-    goal = db.query(SavingsGoal).filter(SavingsGoal.id == goal_id, SavingsGoal.wallet_id == wallet.id).with_for_update().first()
-    if not goal:
-        raise HTTPException(status_code=404, detail="Savings goal not found")
+    require_family_wallet(db, child.family_id, wallet.id, for_update=True)
+    goal = require_family_goal(db, child.family_id, goal_id, for_update=True)
+    if goal.wallet_id != wallet.id:
+        raise HTTPException(status_code=403, detail="Savings goal does not belong to your wallet")
 
     refund_amount = round(to_decimal(goal.current), 2)
     if refund_amount > Decimal("0.00"):
@@ -445,7 +458,7 @@ def create_mission(payload: MissionCreate, parent: User = Depends(require_parent
     # الأب مش بيعمل هنا غير chores (تسنيد مهمة) — طلبات الصرف الطفل هو اللي بيعملها في /missions/redeem
     if not payload.assigned_to_id:
         raise HTTPException(status_code=400, detail="assigned_to_id is required")
-    _get_family_child(db, parent.family_id, payload.assigned_to_id)
+    require_family_child(db, parent.family_id, payload.assigned_to_id)
     validate_money(payload.reward)
 
     mission = Mission(
@@ -471,6 +484,7 @@ def request_redemption(payload: MissionCreate, child: User = Depends(require_chi
     # الطفل بيطلب يصرف كوينز على حاجة — بتروح مباشرة "submitted" مستنية موافقة الأب
     # لو الفئة محظورة من الأب (نفس القايمة اللي بتمنع مشتريات الكارت)، بترفض فورًا من غير ما تتسجل أصلاً
     wallet = _get_wallet_for(db, child)
+    require_family_wallet(db, child.family_id, wallet.id)
     validate_money(payload.reward)
     if payload.category in (wallet.blocked_categories or []):
         raise HTTPException(status_code=400, detail=f"{payload.category} is a blocked category")
@@ -494,12 +508,8 @@ def request_redemption(payload: MissionCreate, child: User = Depends(require_chi
 
 @router.post("/missions/{mission_id}/submit", response_model=MissionOut)
 def submit_mission(mission_id: str, child: User = Depends(require_child), db: Session = Depends(get_db)):
-    mission = (
-        db.query(Mission)
-        .filter(Mission.id == mission_id, Mission.assigned_to_id == child.id, Mission.kind == MissionKind.chore)
-        .first()
-    )
-    if not mission:
+    mission = require_family_mission(db, child.family_id, mission_id, for_update=True)
+    if mission.assigned_to_id != child.id or mission.kind != MissionKind.chore:
         raise HTTPException(status_code=404, detail="Mission not found")
     if mission.status != MissionStatus.pending:
         raise HTTPException(status_code=400, detail=f"Mission is already {mission.status.value}")
@@ -520,14 +530,13 @@ def review_mission(
     db: Session = Depends(get_db),
 ):
     # BUG-022: Lock Mission with with_for_update() and verify status atomically to prevent double payouts
-    mission = db.query(Mission).filter(Mission.id == mission_id, Mission.family_id == parent.family_id).with_for_update().first()
-    if not mission:
-        raise HTTPException(status_code=404, detail="Mission not found")
+    mission = require_family_mission(db, parent.family_id, mission_id, for_update=True)
     if mission.status != MissionStatus.submitted:
         raise HTTPException(status_code=400, detail=f"Mission is not awaiting review (status: {mission.status.value})")
 
-    child = db.query(User).filter(User.id == mission.assigned_to_id).with_for_update().first()
+    child = require_family_child(db, parent.family_id, mission.assigned_to_id, for_update=True)
     wallet = _get_wallet_for(db, child, for_update=True)
+    require_family_wallet(db, parent.family_id, wallet.id, for_update=True)
 
     if payload.decision == "reject":
         mission.status = MissionStatus.rejected
@@ -583,7 +592,7 @@ def my_missions(
     child: User = Depends(require_child),
     db: Session = Depends(get_db),
 ):
-    q = db.query(Mission).filter(Mission.assigned_to_id == child.id)
+    q = db.query(Mission).filter(Mission.assigned_to_id == child.id, Mission.family_id == child.family_id)
     if status:
         q = q.filter(Mission.status == status)
     return q.order_by(Mission.created_date.desc()).offset(skip).limit(limit).all()
@@ -600,6 +609,7 @@ def family_missions(
 ):
     q = db.query(Mission).filter(Mission.family_id == parent.family_id)
     if child_id:
+        require_family_child(db, parent.family_id, child_id)
         q = q.filter(Mission.assigned_to_id == child_id)
     if status:
         q = q.filter(Mission.status == status)
@@ -671,15 +681,11 @@ def review_purchase(
     db: Session = Depends(get_db),
 ):
     # BUG-023: Lock CardPurchase with with_for_update() and verify status atomically
-    purchase = db.query(CardPurchase).filter(CardPurchase.id == purchase_id, CardPurchase.family_id == parent.family_id).with_for_update().first()
-    if not purchase:
-        raise HTTPException(status_code=404, detail="Purchase request not found")
+    purchase = require_family_purchase(db, parent.family_id, purchase_id, for_update=True)
     if purchase.status != PurchaseStatus.pending:
         raise HTTPException(status_code=400, detail=f"Purchase is already {purchase.status.value}")
 
-    wallet = db.query(Wallet).filter(Wallet.id == purchase.wallet_id).with_for_update().first()
-    if not wallet:
-        raise HTTPException(status_code=404, detail="Wallet not found")
+    wallet = require_family_wallet(db, parent.family_id, purchase.wallet_id, for_update=True)
 
     if payload.decision == "reject":
         purchase.status = PurchaseStatus.rejected
@@ -724,7 +730,7 @@ def review_purchase(
 def my_purchases(child: User = Depends(require_child), db: Session = Depends(get_db)):
     return (
         db.query(CardPurchase)
-        .filter(CardPurchase.child_id == child.id)
+        .filter(CardPurchase.child_id == child.id, CardPurchase.family_id == child.family_id)
         .order_by(CardPurchase.created_date.desc())
         .all()
     )
@@ -754,9 +760,10 @@ def my_transactions(
     db: Session = Depends(get_db),
 ):
     wallet = _get_wallet_for(db, child)
+    require_family_wallet(db, child.family_id, wallet.id)
     return (
         db.query(Transaction)
-        .filter(Transaction.wallet_id == wallet.id)
+        .filter(Transaction.wallet_id == wallet.id, Transaction.family_id == child.family_id)
         .order_by(Transaction.created_date.desc())
         .offset(skip)
         .limit(limit)
@@ -772,11 +779,12 @@ def child_transactions(
     parent: User = Depends(require_parent),
     db: Session = Depends(get_db),
 ):
-    child = _get_family_child(db, parent.family_id, child_id)
+    child = require_family_child(db, parent.family_id, child_id)
     wallet = _get_wallet_for(db, child)
+    require_family_wallet(db, parent.family_id, wallet.id)
     return (
         db.query(Transaction)
-        .filter(Transaction.wallet_id == wallet.id)
+        .filter(Transaction.wallet_id == wallet.id, Transaction.family_id == parent.family_id)
         .order_by(Transaction.created_date.desc())
         .offset(skip)
         .limit(limit)

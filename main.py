@@ -14,7 +14,7 @@ logger = logging.getLogger("finfamily")
 
 from db.database import engine, Base
 from api.routes import functions_router
-from api.auth_routes import router as auth_router
+from api.auth_routes import router as auth_router, auth_compat_router
 from api.family_routes import router as family_router
 from api.admin_routes import router as admin_router
 from core.limiter import limiter
@@ -72,17 +72,17 @@ def read_root():
 @app.get("/api/app/version")
 @app.get("/app/version")
 def get_app_version():
-    version = os.getenv("APP_VERSION", "1.0.6")
-    build_num = int(os.getenv("APP_BUILD_NUMBER", "7"))
+    version = os.getenv("APP_VERSION", "1.1.0")
+    build_num = int(os.getenv("APP_BUILD_NUMBER", "8"))
     min_version = os.getenv("MIN_SUPPORTED_VERSION", "1.0.0")
     download_url = os.getenv(
         "APP_DOWNLOAD_URL",
-        "https://github.com/Mahmoud-Hashim-pro/finfamily-mobile-app/releases/download/v1.0.6/FinFamily-v1.0.6.apk"
+        "https://github.com/Mahmoud-Hashim-pro/finfamily-mobile-app/releases/download/v1.1.0/FinFamily-v1.1.0.apk"
     )
     is_mandatory = os.getenv("APP_IS_MANDATORY", "false").strip().lower() in ("true", "1", "yes")
     release_notes = os.getenv(
         "APP_RELEASE_NOTES",
-        "إصدار رسمي v1.0.6: تحصين العمليات المالية بالتزامن الدقيق، حماية مكافآت الألعاب في السيرفر، وتحديثات شاملة للأمان وكارت ميزة التعليمي."
+        "إصدار رسمي v1.1.0: تسجيل الدخول عبر Google، الحفاظ التام على الجلسة ومنع فقدان الحساب عند إغلاق التطبيق، سياسات العزل الصارمة بين العائلات، وترقيات أمان شاملة."
     )
     file_hash = os.getenv("APP_SHA256", "")
 
@@ -120,6 +120,7 @@ app.add_middleware(
 
 # تسجيل الـ Routes
 app.include_router(auth_router)
+app.include_router(auth_compat_router)
 app.include_router(family_router)
 app.include_router(functions_router)
 app.include_router(admin_router)

@@ -7,8 +7,8 @@ from datetime import datetime, timezone
 os.environ["ENVIRONMENT"] = "development"
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 os.environ["JWT_SECRET"] = "financial-concurrency-test-secret-key-32bytes!!"
-os.environ["APP_VERSION"] = "1.0.6"
-os.environ["APP_BUILD_NUMBER"] = "7"
+os.environ["APP_VERSION"] = "1.1.0"
+os.environ["APP_BUILD_NUMBER"] = "8"
 
 from fastapi.testclient import TestClient
 from db.database import engine, Base, SessionLocal, get_db
@@ -164,13 +164,13 @@ def test_p0_3_numeric_precision_in_models():
 
 
 def test_p1_6_version_defaults():
-    """Verify version endpoint reports 1.0.6 and build 7"""
+    """Verify version endpoint reports 1.1.0 and build 8"""
     res = client.get("/api/app/version")
     assert res.status_code == 200
     data = res.json()
-    assert data["latest_version"] == "1.0.6"
-    assert data["build_number"] == 7
-    assert "FinFamily-v1.0.6.apk" in data["download_url"]
+    assert data["latest_version"] == "1.1.0"
+    assert data["build_number"] == 8
+    assert "FinFamily-v1.1.0.apk" in data["download_url"]
 
 
 def test_lesson_completion_sync_and_idempotency():
