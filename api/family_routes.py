@@ -316,6 +316,24 @@ def send_allowance(
             db.flush()
         except IntegrityError:
             db.rollback()
+            # Concurrency race: revalidate the winning record after collision
+            winning_rec = db.query(IdempotencyRecord).filter(IdempotencyRecord.key == clean_key).first()
+            if winning_rec:
+                if winning_rec.family_id != parent.family_id or winning_rec.user_id != parent.id:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="Idempotency key collision across different actors or families",
+                    )
+                if winning_rec.action != "allowance_sent":
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="Idempotency key already used for a different operation",
+                    )
+                if winning_rec.payload_hash and winning_rec.payload_hash != payload_hash:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="Idempotency key reused with conflicting request payload parameters",
+                    )
             wallet = _get_wallet_for(db, child, for_update=False)
             return _wallet_out(db, wallet, child)
 
@@ -899,35 +917,42 @@ def complete_game(payload: GameCompleteRequest, child: User = Depends(require_ch
             coins_awarded, f"{title} — mini-game reward",
         )
 
-    db.add(GameCompletion(
-        child_id=child.id,
-        game_id=payload.game_id,
-        score=payload.score,
-        total=payload.total,
-        xp_awarded=xp_awarded,
-        coins_awarded=coins_awarded,
-        was_rewarded=not already_today,
-        reward_date=today_str if not already_today else None,
-    ))
-    db.flush()  # عشان محاولة اللعب دي تتحسب لو كانت هي آخر لعبة في تحدي "Perfect Day"
+    try:
+        db.add(GameCompletion(
+            child_id=child.id,
+            game_id=payload.game_id,
+            score=payload.score,
+            total=payload.total,
+            xp_awarded=xp_awarded,
+            coins_awarded=coins_awarded,
+            was_rewarded=not already_today,
+            reward_date=today_str if not already_today else None,
+        ))
+        db.flush()  # عشان محاولة اللعب دي تتحسب لو كانت هي آخر لعبة في تحدي "Perfect Day"
 
-    touch_streak(child)
+        touch_streak(child)
 
-    newly_unlocked = check_and_award_badges(db, child)
+        newly_unlocked = check_and_award_badges(db, child)
 
-    perfect_bonus_xp, perfect_bonus_coins = 0, 0
-    if any(b["id"] == "perfect_day" for b in newly_unlocked):
-        perfect_bonus_xp, perfect_bonus_coins = PERFECT_DAY_BONUS_XP, PERFECT_DAY_BONUS_COINS
-        wallet.balance = round(to_decimal(wallet.balance) + to_decimal(perfect_bonus_coins), 2)
-        if apply_xp(child, perfect_bonus_xp):
-            leveled_up = True
-        _log_transaction(
-            db, wallet, child.family_id,
-            TransactionType.game_reward, TransactionDirection.credit,
-            perfect_bonus_coins, "Perfect Day bonus — all mini-games completed today! 🌟",
-        )
+        perfect_bonus_xp, perfect_bonus_coins = 0, 0
+        if any(b["id"] == "perfect_day" for b in newly_unlocked):
+            perfect_bonus_xp, perfect_bonus_coins = PERFECT_DAY_BONUS_XP, PERFECT_DAY_BONUS_COINS
+            wallet.balance = round(to_decimal(wallet.balance) + to_decimal(perfect_bonus_coins), 2)
+            if apply_xp(child, perfect_bonus_xp):
+                leveled_up = True
+            _log_transaction(
+                db, wallet, child.family_id,
+                TransactionType.game_reward, TransactionDirection.credit,
+                perfect_bonus_coins, "Perfect Day bonus — all mini-games completed today! 🌟",
+            )
 
-    db.commit()
+        db.commit()
+    except IntegrityError:
+        # Concurrent completion attempt on same game/day: roll back cleanly without duplicate reward
+        db.rollback()
+        xp_awarded, coins_awarded = 0, 0
+        newly_unlocked = []
+
     db.refresh(child)
     db.refresh(wallet)
 

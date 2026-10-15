@@ -77,7 +77,7 @@ def get_app_version():
     min_version = os.getenv("MIN_SUPPORTED_VERSION", "1.0.0")
     download_url = os.getenv(
         "APP_DOWNLOAD_URL",
-        "https://github.com/Mahmoud-Hashim-pro/finfamily-mobile-app/releases/download/v1.0.0/app-release.apk"
+        "https://github.com/Mahmoud-Hashim-pro/finfamily-mobile-app/releases/latest/download/app-release.apk"
     )
     is_mandatory = os.getenv("APP_IS_MANDATORY", "false").strip().lower() in ("true", "1", "yes")
     release_notes = os.getenv(

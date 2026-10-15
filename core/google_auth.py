@@ -52,6 +52,8 @@ def verify_google_id_token(id_token: str, client_id: Optional[str] = None) -> Di
         return _mock_verifier(token_str, client_id)
 
     expected_client_id = client_id or os.environ.get("GOOGLE_CLIENT_ID")
+    if not expected_client_id:
+        raise ValueError("GOOGLE_CLIENT_ID configuration is required. Google authentication failed closed.")
 
     try:
         url = "https://oauth2.googleapis.com/tokeninfo"
@@ -77,9 +79,9 @@ def verify_google_id_token(id_token: str, client_id: Optional[str] = None) -> Di
     except (TypeError, ValueError):
         raise ValueError("Invalid expiration claim in token")
 
-    # 3. Validate audience if configured
+    # 3. Validate audience (Fail Closed: mandatory configuration and match)
     aud = claims.get("aud")
-    if expected_client_id and aud != expected_client_id:
+    if not aud or aud != expected_client_id:
         raise ValueError(f"Google ID token audience mismatch: expected {expected_client_id}, got {aud}")
 
     # 4. Enforce verified email
@@ -91,9 +93,14 @@ def verify_google_id_token(id_token: str, client_id: Optional[str] = None) -> Di
     if not email or not isinstance(email, str) or "@" not in email:
         raise ValueError("Token is missing a valid email claim")
 
+    # 5. Enforce valid subject identifier
+    sub = claims.get("sub")
+    if not sub or not isinstance(sub, str) or not sub.strip():
+        raise ValueError("Google ID token missing valid subject identifier ('sub')")
+
     return {
         "email": email.strip().lower(),
         "name": claims.get("name") or claims.get("given_name"),
         "picture": claims.get("picture"),
-        "sub": claims.get("sub"),
+        "sub": sub.strip(),
     }

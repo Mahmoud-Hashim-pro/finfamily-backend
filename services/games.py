@@ -96,8 +96,8 @@ PERFECT_DAY_BONUS_COINS = 50
 
 def compute_reward(
     game_id: str,
-    score: float,
-    total: float,
+    score: Optional[float] = None,
+    total: Optional[float] = None,
     selected_option: Optional[str] = None,
     submitted_answers: Optional[List[str]] = None,
 ) -> Optional[Tuple[str, int, float]]:
@@ -107,47 +107,58 @@ def compute_reward(
     Returns (title, xp_awarded, coins_awarded).
     Guarantees:
       1. Game must exist in catalog.
-      2. If submitted_answers provided, score is strictly derived from answer_key matches.
-      3. If selected_option provided, verified against game's unique correct_option.
-      4. Client score cannot exceed total or maximum allowed score for that game.
-      5. Passing threshold ratio >= 0.5 required for any rewards.
+      2. For all catalog games with answer_key, submitted_answers is strictly MANDATORY.
+         Any client-supplied score/total or selected_option without answers is rejected (0 rewards).
+      3. Exact question count is enforced (len(submitted_answers) == len(expected_keys)).
+         Missing or extra answers are rejected with 0 rewards.
+      4. Score is calculated strictly from server-side matches against the authoritative answer_key.
+      5. Minimum passing ratio (>= 0.60) required for rewards.
     """
     game = GAME_CATALOG.get(game_id)
     if not game:
         return None
 
-    # Path A: Detailed answers submission
-    if submitted_answers and isinstance(submitted_answers, list):
-        expected_keys = game.get("answer_key", [])
-        if not expected_keys:
+    expected_keys = game.get("answer_key")
+
+    # Authoritative answer-key validation
+    if expected_keys:
+        if not submitted_answers or not isinstance(submitted_answers, list):
+            # Reject score/total fallback: game has an answer key, so answers must be submitted
             return game["title"], 0, 0.0
+
+        # Enforce exact expected answer count (reject incomplete or padded answer lists)
+        if len(submitted_answers) != len(expected_keys):
+            return game["title"], 0, 0.0
+
+        # Evaluate score strictly on the server against authoritative keys
         correct_count = sum(
             1 for sub, exp in zip(submitted_answers, expected_keys)
             if str(sub).strip().upper() == str(exp).strip().upper()
         )
         total_questions = len(expected_keys)
         ratio = correct_count / total_questions
-        if ratio < 0.5:
+
+        # Enforce passing ratio threshold (at least 60% correct)
+        if ratio < 0.6:
             return game["title"], 0, 0.0
+
         xp_awarded = round(game["base_xp"] * ratio)
         coins_awarded = round(xp_awarded * 0.5, 2)
         return game["title"], xp_awarded, coins_awarded
 
-    # Path B: Multiple-choice option verification
+    # For games without an answer_key (if any added in future):
     expected_option = game.get("correct_option")
     if not selected_option or selected_option.strip() != expected_option:
         return game["title"], 0, 0.0
 
-    # Path C: Score sanity validation (defend against client score spoofing)
     max_allowed = game.get("max_score", 10)
     if total is None or total <= 0 or score is None or score <= 0:
         return game["title"], 0, 0.0
-    if score > total:
+    if score > total or score > max_allowed:
         return game["title"], 0, 0.0
 
-    # Bounded score ratio
     ratio = max(0.0, min(1.0, score / total))
-    if ratio < 0.5:
+    if ratio < 0.6:
         return game["title"], 0, 0.0
 
     xp_awarded = round(game["base_xp"] * ratio)
@@ -156,26 +167,40 @@ def compute_reward(
 
 
 def is_passing_game(
-    score: float,
-    total: float,
+    score: Optional[float] = None,
+    total: Optional[float] = None,
     selected_option: Optional[str] = None,
     game_id: Optional[str] = None,
+    submitted_answers: Optional[List[str]] = None,
 ) -> bool:
     """
-    Checks if a game run meets passing requirements:
-    valid positive numbers, score <= total, passing ratio (>= 0.5), and matching correct option.
+    Validates whether a game attempt meets passing criteria.
+    If game has answer_key, validates submitted_answers directly.
     """
-    if score is None or total is None or total <= 0 or score <= 0:
-        return False
-    if score > total:
-        return False
     if game_id and game_id in GAME_CATALOG:
-        expected = GAME_CATALOG[game_id].get("correct_option")
+        game = GAME_CATALOG[game_id]
+        expected_keys = game.get("answer_key")
+        if expected_keys:
+            if not submitted_answers or not isinstance(submitted_answers, list):
+                return False
+            if len(submitted_answers) != len(expected_keys):
+                return False
+            correct_count = sum(
+                1 for sub, exp in zip(submitted_answers, expected_keys)
+                if str(sub).strip().upper() == str(exp).strip().upper()
+            )
+            return (correct_count / len(expected_keys)) >= 0.6
+
+        expected = game.get("correct_option")
         if selected_option and selected_option.strip() != expected:
             return False
-    elif selected_option is not None:
-        # Default fallback check if game_id not passed
-        valid_options = {g["correct_option"] for g in GAME_CATALOG.values()}
-        if selected_option.strip() not in valid_options:
+        max_allowed = game.get("max_score", 10)
+        if score is None or total is None or total <= 0 or score <= 0:
             return False
-    return (score / total) >= 0.5
+        if score > total or score > max_allowed:
+            return False
+        return (score / total) >= 0.6
+
+    if score is None or total is None or total <= 0 or score <= 0 or score > total:
+        return False
+    return (score / total) >= 0.6

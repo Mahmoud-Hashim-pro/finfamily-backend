@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision: str = '0001_initial_numeric_and_isolation'
+revision: str = '0001_numeric_and_isolation'
 down_revision: Union[str, None] = '0000_baseline_schema'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -136,89 +136,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # 1. Downgrade financial columns from Numeric(12, 2) back to Float
-    # game_completions
-    with op.batch_alter_table('game_completions', schema=None) as batch_op:
-        batch_op.alter_column('coins_awarded',
-                   existing_type=sa.Numeric(precision=12, scale=2),
-                   type_=sa.Float(),
-                   existing_nullable=True,
-                   postgresql_using='coins_awarded::double precision')
-
-    # card_purchases
-    with op.batch_alter_table('card_purchases', schema=None) as batch_op:
-        batch_op.alter_column('amount',
-                   existing_type=sa.Numeric(precision=12, scale=2),
-                   type_=sa.Float(),
-                   existing_nullable=False,
-                   postgresql_using='amount::double precision')
-
-    # transactions
-    with op.batch_alter_table('transactions', schema=None) as batch_op:
-        batch_op.alter_column('amount',
-                   existing_type=sa.Numeric(precision=12, scale=2),
-                   type_=sa.Float(),
-                   existing_nullable=False,
-                   postgresql_using='amount::double precision')
-
-    # missions
-    with op.batch_alter_table('missions', schema=None) as batch_op:
-        batch_op.alter_column('reward',
-                   existing_type=sa.Numeric(precision=12, scale=2),
-                   type_=sa.Float(),
-                   existing_nullable=False,
-                   postgresql_using='reward::double precision')
-
-    # savings_goals
-    with op.batch_alter_table('savings_goals', schema=None) as batch_op:
-        batch_op.alter_column('current',
-                   existing_type=sa.Numeric(precision=12, scale=2),
-                   type_=sa.Float(),
-                   existing_nullable=True,
-                   postgresql_using='current::double precision')
-        batch_op.alter_column('target',
-                   existing_type=sa.Numeric(precision=12, scale=2),
-                   type_=sa.Float(),
-                   existing_nullable=False,
-                   postgresql_using='target::double precision')
-
-    # wallets
-    with op.batch_alter_table('wallets', schema=None) as batch_op:
-        batch_op.alter_column('monthly_limit',
-                   existing_type=sa.Numeric(precision=12, scale=2),
-                   type_=sa.Float(),
-                   existing_nullable=True,
-                   postgresql_using='monthly_limit::double precision')
-        batch_op.alter_column('weekly_limit',
-                   existing_type=sa.Numeric(precision=12, scale=2),
-                   type_=sa.Float(),
-                   existing_nullable=True,
-                   postgresql_using='weekly_limit::double precision')
-        batch_op.alter_column('daily_limit',
-                   existing_type=sa.Numeric(precision=12, scale=2),
-                   type_=sa.Float(),
-                   existing_nullable=True,
-                   postgresql_using='daily_limit::double precision')
-        batch_op.alter_column('savings_balance',
-                   existing_type=sa.Numeric(precision=12, scale=2),
-                   type_=sa.Float(),
-                   existing_nullable=True,
-                   postgresql_using='savings_balance::double precision')
-        batch_op.alter_column('balance',
-                   existing_type=sa.Numeric(precision=12, scale=2),
-                   type_=sa.Float(),
-                   existing_nullable=True,
-                   postgresql_using='balance::double precision')
-
-    # 2. Drop lesson_completions table
-    op.drop_index(op.f('ix_lesson_completions_lesson_id'), table_name='lesson_completions')
-    op.drop_index(op.f('ix_lesson_completions_child_id'), table_name='lesson_completions')
-    op.drop_index(op.f('ix_lesson_completions_id'), table_name='lesson_completions')
-    op.drop_table('lesson_completions')
-
-    # 3. Drop idempotency_records table
-    op.drop_index(op.f('ix_idempotency_records_user_id'), table_name='idempotency_records')
-    op.drop_index(op.f('ix_idempotency_records_family_id'), table_name='idempotency_records')
-    op.drop_index(op.f('ix_idempotency_records_key'), table_name='idempotency_records')
-    op.drop_index(op.f('ix_idempotency_records_id'), table_name='idempotency_records')
-    op.drop_table('idempotency_records')
+    # Explicit safe downgrade policy:
+    # Do NOT drop tables or revert precise Numeric types to prevent data truncation or loss.
+    raise RuntimeError(
+        "Schema downgrade is disabled to protect financial ledger, idempotency, and lesson completion records."
+    )

@@ -25,24 +25,40 @@ app.state.limiter.enabled = False
 client = TestClient(app)
 
 def test_p0_1_game_reward_server_side_verification():
-    """Verify that mini-game rewards cannot be spoofed by sending high score without valid answer"""
+    """Verify that mini-game rewards require authoritative answers and close all score/option bypass paths."""
     game_key = "gm1"
     assert game_key in GAME_CATALOG
+    answer_key = GAME_CATALOG[game_key]["answer_key"]
     correct_opt = GAME_CATALOG[game_key]["correct_option"]
-    assert correct_opt == "optB"
+    assert len(answer_key) == 5
 
-    # Correct answer -> full reward
-    title, xp, coins = compute_reward(game_key, 1, 1, correct_opt)
+    # 1. Authoritative valid answers -> full reward granted
+    title, xp, coins = compute_reward(game_key, submitted_answers=list(answer_key))
     assert xp > 0
     assert coins > 0
 
-    # Wrong answer even with score 1/1 -> 0 reward
-    title, xp_spoofed, coins_spoofed = compute_reward(game_key, 1, 1, "wrong_option")
-    assert xp_spoofed == 0
-    assert coins_spoofed == 0
+    # 2. Score/option-only fallback bypass is STRICTLY CLOSED -> 0 reward
+    title, xp_bypass, coins_bypass = compute_reward(game_key, score=5, total=5, selected_option=correct_opt)
+    assert xp_bypass == 0
+    assert coins_bypass == 0
 
-    # No answer provided -> 0 reward
-    title, xp_none, coins_none = compute_reward(game_key, 1, 1, None)
+    # 3. Missing answers count (e.g. 3 of 5) -> 0 reward
+    title, xp_short, coins_short = compute_reward(game_key, submitted_answers=["B", "A", "C"])
+    assert xp_short == 0
+    assert coins_short == 0
+
+    # 4. Extra padded answers (e.g. 6 answers) -> 0 reward
+    title, xp_extra, coins_extra = compute_reward(game_key, submitted_answers=["B", "A", "C", "A", "B", "D"])
+    assert xp_extra == 0
+    assert coins_extra == 0
+
+    # 5. Wrong answers (below 60% passing ratio) -> 0 reward
+    title, xp_wrong, coins_wrong = compute_reward(game_key, submitted_answers=["X", "X", "X", "X", "X"])
+    assert xp_wrong == 0
+    assert coins_wrong == 0
+
+    # 6. No answers or None -> 0 reward
+    title, xp_none, coins_none = compute_reward(game_key, submitted_answers=None)
     assert xp_none == 0
     assert coins_none == 0
 

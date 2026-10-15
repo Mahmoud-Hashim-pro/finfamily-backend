@@ -217,3 +217,78 @@ def test_google_login_unverified_email_claim_rejected():
     res = client.post("/api/auth/google", json={"id_token": "token_unverified_email"})
     assert res.status_code == 401
     assert "Google email is not verified" in res.text
+
+
+def test_verify_google_id_token_fails_closed_when_client_id_missing():
+    """Unit test: verify_google_id_token must fail closed if GOOGLE_CLIENT_ID is not configured."""
+    from core.google_auth import verify_google_id_token
+    # Temporarily remove mock verifier to test real verification function logic
+    set_mock_google_verifier(None)
+    try:
+        old_env = os.environ.pop("GOOGLE_CLIENT_ID", None)
+        try:
+            with pytest.raises(ValueError, match="GOOGLE_CLIENT_ID configuration is required"):
+                verify_google_id_token("some_token", client_id=None)
+        finally:
+            if old_env is not None:
+                os.environ["GOOGLE_CLIENT_ID"] = old_env
+    finally:
+        set_mock_google_verifier(mock_verifier)
+
+
+def test_verify_google_id_token_audience_mismatch_and_sub_enforcement(monkeypatch):
+    """Unit test: verify_google_id_token must enforce audience matching and sub identifier."""
+    from core.google_auth import verify_google_id_token
+    import requests
+
+    class MockResponse:
+        def __init__(self, data, status_code=200):
+            self._data = data
+            self.status_code = status_code
+            self.headers = {"content-type": "application/json"}
+        def json(self):
+            return self._data
+        @property
+        def text(self):
+            return str(self._data)
+
+    set_mock_google_verifier(None)
+    try:
+        # Case 1: Audience mismatch
+        monkeypatch.setattr(requests, "get", lambda url, params, timeout: MockResponse({
+            "iss": "https://accounts.google.com",
+            "aud": "attacker_client_id",
+            "exp": 9999999999,
+            "email_verified": True,
+            "email": "test@gmail.com",
+            "sub": "sub-123"
+        }))
+        with pytest.raises(ValueError, match="audience mismatch"):
+            verify_google_id_token("valid_jwt", client_id="expected_client_id")
+
+        # Case 2: Missing sub claim
+        monkeypatch.setattr(requests, "get", lambda url, params, timeout: MockResponse({
+            "iss": "https://accounts.google.com",
+            "aud": "expected_client_id",
+            "exp": 9999999999,
+            "email_verified": True,
+            "email": "test@gmail.com",
+            "sub": ""
+        }))
+        with pytest.raises(ValueError, match="missing valid subject identifier"):
+            verify_google_id_token("valid_jwt", client_id="expected_client_id")
+
+        # Case 3: Wrong issuer
+        monkeypatch.setattr(requests, "get", lambda url, params, timeout: MockResponse({
+            "iss": "https://evil.com",
+            "aud": "expected_client_id",
+            "exp": 9999999999,
+            "email_verified": True,
+            "email": "test@gmail.com",
+            "sub": "sub-123"
+        }))
+        with pytest.raises(ValueError, match="Invalid Google token issuer"):
+            verify_google_id_token("valid_jwt", client_id="expected_client_id")
+    finally:
+        set_mock_google_verifier(mock_verifier)
+
