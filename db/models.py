@@ -5,7 +5,7 @@ import string
 from datetime import datetime
 import enum
 
-from sqlalchemy import Column, String, DateTime, Enum, ForeignKey, Float, Integer, JSON, Boolean, UniqueConstraint, Numeric
+from sqlalchemy import Column, String, DateTime, Enum, ForeignKey, Float, Integer, JSON, Boolean, UniqueConstraint, Numeric, CheckConstraint
 from sqlalchemy.orm import relationship, synonym
 
 from .database import Base
@@ -134,6 +134,10 @@ class User(Base):
 class Wallet(Base):
     """كل طفل ليه Wallet واحدة بتتعمل تلقائي وقت ما الأب يضيفه."""
     __tablename__ = "wallets"
+    __table_args__ = (
+        CheckConstraint("balance >= 0", name="chk_wallet_non_negative_balance"),
+        CheckConstraint("savings_balance >= 0", name="chk_wallet_non_negative_savings"),
+    )
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
     owner_id = Column(String, ForeignKey("users.id"), unique=True, nullable=False, index=True)
@@ -162,6 +166,10 @@ class Wallet(Base):
 
 class SavingsGoal(Base):
     __tablename__ = "savings_goals"
+    __table_args__ = (
+        CheckConstraint("current >= 0", name="chk_goal_non_negative_current"),
+        CheckConstraint("target > 0", name="chk_goal_positive_target"),
+    )
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
     wallet_id = Column(String, ForeignKey("wallets.id"), nullable=False, index=True)

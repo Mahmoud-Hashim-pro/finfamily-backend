@@ -59,11 +59,14 @@ def test_migration_fresh_install():
         assert "key" in idem_cols
         assert "payload_hash" in idem_cols
 
-        # Verify users columns
-        user_cols = {c["name"] for c in inspector.get_columns("users")}
-        assert "mfa_pending_secret" in user_cols
-        assert "created_by_id" in user_cols
-        assert "token_version" in user_cols
+        # Verify 100% column parity against Base.metadata
+        from db.models import Base
+        for table_name, model_table in Base.metadata.tables.items():
+            assert table_name in tables, f"Metadata table {table_name} missing from migrated DB"
+            db_cols = {c["name"] for c in inspector.get_columns(table_name)}
+            model_cols = {c.name for c in model_table.columns}
+            missing_cols = model_cols - db_cols
+            assert not missing_cols, f"Table {table_name} missing columns from metadata: {missing_cols}"
 
         engine.dispose()
     finally:
@@ -249,3 +252,49 @@ def test_migration_safe_downgrade_policy():
                 os.remove(temp_db)
         except OSError:
             pass
+
+
+@pytest.mark.skipif(not os.getenv("TEST_POSTGRES_URL"), reason="PostgreSQL test URL not configured")
+def test_migration_postgresql_full_schema_and_numeric_parity():
+    """Verify that Alembic head creates exact schema on PostgreSQL with NUMERIC(12, 2) columns and parity with Base.metadata."""
+    pg_url = os.getenv("TEST_POSTGRES_URL")
+    engine = sa.create_engine(pg_url)
+
+    # Clean public schema for clean Alembic run
+    with engine.begin() as conn:
+        conn.execute(sa.text("DROP SCHEMA IF EXISTS public CASCADE;"))
+        conn.execute(sa.text("CREATE SCHEMA public;"))
+        conn.execute(sa.text("GRANT ALL ON SCHEMA public TO postgres;"))
+        conn.execute(sa.text("GRANT ALL ON SCHEMA public TO public;"))
+
+    cfg = get_alembic_config(pg_url)
+    command.upgrade(cfg, "head")
+
+    inspector = sa.inspect(engine)
+    tables = set(inspector.get_table_names())
+
+    from db.models import Base
+    expected_tables = set(Base.metadata.tables.keys())
+    missing_tables = expected_tables - tables
+    assert not missing_tables, f"PostgreSQL migration is missing tables: {missing_tables}"
+
+    # Verify column types and Numeric(12, 2) precision on PostgreSQL
+    wallet_cols = {c["name"]: c for c in inspector.get_columns("wallets")}
+    for num_col in ["balance", "savings_balance", "daily_limit", "weekly_limit", "monthly_limit"]:
+        assert num_col in wallet_cols, f"Column {num_col} missing in wallets table"
+        col_type = wallet_cols[num_col]["type"]
+        assert isinstance(col_type, sa.Numeric), f"Column {num_col} is not Numeric: {col_type}"
+        assert col_type.precision == 12, f"Column {num_col} precision is not 12: {col_type.precision}"
+        assert col_type.scale == 2, f"Column {num_col} scale is not 2: {col_type.scale}"
+
+    # Verify 100% schema column parity across all models against Base.metadata
+    for table_name, model_table in Base.metadata.tables.items():
+        if table_name not in tables:
+            continue
+        db_cols = {c["name"] for c in inspector.get_columns(table_name)}
+        model_cols = {c.name for c in model_table.columns}
+        missing_cols = model_cols - db_cols
+        assert not missing_cols, f"Table {table_name} missing columns from metadata: {missing_cols}"
+
+    engine.dispose()
+

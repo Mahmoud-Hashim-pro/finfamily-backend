@@ -10,6 +10,22 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgrespassword
+          POSTGRES_DB: finfamily_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -25,13 +41,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Pytest & Migration Suite
+      - name: Run Pytest, PostgreSQL Parity & Concurrency Suite
         env:
           ENVIRONMENT: "test"
           DATABASE_URL: "sqlite:///:memory:"
+          TEST_POSTGRES_URL: "postgresql://postgres:postgrespassword@localhost:5432/finfamily_test"
           JWT_SECRET: "test-ci-secret-key-at-least-32-bytes-secure"
           GOOGLE_CLIENT_ID: "100000000000-dummyclientidforci.apps.googleusercontent.com"
           APP_VERSION: "1.1.0"
           APP_BUILD_NUMBER: "8"
         run: |
-          pytest test_google_auth.py test_cross_family_isolation_and_google_auth.py test_family_isolation_policy.py test_financial_concurrency_and_security.py test_migrations_reconciliation.py test_subsystem1_auth_security.py test_subsystem2_admin_ops.py -v
+          pytest test_google_auth.py test_cross_family_isolation_and_google_auth.py test_family_isolation_policy.py test_financial_concurrency_and_security.py test_comprehensive_family_isolation_matrix.py test_concurrency_and_game_atomicity.py test_migrations_reconciliation.py test_subsystem1_auth_security.py test_subsystem2_admin_ops.py -v

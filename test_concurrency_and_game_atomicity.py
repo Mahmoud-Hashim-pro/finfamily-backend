@@ -1,0 +1,346 @@
+"""
+Genuine Multi-Threaded Financial Concurrency, Idempotency & Game Reward Atomicity Test Suite
+Verifies:
+1. Simultaneous identical idempotency keys (ThreadPoolExecutor: exactly 1 executes, others replay 200, no double credits).
+2. Conflicting payloads with identical idempotency key (HTTP 409 Conflict).
+3. Competing simultaneous transfers to one wallet with unique idempotency keys (no lost updates, exact sum).
+4. Competing simultaneous debits / overdraft prevention (no negative balances, strictly enforces funds check).
+5. Concurrent game completion submissions (daily anti-cheat awarded at most once, atomic wallet + XP balance).
+"""
+import os
+import uuid
+import tempfile
+import pytest
+from decimal import Decimal
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import sqlalchemy as sa
+from sqlalchemy import event, create_engine
+from sqlalchemy.orm import sessionmaker
+
+os.environ["ENVIRONMENT"] = "development"
+os.environ["JWT_SECRET"] = "concurrency-atomicity-test-secret-key-32bytes!!"
+os.environ["APP_VERSION"] = "1.1.0"
+os.environ["APP_BUILD_NUMBER"] = "8"
+
+# Configure dedicated concurrent database engine (PostgreSQL if TEST_POSTGRES_URL is available, else WAL-mode SQLite file)
+test_pg_url = os.getenv("TEST_POSTGRES_URL")
+if test_pg_url:
+    concur_db_url = test_pg_url
+    concur_engine = create_engine(concur_db_url, pool_size=20, max_overflow=20)
+else:
+    temp_dir = tempfile.gettempdir()
+    db_file = os.path.join(temp_dir, f"finfamily_concur_{uuid.uuid4().hex}.db")
+    concur_db_url = f"sqlite:///{db_file}"
+    concur_engine = create_engine(
+        concur_db_url,
+        connect_args={"check_same_thread": False, "timeout": 30.0},
+        pool_size=20,
+        max_overflow=20,
+    )
+    @event.listens_for(concur_engine, "connect")
+    def _set_sqlite_pragmas(dbapi_conn, record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
+
+from db.database import Base, get_db
+from db.models import (
+    User, Family, Wallet, UserRole, IdempotencyRecord,
+    SavingsGoal, Transaction, TransactionType, GameCompletion
+)
+from core.security import hash_password, create_access_token
+from services.games import GAME_CATALOG
+from main import app
+from fastapi.testclient import TestClient
+
+Base.metadata.create_all(bind=concur_engine)
+app.state.limiter.enabled = False
+
+ConcurSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=concur_engine)
+
+def _concur_get_db():
+    db = ConcurSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+@pytest.fixture(autouse=True)
+def _scope_concur_db():
+    app.dependency_overrides[get_db] = _concur_get_db
+    yield
+    app.dependency_overrides.pop(get_db, None)
+
+client = TestClient(app)
+
+
+def _setup_family_and_users(init_wallet_balance=0.0):
+    db = ConcurSessionLocal()
+    try:
+        fam_id = f"fam-concur-{uuid.uuid4()}"
+        fam = Family(id=fam_id, name="Concurrency Test Family", family_code=f"CC{uuid.uuid4().hex[:4].upper()}")
+        db.add(fam)
+        db.commit()
+
+        parent_id = f"p-{uuid.uuid4()}"
+        parent = User(
+            id=parent_id,
+            email=f"concur_p_{uuid.uuid4().hex[:6]}@finfamily.test",
+            full_name="Parent Concurrency",
+            password_hash=hash_password("Pass12345!"),
+            role=UserRole.parent,
+            family_id=fam_id,
+            token_version=1,
+            is_active=True,
+        )
+
+        child_id = f"c-{uuid.uuid4()}"
+        child = User(
+            id=child_id,
+            full_name="Child Concurrency",
+            pin_hash=hash_password("1234"),
+            role=UserRole.child,
+            family_id=fam_id,
+            token_version=1,
+            is_active=True,
+            xp=0,
+            level=1,
+        )
+        db.add_all([parent, child])
+        db.commit()
+
+        c_wallet = Wallet(owner_id=child_id, balance=init_wallet_balance, savings_balance=0.0)
+        db.add(c_wallet)
+        db.commit()
+
+        p_token = create_access_token(user_id=parent_id, family_id=fam_id, role=UserRole.parent.value, email=parent.email, token_version=1)
+        c_token = create_access_token(user_id=child_id, family_id=fam_id, role=UserRole.child.value, token_version=1)
+
+        return fam_id, parent_id, child_id, p_token, c_token
+    finally:
+        db.close()
+
+
+def test_concurrent_identical_idempotency_allowance():
+    """10 simultaneous threads sending the exact same idempotency key: exactly 1 executes credit, no double credit."""
+    fam_id, parent_id, child_id, p_token, _ = _setup_family_and_users(init_wallet_balance=50.0)
+    headers = {"Authorization": f"Bearer {p_token}"}
+    shared_key = f"idem-shared-{uuid.uuid4()}"
+    payload = {
+        "amount": 25.0,
+        "label": "Concurrent Pocket Money",
+        "idempotency_key": shared_key
+    }
+
+    def _send_request():
+        return client.post(f"/api/wallet/child/{child_id}/allowance", json=payload, headers=headers)
+
+    concurrency_count = 10
+    with ThreadPoolExecutor(max_workers=concurrency_count) as executor:
+        futures = [executor.submit(_send_request) for _ in range(concurrency_count)]
+        responses = [f.result() for f in as_completed(futures)]
+
+    # All responses must be HTTP 200
+    for resp in responses:
+        assert resp.status_code == 200, f"Expected 200 but got {resp.status_code}: {resp.text}"
+
+    # Wallet balance must be exactly 50.0 + 25.0 = 75.0, NOT 50.0 + 250.0
+    db = ConcurSessionLocal()
+    try:
+        w = db.query(Wallet).filter(Wallet.owner_id == child_id).first()
+        assert float(w.balance) == 75.0, f"Balance was double-credited! Expected 75.0, got {w.balance}"
+
+        # Only 1 allowance transaction recorded
+        tx_count = db.query(Transaction).filter(
+            Transaction.wallet_id == w.id,
+            Transaction.type == TransactionType.allowance
+        ).count()
+        assert tx_count == 1, f"Expected exactly 1 transaction, got {tx_count}"
+
+        # Only 1 idempotency record exists
+        idem_count = db.query(IdempotencyRecord).filter(IdempotencyRecord.key == shared_key).count()
+        assert idem_count == 1
+    finally:
+        db.close()
+
+
+def test_idempotency_conflicting_payload_rejected_with_409():
+    """Reusing the same idempotency key with a conflicting payload raises HTTP 409 Conflict."""
+    fam_id, parent_id, child_id, p_token, _ = _setup_family_and_users(init_wallet_balance=100.0)
+    headers = {"Authorization": f"Bearer {p_token}"}
+    shared_key = f"idem-conflict-{uuid.uuid4()}"
+
+    payload1 = {
+        "amount": 30.0,
+        "label": "Original Request",
+        "idempotency_key": shared_key
+    }
+    payload2 = {
+        "amount": 90.0,  # Conflicting amount
+        "label": "Conflicting Request",
+        "idempotency_key": shared_key
+    }
+
+    # First request succeeds
+    r1 = client.post(f"/api/wallet/child/{child_id}/allowance", json=payload1, headers=headers)
+    assert r1.status_code == 200
+    assert float(r1.json()["balance"]) == 130.0
+
+    # Second request with different amount must be rejected with 409
+    r2 = client.post(f"/api/wallet/child/{child_id}/allowance", json=payload2, headers=headers)
+    assert r2.status_code == 409, f"Expected 409 Conflict, got {r2.status_code}: {r2.text}"
+    assert "conflicting request payload" in r2.json()["detail"].lower()
+
+    # Verify balance was NOT modified by conflicting request
+    db = ConcurSessionLocal()
+    try:
+        w = db.query(Wallet).filter(Wallet.owner_id == child_id).first()
+        assert float(w.balance) == 130.0
+    finally:
+        db.close()
+
+
+def test_concurrent_distinct_transfers_no_lost_updates():
+    """10 simultaneous distinct transfers to child wallet: all succeed and sum is exact (no race condition loss)."""
+    fam_id, parent_id, child_id, p_token, _ = _setup_family_and_users(init_wallet_balance=0.0)
+    headers = {"Authorization": f"Bearer {p_token}"}
+    transfer_amount = 10.0
+    thread_count = 10
+
+    def _send_transfer(idx):
+        unique_key = f"idem-distinct-{idx}-{uuid.uuid4()}"
+        p = {
+            "amount": transfer_amount,
+            "label": f"Transfer #{idx}",
+            "idempotency_key": unique_key
+        }
+        return client.post(f"/api/wallet/child/{child_id}/allowance", json=p, headers=headers)
+
+    with ThreadPoolExecutor(max_workers=thread_count) as executor:
+        futures = [executor.submit(_send_transfer, i) for i in range(thread_count)]
+        responses = [f.result() for f in as_completed(futures)]
+
+    for resp in responses:
+        assert resp.status_code == 200, f"Transfer failed: {resp.text}"
+
+    # Verify final balance is 10 * 10.0 = 100.0
+    db = ConcurSessionLocal()
+    try:
+        w = db.query(Wallet).filter(Wallet.owner_id == child_id).first()
+        assert float(w.balance) == 100.0, f"Lost update detected! Expected 100.0, got {w.balance}"
+    finally:
+        db.close()
+
+
+def test_concurrent_debit_overdraft_prevention():
+    """Simultaneous goal deposits competing for limited wallet funds: overdraft prevented, no negative balance."""
+    fam_id, parent_id, child_id, _, c_token = _setup_family_and_users(init_wallet_balance=35.0)
+    c_headers = {"Authorization": f"Bearer {c_token}"}
+
+    db = ConcurSessionLocal()
+    try:
+        w = db.query(Wallet).filter(Wallet.owner_id == child_id).first()
+        goal = SavingsGoal(
+            id=f"g-{uuid.uuid4()}",
+            wallet_id=w.id,
+            name="Lego Set",
+            target=100.0,
+            current=0.0
+        )
+        db.add(goal)
+        db.commit()
+        goal_id = goal.id
+    finally:
+        db.close()
+
+    # Threads each try to deposit 20.0 (total requested exceeds wallet balance 35.0)
+    def _attempt_deposit():
+        return client.post(
+            f"/api/wallet/me/goals/{goal_id}/deposit",
+            json={"amount": 20.0},
+            headers=c_headers
+        )
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(_attempt_deposit) for _ in range(5)]
+        responses = [f.result() for f in as_completed(futures)]
+
+    successes = [r for r in responses if r.status_code == 200]
+    failures = [r for r in responses if r.status_code == 400]
+
+    # At least one succeeded, overdraft was prevented, and failures occurred
+    assert len(successes) >= 1, "At least 1 deposit must succeed"
+    assert len(failures) >= 1, "Excess deposits must be rejected with 400"
+    assert len(successes) + len(failures) == 5
+
+    db = ConcurSessionLocal()
+    try:
+        w = db.query(Wallet).filter(Wallet.owner_id == child_id).first()
+        g = db.query(SavingsGoal).filter(SavingsGoal.id == goal_id).first()
+        # In all scenarios, wallet balance must NEVER be negative
+        assert float(w.balance) >= 0.0, f"Wallet balance overdrafted! Balance: {w.balance}"
+        # Sum of available balance and goal current must equal initial balance
+        assert float(w.balance) + float(g.current) == 35.0, f"Money leaked or created! balance={w.balance}, goal={g.current}"
+    finally:
+        db.close()
+
+
+def test_concurrent_game_completion_daily_anti_cheat_and_atomicity():
+    """10 simultaneous game completions with correct answers: daily bonus anti-cheat awarded at most ONCE."""
+    fam_id, parent_id, child_id, _, c_token = _setup_family_and_users(init_wallet_balance=0.0)
+    c_headers = {"Authorization": f"Bearer {c_token}"}
+
+    game_id = "gm1"
+    assert game_id in GAME_CATALOG
+    answer_key = GAME_CATALOG[game_id]["answer_key"]
+
+    payload = {
+        "game_id": game_id,
+        "score": 5.0,
+        "total": 5.0,
+        "selected_option": "B",
+        "submitted_answers": list(answer_key)
+    }
+
+    def _submit_game():
+        return client.post("/api/games/complete", json=payload, headers=c_headers)
+
+    thread_count = 10
+    with ThreadPoolExecutor(max_workers=thread_count) as executor:
+        futures = [executor.submit(_submit_game) for _ in range(thread_count)]
+        responses = [f.result() for f in as_completed(futures)]
+
+    # All must return 200 OK
+    for r in responses:
+        assert r.status_code == 200, f"Game completion failed: {r.text}"
+
+    # Exactly 1 response must indicate rewarded, and 9 must indicate already rewarded today
+    rewarded_responses = [r.json() for r in responses if r.json().get("already_rewarded_today") is False and r.json().get("coins_awarded", 0) > 0]
+    already_responses = [r.json() for r in responses if r.json().get("already_rewarded_today") is True or r.json().get("coins_awarded", 0) == 0]
+
+    assert len(rewarded_responses) == 1, f"Expected exactly 1 rewarded response, got {len(rewarded_responses)}"
+    assert len(already_responses) == thread_count - 1
+
+    expected_coins = rewarded_responses[0]["coins_awarded"]
+    expected_xp = rewarded_responses[0]["xp_awarded"]
+    assert expected_coins > 0
+    assert expected_xp > 0
+
+    # Verify wallet and user in database: credited exactly ONCE
+    db = ConcurSessionLocal()
+    try:
+        w = db.query(Wallet).filter(Wallet.owner_id == child_id).first()
+        u = db.query(User).filter(User.id == child_id).first()
+        assert float(w.balance) == float(expected_coins), f"Wallet credited multiple times! Expected {expected_coins}, got {w.balance}"
+        assert u.xp == expected_xp, f"XP awarded multiple times! Expected {expected_xp}, got {u.xp}"
+
+        # Check rewarded game completions count in DB
+        rewarded_count = db.query(GameCompletion).filter(
+            GameCompletion.child_id == child_id,
+            GameCompletion.game_id == game_id,
+            GameCompletion.was_rewarded == True
+        ).count()
+        assert rewarded_count == 1, f"Expected exactly 1 was_rewarded=True completion, got {rewarded_count}"
+    finally:
+        db.close()

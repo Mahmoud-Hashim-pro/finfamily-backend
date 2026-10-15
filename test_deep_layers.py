@@ -7,9 +7,10 @@ sys.stdout.reconfigure(encoding='utf-8')
 
 BASE_URL = "https://finfamily-backend.vercel.app/api"
 
-print("============================================================")
-print("🧪 TESTING DEEP FUNCTIONAL & ARCHITECTURAL LAYERS")
-print("============================================================")
+def main():
+    print("============================================================")
+    print("🧪 TESTING DEEP FUNCTIONAL & ARCHITECTURAL LAYERS")
+    print("============================================================")
 
 # 1. Login parent
 login_payload = {

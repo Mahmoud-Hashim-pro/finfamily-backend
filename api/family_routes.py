@@ -337,7 +337,12 @@ def send_allowance(
             wallet = _get_wallet_for(db, child, for_update=False)
             return _wallet_out(db, wallet, child)
 
-    wallet.balance = round(to_decimal(wallet.balance) + to_decimal(payload.amount), 2)
+    db.query(Wallet).filter(Wallet.id == wallet.id).update(
+        {Wallet.balance: Wallet.balance + to_decimal(payload.amount)},
+        synchronize_session=False,
+    )
+    db.flush()
+    db.refresh(wallet)
     _log_transaction(
         db, wallet, parent.family_id,
         TransactionType.allowance, TransactionDirection.credit,
@@ -404,10 +409,27 @@ def deposit_to_goal(
     if round(to_decimal(goal.current) + to_decimal(payload.amount), 2) > to_decimal(goal.target):
         raise HTTPException(status_code=400, detail="Deposit exceeds savings goal target")
 
-    # التحويل: من الرصيد المتاح إلى هدف الادخار
-    wallet.balance = round(to_decimal(wallet.balance) - to_decimal(payload.amount), 2)
-    wallet.savings_balance = round(to_decimal(wallet.savings_balance) + to_decimal(payload.amount), 2)
-    goal.current = round(to_decimal(goal.current) + to_decimal(payload.amount), 2)
+    # Atomic transfer: debit from available balance & credit to savings_balance and goal.current
+    updated = db.query(Wallet).filter(
+        Wallet.id == wallet.id,
+        Wallet.balance >= to_decimal(payload.amount),
+    ).update(
+        {
+            Wallet.balance: Wallet.balance - to_decimal(payload.amount),
+            Wallet.savings_balance: Wallet.savings_balance + to_decimal(payload.amount),
+        },
+        synchronize_session=False,
+    )
+    if updated == 0:
+        raise HTTPException(status_code=400, detail="Not enough balance in wallet")
+
+    db.query(SavingsGoal).filter(SavingsGoal.id == goal.id).update(
+        {SavingsGoal.current: SavingsGoal.current + to_decimal(payload.amount)},
+        synchronize_session=False,
+    )
+    db.flush()
+    db.refresh(wallet)
+    db.refresh(goal)
 
     _log_transaction(
         db, wallet, child.family_id,
@@ -417,7 +439,11 @@ def deposit_to_goal(
 
     check_and_award_badges(db, child)  # super_saver ممكن تتفتح هنا لو الهدف خلص
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Not enough balance in wallet")
     db.refresh(goal)
     return goal
 
@@ -453,7 +479,11 @@ def withdraw_from_goal(
         payload.amount, f"Withdrawn from savings goal: {goal.name}",
     )
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Invalid withdrawal amount or insufficient savings")
     db.refresh(goal)
     return goal
 
@@ -917,6 +947,7 @@ def complete_game(payload: GameCompleteRequest, child: User = Depends(require_ch
             coins_awarded, f"{title} — mini-game reward",
         )
 
+    perfect_bonus_xp, perfect_bonus_coins = 0, 0
     try:
         db.add(GameCompletion(
             child_id=child.id,
@@ -934,7 +965,6 @@ def complete_game(payload: GameCompleteRequest, child: User = Depends(require_ch
 
         newly_unlocked = check_and_award_badges(db, child)
 
-        perfect_bonus_xp, perfect_bonus_coins = 0, 0
         if any(b["id"] == "perfect_day" for b in newly_unlocked):
             perfect_bonus_xp, perfect_bonus_coins = PERFECT_DAY_BONUS_XP, PERFECT_DAY_BONUS_COINS
             wallet.balance = round(to_decimal(wallet.balance) + to_decimal(perfect_bonus_coins), 2)
@@ -951,6 +981,7 @@ def complete_game(payload: GameCompleteRequest, child: User = Depends(require_ch
         # Concurrent completion attempt on same game/day: roll back cleanly without duplicate reward
         db.rollback()
         xp_awarded, coins_awarded = 0, 0
+        perfect_bonus_xp, perfect_bonus_coins = 0, 0
         newly_unlocked = []
 
     db.refresh(child)

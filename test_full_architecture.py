@@ -5,11 +5,10 @@ import sys
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-BASE_URL = "https://finfamily-backend.vercel.app/api"
+import pytest
+pytestmark = pytest.mark.skip(reason="Manual integration script for deployed Vercel backend")
 
-print("================================================================================")
-print("🚀 FINFAMILY FULL ARCHITECTURAL & LAYER INTEGRATION TEST SUITE (ROUND 2)")
-print("================================================================================")
+BASE_URL = "https://finfamily-backend.vercel.app/api"
 
 results = []
 
@@ -17,6 +16,11 @@ def record(layer, test_name, passed, details=""):
     status = "✅ PASS" if passed else "❌ FAIL"
     results.append((layer, test_name, passed, details))
     print(f"[{status}] [{layer}] {test_name}: {details}")
+
+def run_full_suite():
+    print("================================================================================")
+    print("🚀 FINFAMILY FULL ARCHITECTURAL & LAYER INTEGRATION TEST SUITE (ROUND 2)")
+    print("================================================================================")
 
 # ==============================================================================
 # 1. CORE SYSTEM & VERSION LAYER
