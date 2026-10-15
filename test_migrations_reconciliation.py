@@ -254,10 +254,97 @@ def test_migration_safe_downgrade_policy():
             pass
 
 
+def assert_is_safe_disposable_test_database(url: str) -> None:
+    """Strict fail-closed safety guard before any destructive database operation (e.g. DROP SCHEMA).
+
+    Verifies that the target database is explicitly a disposable local or CI test database:
+    1. Host must be strictly localhost, 127.0.0.1, or postgres (CI service container).
+    2. Database name must contain 'test' (e.g. finfamily_test, test_db).
+    3. Database name must NEVER contain 'prod', 'production', 'live', or 'staging'.
+    4. Must never match an active non-test production DATABASE_URL.
+    """
+    if not url or not isinstance(url, str):
+        raise ValueError("Database URL must be a non-empty string.")
+
+    try:
+        parsed = sa.engine.make_url(url)
+    except Exception as e:
+        raise ValueError(f"Invalid database URL: {e}")
+
+    host = (parsed.host or "").lower()
+    database = (parsed.database or "").lower()
+
+    allowed_hosts = {"localhost", "127.0.0.1", "postgres"}
+    if host not in allowed_hosts:
+        raise ValueError(
+            f"Security Violation: Destructive operations forbidden on host '{host}'. "
+            f"Only disposable local/CI test containers ({sorted(list(allowed_hosts))}) are permitted."
+        )
+
+    if not database or "test" not in database:
+        raise ValueError(
+            f"Security Violation: Database name '{database}' does not contain 'test'. "
+            "Destructive schema actions are strictly restricted to dedicated test databases."
+        )
+
+    forbidden_keywords = ["prod", "production", "live", "staging"]
+    for kw in forbidden_keywords:
+        if kw in database:
+            raise ValueError(
+                f"Security Violation: Database name '{database}' contains forbidden keyword '{kw}'."
+            )
+
+    env_db = os.getenv("DATABASE_URL")
+    if env_db:
+        try:
+            env_parsed = sa.engine.make_url(env_db)
+            env_db_name = (env_parsed.database or "").lower()
+            env_host = (env_parsed.host or "").lower()
+            if "test" not in env_db_name or env_host not in allowed_hosts:
+                if (env_host == host and env_db_name == database) or url.strip() == env_db.strip():
+                    raise ValueError(
+                        f"Security Violation: Target test URL points to primary non-test database '{env_db_name}'."
+                    )
+        except Exception as e:
+            if "Security Violation" in str(e):
+                raise
+
+
+def test_assert_is_safe_disposable_test_database_validation():
+    """Verify that the safety guard strictly permits disposable test databases and rejects unsafe targets."""
+    # Permitted URLs
+    assert_is_safe_disposable_test_database("postgresql://postgres:pass@localhost:5432/finfamily_test")
+    assert_is_safe_disposable_test_database("postgresql://user:pass@127.0.0.1:5432/app_test_db")
+    assert_is_safe_disposable_test_database("postgresql://postgres:postgrespassword@postgres:5432/test_container")
+
+    # Rejected URLs: remote host
+    with pytest.raises(ValueError, match="Destructive operations forbidden on host"):
+        assert_is_safe_disposable_test_database("postgresql://user:pass@aws-rds.example.com:5432/finfamily_test")
+
+    # Rejected URLs: no 'test' in db name
+    with pytest.raises(ValueError, match="does not contain 'test'"):
+        assert_is_safe_disposable_test_database("postgresql://postgres:pass@localhost:5432/finfamily")
+
+    # Rejected URLs: production / staging / live in db name
+    with pytest.raises(ValueError, match="contains forbidden keyword 'prod'"):
+        assert_is_safe_disposable_test_database("postgresql://postgres:pass@localhost:5432/finfamily_prod_test")
+    with pytest.raises(ValueError, match="contains forbidden keyword"):
+        assert_is_safe_disposable_test_database("postgresql://postgres:pass@localhost:5432/finfamily_production_test")
+    with pytest.raises(ValueError, match="contains forbidden keyword 'live'"):
+        assert_is_safe_disposable_test_database("postgresql://postgres:pass@localhost:5432/finfamily_live_test")
+    with pytest.raises(ValueError, match="contains forbidden keyword 'staging'"):
+        assert_is_safe_disposable_test_database("postgresql://postgres:pass@localhost:5432/finfamily_staging_test")
+
+    # Rejected URLs: empty or non-string
+    with pytest.raises(ValueError, match="Database URL must be a non-empty string"):
+        assert_is_safe_disposable_test_database("")
+
+
 @pytest.mark.skipif(not os.getenv("TEST_POSTGRES_URL"), reason="PostgreSQL test URL not configured")
 def test_migration_postgresql_full_schema_and_numeric_parity():
     """Verify that Alembic head creates exact schema on PostgreSQL with NUMERIC(12, 2) columns and parity with Base.metadata."""
     pg_url = os.getenv("TEST_POSTGRES_URL")
+    assert_is_safe_disposable_test_database(pg_url)
     engine = sa.create_engine(pg_url)
 
     # Clean public schema for clean Alembic run

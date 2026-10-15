@@ -2,13 +2,18 @@ import uuid
 import random
 import secrets
 import string
-from datetime import datetime
+from datetime import datetime, timezone
 import enum
 
 from sqlalchemy import Column, String, DateTime, Enum, ForeignKey, Float, Integer, JSON, Boolean, UniqueConstraint, Numeric, CheckConstraint
 from sqlalchemy.orm import relationship, synonym
 
 from .database import Base
+
+
+def utcnow():
+    """Return naive UTC timestamp to eliminate Python 3.12+ datetime.utcnow() deprecation."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class UserRole(str, enum.Enum):
@@ -77,8 +82,8 @@ class Family(Base):
     # الكود ده الطفل بيستخدمه عشان يعرف يدخل على عيلته وقت الـ login
     family_code = Column(String, unique=True, index=True, default=_generate_family_code)
 
-    created_date = Column(DateTime, default=datetime.utcnow)
-    updated_date = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_date = Column(DateTime, default=utcnow)
+    updated_date = Column(DateTime, default=utcnow, onupdate=utcnow)
 
     members = relationship("User", back_populates="family", cascade="all, delete-orphan")
 
@@ -126,8 +131,8 @@ class User(Base):
     wallet = relationship("Wallet", back_populates="owner", uselist=False, cascade="all, delete-orphan")
     badges = relationship("UserBadge", back_populates="user", cascade="all, delete-orphan")
 
-    created_date = Column(DateTime, default=datetime.utcnow)
-    updated_date = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_date = Column(DateTime, default=utcnow)
+    updated_date = Column(DateTime, default=utcnow, onupdate=utcnow)
     created_by_id = Column(String, nullable=True)
 
 
@@ -156,8 +161,8 @@ class Wallet(Base):
     card_theme = Column(String, default="blue")  # الطفل هو اللي بيختاره من صفحته
     is_simulated = Column(Boolean, default=True, nullable=False)  # BUG-098: Simulated Meeza learning card
 
-    created_date = Column(DateTime, default=datetime.utcnow)
-    updated_date = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_date = Column(DateTime, default=utcnow)
+    updated_date = Column(DateTime, default=utcnow, onupdate=utcnow)
 
     savings_goals = relationship("SavingsGoal", back_populates="wallet", cascade="all, delete-orphan")
     transactions = relationship("Transaction", back_populates="wallet", cascade="all, delete-orphan")
@@ -181,8 +186,8 @@ class SavingsGoal(Base):
     target = Column(Numeric(12, 2), nullable=False)
     current = Column(Numeric(12, 2), default=0.0)
 
-    created_date = Column(DateTime, default=datetime.utcnow)
-    updated_date = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_date = Column(DateTime, default=utcnow)
+    updated_date = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class Mission(Base):
@@ -212,8 +217,8 @@ class Mission(Base):
     reviewed_date = Column(DateTime, nullable=True)
     review_note = Column(String, nullable=True)
 
-    created_date = Column(DateTime, default=datetime.utcnow)
-    updated_date = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_date = Column(DateTime, default=utcnow)
+    updated_date = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class Transaction(Base):
@@ -231,7 +236,7 @@ class Transaction(Base):
     amount = Column(Numeric(12, 2), nullable=False)
     description = Column(String, nullable=False)
 
-    created_date = Column(DateTime, default=datetime.utcnow)
+    created_date = Column(DateTime, default=utcnow)
 
 
 class CardPurchase(Base):
@@ -262,7 +267,7 @@ class CardPurchase(Base):
     reviewed_by_id = Column(String, nullable=True)
     reviewed_date = Column(DateTime, nullable=True)
 
-    created_date = Column(DateTime, default=datetime.utcnow)
+    created_date = Column(DateTime, default=utcnow)
 
 
 class GameCompletion(Base):
@@ -288,7 +293,7 @@ class GameCompletion(Base):
 
     user_id = synonym("child_id")
 
-    created_date = Column(DateTime, default=datetime.utcnow)
+    created_date = Column(DateTime, default=utcnow)
 
     __table_args__ = (
         UniqueConstraint("child_id", "game_id", "reward_date", name="uq_game_reward_daily"),
@@ -318,7 +323,7 @@ class AuditLog(Base):
     detail = Column(JSON, nullable=True)
     ip_address = Column(String, nullable=True)
 
-    created_date = Column(DateTime, default=datetime.utcnow, index=True)
+    created_date = Column(DateTime, default=utcnow, index=True)
 
 
 class UserBadge(Base):
@@ -330,7 +335,7 @@ class UserBadge(Base):
     user = relationship("User", back_populates="badges")
 
     badge_id = Column(String, nullable=False)  # مفتاح من BADGE_DEFS، زي "first_chore"
-    unlocked_date = Column(DateTime, default=datetime.utcnow)
+    unlocked_date = Column(DateTime, default=utcnow)
 
     __table_args__ = (
         UniqueConstraint("user_id", "badge_id", name="uq_user_badge"),
@@ -352,7 +357,7 @@ class PasswordResetToken(Base):
     expires_at = Column(DateTime, nullable=False)
     used = Column(Boolean, default=False)
 
-    created_date = Column(DateTime, default=datetime.utcnow)
+    created_date = Column(DateTime, default=utcnow)
 
 
 class MfaRecoveryCode(Base):
@@ -370,7 +375,7 @@ class MfaRecoveryCode(Base):
     used = Column(Boolean, default=False)
     used_date = Column(DateTime, nullable=True)
 
-    created_date = Column(DateTime, default=datetime.utcnow)
+    created_date = Column(DateTime, default=utcnow)
 
 
 class IdempotencyRecord(Base):
@@ -386,7 +391,7 @@ class IdempotencyRecord(Base):
     user_id = Column(String, ForeignKey("users.id"), nullable=True, index=True)
     action = Column(String, nullable=False)
     payload_hash = Column(String(64), nullable=True)
-    created_date = Column(DateTime, default=datetime.utcnow)
+    created_date = Column(DateTime, default=utcnow)
 
 
 class LessonCompletion(Base):
@@ -399,7 +404,7 @@ class LessonCompletion(Base):
     child_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
     lesson_id = Column(String, nullable=False, index=True)
     xp_awarded = Column(Integer, default=0)
-    created_date = Column(DateTime, default=datetime.utcnow)
+    created_date = Column(DateTime, default=utcnow)
 
     __table_args__ = (
         UniqueConstraint("child_id", "lesson_id", name="uq_child_lesson"),

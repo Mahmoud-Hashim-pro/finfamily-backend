@@ -1,5 +1,6 @@
 import os
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,17 +22,10 @@ from core.limiter import limiter
 
 is_production = os.getenv("ENVIRONMENT", os.getenv("ENV", "development")).strip().lower() in ("production", "prod")
 
-app = FastAPI(
-    title="FinFamily API",
-    docs_url=None if is_production else "/docs",
-    redoc_url=None if is_production else "/redoc",
-    openapi_url=None if is_production else "/openapi.json"
-)
-
 db_healthy = True
 
-@app.on_event("startup")
-def startup_db_init():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global db_healthy
     try:
         Base.metadata.create_all(bind=engine)
@@ -42,6 +36,15 @@ def startup_db_init():
         logger.error(f"Database initialization failed during startup: {e}", exc_info=True)
         if is_production:
             raise RuntimeError(f"Database initialization failed in production: {e}") from e
+    yield
+
+app = FastAPI(
+    title="FinFamily API",
+    docs_url=None if is_production else "/docs",
+    redoc_url=None if is_production else "/redoc",
+    openapi_url=None if is_production else "/openapi.json",
+    lifespan=lifespan
+)
 
 @app.get("/")
 def read_root():
