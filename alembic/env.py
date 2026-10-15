@@ -28,8 +28,13 @@ if config.config_file_name is not None:
 # Set target metadata for 'autogenerate' support
 target_metadata = Base.metadata
 
-# Read DATABASE_URL from os.environ without overwriting production credentials
-database_url = os.environ.get("DATABASE_URL")
+# Read DATABASE_URL from config (if programmatically overridden for tests) or os.environ without overwriting production credentials
+explicit_url = config.get_main_option("sqlalchemy.url")
+if explicit_url and not explicit_url.startswith("driver://"):
+    database_url = explicit_url
+else:
+    database_url = os.environ.get("DATABASE_URL")
+
 if not database_url:
     env = os.environ.get("ENVIRONMENT", os.environ.get("ENV", "development")).strip().lower()
     if env in ("production", "prod"):

@@ -11,6 +11,7 @@ class GameCompleteRequest(BaseModel):
     score: float = Field(ge=0, default=0.0)
     total: float = Field(gt=0, default=1.0)
     selected_option: str | None = None
+    submitted_answers: List[str] | None = None
 
 
 class GameCompleteResponse(BaseModel):

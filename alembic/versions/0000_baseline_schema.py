@@ -77,8 +77,22 @@ def upgrade() -> None:
     else:
         existing_cols = {col['name'] for col in inspector.get_columns('users')}
         with op.batch_alter_table('users', schema=None) as batch_op:
+            if 'token_version' not in existing_cols:
+                batch_op.add_column(sa.Column('token_version', sa.Integer(), server_default='1', default=1, nullable=False))
+            if 'failed_pin_attempts' not in existing_cols:
+                batch_op.add_column(sa.Column('failed_pin_attempts', sa.Integer(), server_default='0', default=0, nullable=False))
+            if 'pin_locked_until' not in existing_cols:
+                batch_op.add_column(sa.Column('pin_locked_until', sa.DateTime(), nullable=True))
+            if 'mfa_enabled' not in existing_cols:
+                batch_op.add_column(sa.Column('mfa_enabled', sa.Boolean(), server_default='0', default=False, nullable=False))
+            if 'mfa_secret' not in existing_cols:
+                batch_op.add_column(sa.Column('mfa_secret', sa.String(), nullable=True))
             if 'mfa_pending_secret' not in existing_cols:
                 batch_op.add_column(sa.Column('mfa_pending_secret', sa.String(), nullable=True))
+            if 'last_active_date' not in existing_cols:
+                batch_op.add_column(sa.Column('last_active_date', sa.DateTime(), nullable=True))
+            if 'avatar_url' not in existing_cols:
+                batch_op.add_column(sa.Column('avatar_url', sa.String(), nullable=True))
             if 'created_by_id' not in existing_cols:
                 batch_op.add_column(sa.Column('created_by_id', sa.String(), nullable=True))
             if 'updated_date' not in existing_cols:
@@ -109,12 +123,22 @@ def upgrade() -> None:
     else:
         existing_cols = {col['name'] for col in inspector.get_columns('wallets')}
         with op.batch_alter_table('wallets', schema=None) as batch_op:
+            if 'daily_limit' not in existing_cols:
+                batch_op.add_column(sa.Column('daily_limit', sa.Numeric(precision=12, scale=2), nullable=True))
+            if 'weekly_limit' not in existing_cols:
+                batch_op.add_column(sa.Column('weekly_limit', sa.Numeric(precision=12, scale=2), nullable=True))
+            if 'monthly_limit' not in existing_cols:
+                batch_op.add_column(sa.Column('monthly_limit', sa.Numeric(precision=12, scale=2), nullable=True))
             if 'blocked_categories' not in existing_cols:
                 batch_op.add_column(sa.Column('blocked_categories', sa.JSON(), nullable=True))
+            if 'card_number' not in existing_cols:
+                batch_op.add_column(sa.Column('card_number', sa.String(), nullable=True))
             if 'card_theme' not in existing_cols:
                 batch_op.add_column(sa.Column('card_theme', sa.String(), default='blue'))
             if 'is_simulated' not in existing_cols:
                 batch_op.add_column(sa.Column('is_simulated', sa.Boolean(), default=True))
+            if 'updated_date' not in existing_cols:
+                batch_op.add_column(sa.Column('updated_date', sa.DateTime(), nullable=True))
 
     # 4. savings_goals
     if 'savings_goals' not in existing_tables:
@@ -234,6 +258,21 @@ def upgrade() -> None:
         op.create_index('ix_card_purchases_wallet_id', 'card_purchases', ['wallet_id'])
         op.create_index('ix_card_purchases_family_id', 'card_purchases', ['family_id'])
         op.create_index('ix_card_purchases_child_id', 'card_purchases', ['child_id'])
+    else:
+        existing_cols = {col['name'] for col in inspector.get_columns('card_purchases')}
+        with op.batch_alter_table('card_purchases', schema=None) as batch_op:
+            if 'category' not in existing_cols:
+                batch_op.add_column(sa.Column('category', sa.String(), default='Other'))
+            if 'location' not in existing_cols:
+                batch_op.add_column(sa.Column('location', sa.String(), nullable=True))
+            if 'decline_reason' not in existing_cols:
+                batch_op.add_column(sa.Column('decline_reason', sa.String(), nullable=True))
+            if 'is_simulated' not in existing_cols:
+                batch_op.add_column(sa.Column('is_simulated', sa.Boolean(), server_default='1', default=True, nullable=False))
+            if 'reviewed_by_id' not in existing_cols:
+                batch_op.add_column(sa.Column('reviewed_by_id', sa.String(), nullable=True))
+            if 'reviewed_date' not in existing_cols:
+                batch_op.add_column(sa.Column('reviewed_date', sa.DateTime(), nullable=True))
 
     # 8. game_completions
     if 'game_completions' not in existing_tables:
@@ -256,6 +295,11 @@ def upgrade() -> None:
         op.create_index('ix_game_completions_id', 'game_completions', ['id'])
         op.create_index('ix_game_completions_child_id', 'game_completions', ['child_id'])
         op.create_index('ix_game_completions_game_id', 'game_completions', ['game_id'])
+    else:
+        existing_cols = {col['name'] for col in inspector.get_columns('game_completions')}
+        with op.batch_alter_table('game_completions', schema=None) as batch_op:
+            if 'completion_date' not in existing_cols:
+                batch_op.add_column(sa.Column('completion_date', sa.String(), nullable=True))
 
     # 9. audit_logs
     if 'audit_logs' not in existing_tables:

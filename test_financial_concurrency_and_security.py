@@ -237,3 +237,103 @@ def test_lesson_completion_sync_and_idempotency():
     res = client.get("/api/lessons/completed", headers=headers)
     assert res.status_code == 200
     assert "lesson_saving_1" in res.json()
+
+
+def test_p1_7_idempotency_key_conflict_rejections():
+    """Verify that reusing an idempotency key with conflicting payload or across actors returns 409 Conflict."""
+    db = SessionLocal()
+    try:
+        fam1 = Family(id=f"fam1-{uuid.uuid4()}", name="Fam 1", family_code=f"F1{uuid.uuid4().hex[:4].upper()}")
+        fam2 = Family(id=f"fam2-{uuid.uuid4()}", name="Fam 2", family_code=f"F2{uuid.uuid4().hex[:4].upper()}")
+        db.add_all([fam1, fam2])
+        db.commit()
+
+        p1 = User(id=f"p1-{uuid.uuid4()}", full_name="Parent One", email=f"p1_{uuid.uuid4().hex[:6]}@test.com", role=UserRole.parent, family_id=fam1.id)
+        p2 = User(id=f"p2-{uuid.uuid4()}", full_name="Parent Two", email=f"p2_{uuid.uuid4().hex[:6]}@test.com", role=UserRole.parent, family_id=fam2.id)
+        c1 = User(id=f"c1-{uuid.uuid4()}", full_name="Child 1", role=UserRole.child, family_id=fam1.id)
+        c1_other = User(id=f"c1b-{uuid.uuid4()}", full_name="Child 1b", role=UserRole.child, family_id=fam1.id)
+        c2 = User(id=f"c2-{uuid.uuid4()}", full_name="Child 2", role=UserRole.child, family_id=fam2.id)
+        db.add_all([p1, p2, c1, c1_other, c2])
+        db.commit()
+
+        w1 = Wallet(owner_id=c1.id, balance=100.0)
+        w1_other = Wallet(owner_id=c1_other.id, balance=50.0)
+        w2 = Wallet(owner_id=c2.id, balance=200.0)
+        db.add_all([w1, w1_other, w2])
+        db.commit()
+
+        p1_id, p1_email, fam1_id = p1.id, p1.email, fam1.id
+        p2_id, p2_email, fam2_id = p2.id, p2.email, fam2.id
+        c1_id, c1_other_id, c2_id = c1.id, c1_other.id, c2.id
+        p1_token = create_access_token(user_id=p1_id, family_id=fam1_id, role="parent", email=p1_email)
+        p2_token = create_access_token(user_id=p2_id, family_id=fam2_id, role="parent", email=p2_email)
+    finally:
+        db.close()
+
+    hdr1 = {"Authorization": f"Bearer {p1_token}"}
+    hdr2 = {"Authorization": f"Bearer {p2_token}"}
+    shared_key = f"shared-idem-key-{uuid.uuid4()}"
+
+    # 1. P1 sends 25 to c1 -> 200 OK
+    res1 = client.post(f"/api/wallet/child/{c1_id}/allowance", json={"amount": 25.0, "label": "Lunch", "idempotency_key": shared_key}, headers=hdr1)
+    assert res1.status_code == 200
+
+    # 2. P1 reuses key with different amount (e.g. 50.0 instead of 25.0) -> 409 Conflict
+    res_diff_amt = client.post(f"/api/wallet/child/{c1_id}/allowance", json={"amount": 50.0, "label": "Lunch", "idempotency_key": shared_key}, headers=hdr1)
+    assert res_diff_amt.status_code == 409
+    assert "conflicting request payload" in res_diff_amt.json()["detail"].lower()
+
+    # 3. P1 reuses key with different child -> 409 Conflict
+    res_diff_child = client.post(f"/api/wallet/child/{c1_other_id}/allowance", json={"amount": 25.0, "label": "Lunch", "idempotency_key": shared_key}, headers=hdr1)
+    assert res_diff_child.status_code == 409
+
+    # 4. P2 (different family and user) tries to use same key -> 409 Conflict
+    res_diff_fam = client.post(f"/api/wallet/child/{c2_id}/allowance", json={"amount": 25.0, "label": "Lunch", "idempotency_key": shared_key}, headers=hdr2)
+    assert res_diff_fam.status_code == 409
+    assert "collision across different actors" in res_diff_fam.json()["detail"].lower()
+
+
+def test_p1_8_game_completion_reward_and_daily_duplicate_guard():
+    """Verify that completing a game awards rewards only once daily and prevents duplicate rewards."""
+    db = SessionLocal()
+    try:
+        fam = Family(id=f"fam-gm-{uuid.uuid4()}", name="Game Fam", family_code=f"GM{uuid.uuid4().hex[:4].upper()}")
+        db.add(fam)
+        child = User(id=f"c-gm-{uuid.uuid4()}", full_name="Gamer Child", role=UserRole.child, family_id=fam.id, xp=0, level=1)
+        db.add(child)
+        db.commit()
+        wallet = Wallet(owner_id=child.id, balance=10.0)
+        db.add(wallet)
+        db.commit()
+        child_token = create_access_token(user_id=child.id, family_id=fam.id, role="child")
+    finally:
+        db.close()
+
+    headers = {"Authorization": f"Bearer {child_token}"}
+    answer_key = GAME_CATALOG["gm1"]["answer_key"]
+
+    # 1. First completion with valid answers -> Awards XP and coins
+    payload = {
+        "game_id": "gm1",
+        "score": 5,
+        "total": 5,
+        "submitted_answers": list(answer_key),
+    }
+    res1 = client.post("/api/games/complete", json=payload, headers=headers)
+    assert res1.status_code == 200
+    data1 = res1.json()
+    assert data1["already_rewarded_today"] is False
+    assert data1["xp_awarded"] > 0
+    assert data1["coins_awarded"] > 0
+    assert float(data1["new_balance"]) > 10.0
+    initial_coins = data1["coins_awarded"]
+    balance_after = float(data1["new_balance"])
+
+    # 2. Second completion of same game on same day -> 0 XP, 0 coins, already_rewarded_today is True
+    res2 = client.post("/api/games/complete", json=payload, headers=headers)
+    assert res2.status_code == 200
+    data2 = res2.json()
+    assert data2["already_rewarded_today"] is True
+    assert data2["xp_awarded"] == 0
+    assert data2["coins_awarded"] == 0
+    assert float(data2["new_balance"]) == balance_after
