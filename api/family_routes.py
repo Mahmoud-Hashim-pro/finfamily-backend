@@ -277,12 +277,32 @@ def send_allowance(
     wallet = _get_wallet_for(db, child, for_update=True)
     require_family_wallet(db, parent.family_id, wallet.id, for_update=True)
 
-    # Dedicated atomic idempotency check via IdempotencyRecord with UNIQUE constraint
+    # Dedicated atomic idempotency check via IdempotencyRecord with UNIQUE constraint & payload hash validation
     idempotency_key = request.headers.get("X-Idempotency-Key") or request.headers.get("Idempotency-Key") or payload.idempotency_key
     if idempotency_key:
         clean_key = str(idempotency_key).strip()
+        import hashlib, json
+        payload_data = {"child_id": child_id, "amount": float(payload.amount), "label": payload.label or ""}
+        payload_hash = hashlib.sha256(json.dumps(payload_data, sort_keys=True).encode()).hexdigest()
+
         existing_rec = db.query(IdempotencyRecord).filter(IdempotencyRecord.key == clean_key).first()
         if existing_rec:
+            # Enforce actor, family, action, and payload integrity
+            if existing_rec.family_id != parent.family_id or existing_rec.user_id != parent.id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Idempotency key collision across different actors or families",
+                )
+            if existing_rec.action != "allowance_sent":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Idempotency key already used for a different operation",
+                )
+            if existing_rec.payload_hash and existing_rec.payload_hash != payload_hash:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Idempotency key reused with conflicting request payload parameters",
+                )
             return _wallet_out(db, wallet, child)
 
         try:
@@ -291,6 +311,7 @@ def send_allowance(
                 family_id=parent.family_id,
                 user_id=parent.id,
                 action="allowance_sent",
+                payload_hash=payload_hash,
             ))
             db.flush()
         except IntegrityError:
@@ -838,7 +859,13 @@ def list_audit_logs(
 
 @router.post("/games/complete", response_model=GameCompleteResponse)
 def complete_game(payload: GameCompleteRequest, child: User = Depends(require_child), db: Session = Depends(get_db)):
-    result = compute_reward(payload.game_id, payload.score, payload.total, payload.selected_option)
+    result = compute_reward(
+        payload.game_id,
+        payload.score,
+        payload.total,
+        payload.selected_option,
+        getattr(payload, "submitted_answers", None),
+    )
     if not result:
         raise HTTPException(status_code=404, detail="Unknown game_id")
     title, xp_awarded, coins_awarded = result

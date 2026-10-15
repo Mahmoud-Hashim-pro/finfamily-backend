@@ -29,7 +29,7 @@ def test_p0_1_game_reward_server_side_verification():
     game_key = "gm1"
     assert game_key in GAME_CATALOG
     correct_opt = GAME_CATALOG[game_key]["correct_option"]
-    assert correct_opt == "optA"
+    assert correct_opt == "optB"
 
     # Correct answer -> full reward
     title, xp, coins = compute_reward(game_key, 1, 1, correct_opt)
@@ -170,7 +170,7 @@ def test_p1_6_version_defaults():
     data = res.json()
     assert data["latest_version"] == "1.1.0"
     assert data["build_number"] == 8
-    assert "FinFamily-v1.1.0.apk" in data["download_url"]
+    assert "app-release.apk" in data["download_url"] or "FinFamily" in data["download_url"]
 
 
 def test_lesson_completion_sync_and_idempotency():

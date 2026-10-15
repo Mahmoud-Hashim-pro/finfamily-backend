@@ -46,11 +46,33 @@ from core.security import (
     create_access_token,
     decode_access_token,
 )
+from core.google_auth import set_mock_google_verifier
 from main import app
 
 Base.metadata.create_all(bind=engine)
 app.state.limiter.enabled = False
 client = TestClient(app)
+
+_MOCK_GOOGLE_TOKENS = {}
+
+def mock_google_verifier(token: str, client_id=None):
+    if token in _MOCK_GOOGLE_TOKENS:
+        return _MOCK_GOOGLE_TOKENS[token]
+    if token.startswith("valid_token_"):
+        tag = token.replace("valid_token_", "")
+        return {
+            "email": f"{tag}@gmail.com",
+            "name": f"User {tag}",
+            "picture": "https://lh3.googleusercontent.com/a/photo.jpg",
+            "sub": f"sub-{tag}",
+        }
+    raise ValueError(f"Invalid Google ID token: {token}")
+
+@pytest.fixture(autouse=True)
+def setup_google_mock():
+    set_mock_google_verifier(mock_google_verifier)
+    yield
+    set_mock_google_verifier(None)
 
 
 @pytest.fixture
@@ -487,12 +509,18 @@ def test_google_auth_new_email_creates_family_and_parent():
     new_email = f"google_parent_{unique_tag}@gmail.com"
     full_name = f"Google Dad {unique_tag}"
     family_name = f"Al-Fulan Family {unique_tag}"
+    mock_token = f"token_new_{unique_tag}"
+
+    _MOCK_GOOGLE_TOKENS[mock_token] = {
+        "email": new_email,
+        "name": full_name,
+        "picture": "https://lh3.googleusercontent.com/a/photo.jpg",
+        "sub": f"google-sub-{unique_tag}",
+    }
 
     payload = {
-        "email": new_email,
-        "full_name": full_name,
+        "id_token": mock_token,
         "family_name": family_name,
-        "avatar_url": "https://lh3.googleusercontent.com/a/photo.jpg",
     }
 
     response = client.post("/api/auth/google", json=payload)
@@ -546,6 +574,7 @@ def test_google_auth_existing_email_returns_existing_user():
     """
     unique_tag = uuid.uuid4().hex[:8]
     existing_email = f"existing_parent_{unique_tag}@gmail.com"
+    mock_token = f"token_exist_{unique_tag}"
 
     db = SessionLocal()
     try:
@@ -569,10 +598,16 @@ def test_google_auth_existing_email_returns_existing_user():
     finally:
         db.close()
 
+    _MOCK_GOOGLE_TOKENS[mock_token] = {
+        "email": existing_email,
+        "name": f"Existing Parent {unique_tag}",
+        "picture": "https://lh3.googleusercontent.com/avatar_new.jpg",
+        "sub": f"google-sub-{unique_tag}",
+    }
+
     # Call /api/auth/google with the same email
     payload = {
-        "email": existing_email,
-        "avatar_url": "https://lh3.googleusercontent.com/avatar_new.jpg",
+        "id_token": mock_token,
     }
     response = client.post("/api/auth/google", json=payload)
     assert response.status_code == 200, f"Expected 200, got {response.status_code}: {response.text}"
@@ -606,15 +641,27 @@ def test_google_auth_email_case_insensitivity():
     """
     unique_tag = uuid.uuid4().hex[:8]
     clean_email = f"casetest_{unique_tag}@gmail.com"
+    token1 = f"token_case1_{unique_tag}"
+    _MOCK_GOOGLE_TOKENS[token1] = {
+        "email": clean_email,
+        "name": "Case User",
+        "sub": f"sub1-{unique_tag}",
+    }
 
     # Register first with lowercase
-    res1 = client.post("/api/auth/google", json={"email": clean_email, "full_name": "Case User"})
+    res1 = client.post("/api/auth/google", json={"id_token": token1})
     assert res1.status_code == 200
     first_id = res1.json()["user"]["id"]
 
     # Login again with mixed uppercase email
     mixed_email = f"CaSeTeSt_{unique_tag}@GMAIL.COM"
-    res2 = client.post("/api/auth/google", json={"email": mixed_email})
+    token2 = f"token_case2_{unique_tag}"
+    _MOCK_GOOGLE_TOKENS[token2] = {
+        "email": mixed_email,
+        "name": "Case User",
+        "sub": f"sub2-{unique_tag}",
+    }
+    res2 = client.post("/api/auth/google", json={"id_token": token2})
     assert res2.status_code == 200
     second_id = res2.json()["user"]["id"]
 
@@ -631,7 +678,13 @@ def test_google_authenticated_parent_cannot_cross_family_boundaries(two_families
     # Register brand new parent via Google Auth
     tag = uuid.uuid4().hex[:6]
     g_email = f"google_cross_parent_{tag}@gmail.com"
-    g_res = client.post("/api/auth/google", json={"email": g_email, "full_name": f"Google Parent {tag}"})
+    token_cross = f"token_cross_{tag}"
+    _MOCK_GOOGLE_TOKENS[token_cross] = {
+        "email": g_email,
+        "name": f"Google Parent {tag}",
+        "sub": f"sub-cross-{tag}",
+    }
+    g_res = client.post("/api/auth/google", json={"id_token": token_cross})
     assert g_res.status_code == 200
     g_token = g_res.json()["access_token"]
     g_headers = {"Authorization": f"Bearer {g_token}"}

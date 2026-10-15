@@ -368,6 +368,7 @@ class MfaRecoveryCode(Base):
 class IdempotencyRecord(Base):
     """
     سجل فريد ومحصن (Atomic & Unique) لمنع العمليات المالية المتكررة الناتجة عن التزامن أو انقطاع الشبكة.
+    يدعم التحقق الصارم من تطابق الـ payload_hash لمنع استخدام نفس المفتاح لعمليات مختلفة.
     """
     __tablename__ = "idempotency_records"
 
@@ -376,6 +377,7 @@ class IdempotencyRecord(Base):
     family_id = Column(String, ForeignKey("families.id"), nullable=True, index=True)
     user_id = Column(String, ForeignKey("users.id"), nullable=True, index=True)
     action = Column(String, nullable=False)
+    payload_hash = Column(String(64), nullable=True)
     created_date = Column(DateTime, default=datetime.utcnow)
 
 

@@ -13,45 +13,52 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = '0001_initial_numeric_and_isolation'
-down_revision: Union[str, None] = None
+down_revision: Union[str, None] = '0000_baseline_schema'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    existing_tables = set(inspector.get_table_names())
+
     # 1. Create idempotency_records table
-    op.create_table(
-        'idempotency_records',
-        sa.Column('id', sa.String(), nullable=False),
-        sa.Column('key', sa.String(length=128), nullable=False),
-        sa.Column('family_id', sa.String(), nullable=True),
-        sa.Column('user_id', sa.String(), nullable=True),
-        sa.Column('action', sa.String(), nullable=False),
-        sa.Column('created_date', sa.DateTime(), nullable=True),
-        sa.ForeignKeyConstraint(['family_id'], ['families.id'], ),
-        sa.ForeignKeyConstraint(['user_id'], ['users.id'], ),
-        sa.PrimaryKeyConstraint('id')
-    )
-    op.create_index(op.f('ix_idempotency_records_id'), 'idempotency_records', ['id'], unique=False)
-    op.create_index(op.f('ix_idempotency_records_key'), 'idempotency_records', ['key'], unique=True)
-    op.create_index(op.f('ix_idempotency_records_family_id'), 'idempotency_records', ['family_id'], unique=False)
-    op.create_index(op.f('ix_idempotency_records_user_id'), 'idempotency_records', ['user_id'], unique=False)
+    if 'idempotency_records' not in existing_tables:
+        op.create_table(
+            'idempotency_records',
+            sa.Column('id', sa.String(), nullable=False),
+            sa.Column('key', sa.String(length=128), nullable=False),
+            sa.Column('family_id', sa.String(), nullable=True),
+            sa.Column('user_id', sa.String(), nullable=True),
+            sa.Column('action', sa.String(), nullable=False),
+            sa.Column('payload_hash', sa.String(length=64), nullable=True),
+            sa.Column('created_date', sa.DateTime(), nullable=True),
+            sa.ForeignKeyConstraint(['family_id'], ['families.id'], ),
+            sa.ForeignKeyConstraint(['user_id'], ['users.id'], ),
+            sa.PrimaryKeyConstraint('id')
+        )
+        op.create_index(op.f('ix_idempotency_records_id'), 'idempotency_records', ['id'], unique=False)
+        op.create_index(op.f('ix_idempotency_records_key'), 'idempotency_records', ['key'], unique=True)
+        op.create_index(op.f('ix_idempotency_records_family_id'), 'idempotency_records', ['family_id'], unique=False)
+        op.create_index(op.f('ix_idempotency_records_user_id'), 'idempotency_records', ['user_id'], unique=False)
 
     # 2. Create lesson_completions table
-    op.create_table(
-        'lesson_completions',
-        sa.Column('id', sa.String(), nullable=False),
-        sa.Column('child_id', sa.String(), nullable=False),
-        sa.Column('lesson_id', sa.String(), nullable=False),
-        sa.Column('xp_awarded', sa.Integer(), nullable=True),
-        sa.Column('created_date', sa.DateTime(), nullable=True),
-        sa.ForeignKeyConstraint(['child_id'], ['users.id'], ),
-        sa.PrimaryKeyConstraint('id'),
-        sa.UniqueConstraint('child_id', 'lesson_id', name='uq_child_lesson')
-    )
-    op.create_index(op.f('ix_lesson_completions_id'), 'lesson_completions', ['id'], unique=False)
-    op.create_index(op.f('ix_lesson_completions_child_id'), 'lesson_completions', ['child_id'], unique=False)
-    op.create_index(op.f('ix_lesson_completions_lesson_id'), 'lesson_completions', ['lesson_id'], unique=False)
+    if 'lesson_completions' not in existing_tables:
+        op.create_table(
+            'lesson_completions',
+            sa.Column('id', sa.String(), nullable=False),
+            sa.Column('child_id', sa.String(), nullable=False),
+            sa.Column('lesson_id', sa.String(), nullable=False),
+            sa.Column('xp_awarded', sa.Integer(), nullable=True),
+            sa.Column('created_date', sa.DateTime(), nullable=True),
+            sa.ForeignKeyConstraint(['child_id'], ['users.id'], ),
+            sa.PrimaryKeyConstraint('id'),
+            sa.UniqueConstraint('child_id', 'lesson_id', name='uq_child_lesson')
+        )
+        op.create_index(op.f('ix_lesson_completions_id'), 'lesson_completions', ['id'], unique=False)
+        op.create_index(op.f('ix_lesson_completions_child_id'), 'lesson_completions', ['child_id'], unique=False)
+        op.create_index(op.f('ix_lesson_completions_lesson_id'), 'lesson_completions', ['lesson_id'], unique=False)
 
     # 3. Upgrade financial columns from Float to Numeric(12, 2)
     # wallets

@@ -61,7 +61,7 @@ def read_root():
         "status": status_str,
         "service": "FinFamily API",
         "docs": None if is_production else "/docs",
-        "version": os.getenv("APP_VERSION", "1.0.6")
+        "version": os.getenv("APP_VERSION", "1.1.0")
     }
     return JSONResponse(
         status_code=200 if status_str == "healthy" else 503,
@@ -77,7 +77,7 @@ def get_app_version():
     min_version = os.getenv("MIN_SUPPORTED_VERSION", "1.0.0")
     download_url = os.getenv(
         "APP_DOWNLOAD_URL",
-        "https://github.com/Mahmoud-Hashim-pro/finfamily-mobile-app/releases/download/v1.1.0/FinFamily-v1.1.0.apk"
+        "https://github.com/Mahmoud-Hashim-pro/finfamily-mobile-app/releases/download/v1.0.0/app-release.apk"
     )
     is_mandatory = os.getenv("APP_IS_MANDATORY", "false").strip().lower() in ("true", "1", "yes")
     release_notes = os.getenv(

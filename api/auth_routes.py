@@ -38,6 +38,7 @@ from core.deps import get_current_user, require_parent
 from core.limiter import limiter
 from core.audit import log_action
 from core import mfa
+from core.google_auth import verify_google_id_token
 from services.email import (
     send_password_reset_email,
     send_password_changed_notification,
@@ -311,46 +312,45 @@ def login_parent(request: Request, payload: ParentLogin, db: Session = Depends(g
 @auth_compat_router.post("/google", response_model=TokenResponse)
 @limiter.limit("15/minute")
 def google_auth(request: Request, payload: GoogleLoginRequest, db: Session = Depends(get_db)):
-    target_email = payload.email
-    target_name = payload.full_name or payload.name
-    target_avatar = payload.avatar_url
-    target_family_name = payload.family_name
-
-    if payload.id_token:
-        try:
-            from jose import jwt as jose_jwt
-            decoded = jose_jwt.get_unverified_claims(payload.id_token)
-            if not target_email and decoded.get("email"):
-                target_email = decoded.get("email")
-            if not target_name:
-                target_name = decoded.get("name") or decoded.get("given_name")
-            if not target_avatar:
-                target_avatar = decoded.get("picture")
-        except Exception as ex:
-            logger.warning(f"Could not parse Google id_token: {ex}")
-
-    if not target_email:
+    if not payload.id_token or not payload.id_token.strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email is required for Google login",
+            detail="Google ID token is required for Google login",
         )
 
-    clean_email = str(target_email).strip().lower()
-    raw_name = (target_name or clean_email.split("@")[0].replace(".", " ")).strip()
-    full_name = target_name.strip() if target_name else (raw_name.title() if raw_name else "Parent")
+    try:
+        claims = verify_google_id_token(payload.id_token)
+    except ValueError as ex:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Google authentication failed: {str(ex)}",
+        )
+
+    # Identity strictly derived from verified token claims:
+    clean_email = claims["email"].strip().lower()
+    verified_name = claims.get("name")
+    verified_avatar = claims.get("picture")
+    target_family_name = payload.family_name
+
+    raw_name = (verified_name or clean_email.split("@")[0].replace(".", " ")).strip()
+    full_name = verified_name.strip() if verified_name else (raw_name.title() if raw_name else "Parent")
 
     # Look for existing user
     user = db.query(User).filter(func.lower(User.email) == clean_email).first()
     if user:
+        # P0 Security Check: Never reactivate disabled accounts upon Google sign in!
+        if hasattr(user, "is_active") and not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Account is deactivated. Contact administration to restore access.",
+            )
         if user.role != UserRole.parent:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only parent accounts can sign in via Google login",
             )
-        if target_avatar and not user.avatar_url:
-            user.avatar_url = target_avatar
-        if hasattr(user, "is_active") and not user.is_active:
-            user.is_active = True
+        if verified_avatar and not user.avatar_url:
+            user.avatar_url = verified_avatar
         if not user.wallet:
             wallet = Wallet(owner_id=user.id)
             db.add(wallet)
@@ -390,7 +390,7 @@ def google_auth(request: Request, payload: GoogleLoginRequest, db: Session = Dep
             role=UserRole.parent,
             full_name=full_name,
             email=clean_email,
-            avatar_url=target_avatar,
+            avatar_url=verified_avatar,
             is_active=True,
             token_version=1,
         )
@@ -413,6 +413,8 @@ def google_auth(request: Request, payload: GoogleLoginRequest, db: Session = Dep
         db.rollback()
         user = db.query(User).filter(func.lower(User.email) == clean_email).first()
         if user:
+            if hasattr(user, "is_active") and not user.is_active:
+                raise HTTPException(status_code=403, detail="Account is deactivated")
             token = create_access_token(
                 user_id=user.id,
                 family_id=user.family_id,

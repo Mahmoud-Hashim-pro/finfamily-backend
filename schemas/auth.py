@@ -82,20 +82,13 @@ class ParentLoginResult(BaseModel):
 
 
 class GoogleLoginRequest(BaseModel):
-    id_token: Optional[str] = None
+    id_token: str = Field(min_length=1, description="Cryptographically signed Google ID Token")
+    family_name: Optional[str] = Field(default=None, max_length=100)
+    # The fields below may be sent by client wrappers but are ignored by backend authentication
     email: Optional[EmailStr] = None
     name: Optional[str] = None
     full_name: Optional[str] = None
-    family_name: Optional[str] = None
     avatar_url: Optional[str] = None
-
-    @field_validator("email", mode="before")
-    @classmethod
-    def normalize_email(cls, v):
-        if isinstance(v, str):
-            clean = v.strip().lower()
-            return clean if clean else None
-        return v
 
 
 class GoogleAuthRequest(BaseModel):
