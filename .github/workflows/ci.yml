@@ -1,0 +1,37 @@
+name: Backend CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Pytest & Migration Suite
+        env:
+          ENVIRONMENT: test
+          DATABASE_URL: sqlite:///:memory:
+          JWT_SECRET: test-ci-secret-key-at-least-32-bytes!!
+          GOOGLE_CLIENT_ID: 100000000000-dummyclientidforci.apps.googleusercontent.com
+          APP_VERSION: 1.1.0
+          APP_BUILD_NUMBER: 8
+        run: |
+          pytest test_google_auth.py test_cross_family_isolation_and_google_auth.py test_family_isolation_policy.py test_financial_concurrency_and_security.py test_migrations_reconciliation.py test_subsystem1_auth_security.py test_subsystem2_admin_ops.py -v
