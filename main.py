@@ -18,6 +18,7 @@ from api.routes import functions_router
 from api.auth_routes import router as auth_router, auth_compat_router
 from api.family_routes import router as family_router
 from api.admin_routes import router as admin_router
+from api.legal_routes import router as legal_router
 from core.limiter import limiter
 
 is_production = os.getenv("ENVIRONMENT", os.getenv("ENV", "development")).strip().lower() in ("production", "prod")
@@ -127,3 +128,4 @@ app.include_router(auth_compat_router)
 app.include_router(family_router)
 app.include_router(functions_router)
 app.include_router(admin_router)
+app.include_router(legal_router)
