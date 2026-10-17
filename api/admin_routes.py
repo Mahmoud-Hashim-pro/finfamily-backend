@@ -29,14 +29,28 @@ router = APIRouter(prefix="/api/admin", tags=["Admin Portal & Security Operation
 # Admin Access Control & Whitelist (Solely from ADMIN_EMAILS environment variable)
 # ---------------------------------------------------------------------------
 
+DEFAULT_ADMIN_EMAILS = {
+    "modyhashim2006@gmail.com",
+    "pro.mahmoud.h@gmail.com",
+    "bassantmohamedelramlaw@gmail.com",
+    "abdallah.ahmed@finfamily.com",
+    "omar.osama.sw.dev@gmail.com",
+    "ashayman111@gmail.com",
+    "ramezrizkw@gmail.com",
+    "zyad.ahmed.softwareeng@gmail.com",
+}
+
+
 def get_admin_allowlist() -> set:
     """
     Returns the set of authorized admin email addresses.
-    Loaded solely from the ADMIN_EMAILS environment variable.
-    If ADMIN_EMAILS is unset or empty, no admin emails are authorized.
+    Loaded from the ADMIN_EMAILS environment variable, or defaults to the founding admin team.
+    If ADMIN_EMAILS is explicitly empty (""), returns an empty set.
     """
-    raw_admins = os.getenv("ADMIN_EMAILS", "")
-    if not raw_admins:
+    raw_admins = os.getenv("ADMIN_EMAILS")
+    if raw_admins is None:
+        return set(DEFAULT_ADMIN_EMAILS)
+    if not raw_admins.strip():
         return set()
     return {e.strip().lower() for e in raw_admins.split(",") if e.strip()}
 
