@@ -59,14 +59,24 @@ CRITICAL_SCHEMA_COLUMNS = {
 }
 
 
+CRITICAL_NUMERIC_COLUMNS = {
+    "wallets": {"balance", "savings_balance"},
+    "card_purchases": {"amount"},
+}
+
+
 def verify_database_readiness(target_engine, is_production_mode: bool) -> tuple[bool, str]:
     """
-    FF-34, FF-35 & G2: Verify database connectivity, table schema, critical columns, and Alembic version without mutating DDL.
+    FF-34, FF-35 & G2: Deep verification of database connectivity, schema tables, critical columns,
+    fixed-point numeric data types, primary keys, unique constraints, and Alembic revision without mutating DDL.
     Checks:
     1. Active ping connectivity via SELECT 1.
     2. Presence of all required domain tables.
     3. Presence of all critical columns per domain table.
-    4. If alembic_version is tracked, ensures the schema revision matches the expected head ('0002_idemp_mfa_atomic').
+    4. Validation of fixed-point NUMERIC/DECIMAL types for financial columns.
+    5. Presence of primary key constraints on all required domain tables.
+    6. Presence of unique constraints/indexes on critical unique identifiers (users.email, idempotency_records.key).
+    7. If alembic_version is tracked, ensures the schema revision matches the expected head ('0002_idemp_mfa_atomic').
     Returns (is_ready, detail_message).
     """
     from sqlalchemy import text, inspect
@@ -80,14 +90,46 @@ def verify_database_readiness(target_engine, is_production_mode: bool) -> tuple[
             if missing:
                 return False, f"Missing required database tables: {missing}"
 
-            # Verify critical columns for every required table
+            # 1. Verify critical columns and primary keys for every required table
             for tbl, expected_cols in CRITICAL_SCHEMA_COLUMNS.items():
                 if tbl in tables:
-                    actual_cols = {col["name"] for col in inspector.get_columns(tbl)}
+                    columns_info = inspector.get_columns(tbl)
+                    actual_cols = {col["name"] for col in columns_info}
                     missing_cols = expected_cols - actual_cols
                     if missing_cols:
                         return False, f"Table '{tbl}' is missing critical columns: {missing_cols}"
 
+                    # Primary key constraint verification
+                    pk = inspector.get_pk_constraint(tbl)
+                    if not pk or not pk.get("constrained_columns"):
+                        return False, f"Table '{tbl}' is missing a primary key constraint."
+
+            # 2. Verify fixed-point numeric types for financial columns
+            for tbl, num_cols in CRITICAL_NUMERIC_COLUMNS.items():
+                if tbl in tables:
+                    col_types = {c["name"]: str(c["type"]).upper() for c in inspector.get_columns(tbl)}
+                    for col_name in num_cols:
+                        c_type = col_types.get(col_name, "")
+                        if not any(t in c_type for t in ("NUMERIC", "DECIMAL")):
+                            return False, f"Financial column '{tbl}.{col_name}' has non-numeric type '{c_type}', expected NUMERIC/DECIMAL."
+
+            # 3. Verify unique constraints / unique indices on critical keys
+            def check_unique(tbl_name: str, col_name: str) -> bool:
+                for idx in inspector.get_indexes(tbl_name):
+                    if idx.get("unique") and col_name in idx.get("column_names", []):
+                        return True
+                for uq in inspector.get_unique_constraints(tbl_name):
+                    if col_name in uq.get("column_names", []):
+                        return True
+                return False
+
+            if "idempotency_records" in tables and not check_unique("idempotency_records", "key"):
+                return False, "Table 'idempotency_records' is missing a unique constraint on column 'key'."
+
+            if "users" in tables and not check_unique("users", "email"):
+                return False, "Table 'users' is missing a unique constraint on column 'email'."
+
+            # 4. Verify Alembic schema migration tracking
             if "alembic_version" in tables:
                 row = conn.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).fetchone()
                 if not row or not row[0]:
@@ -99,7 +141,7 @@ def verify_database_readiness(target_engine, is_production_mode: bool) -> tuple[
             elif is_production_mode:
                 return False, "Production database is missing 'alembic_version' migration tracking table."
 
-        return True, "Database connectivity, critical columns, and schema readiness verified."
+        return True, "Database connectivity, critical columns, data types, constraints, and schema readiness verified."
     except Exception as e:
         return False, f"Database readiness check failed: {e}"
 
@@ -211,7 +253,7 @@ def get_app_version():
         "APP_RELEASE_NOTES",
         f"إصدار رسمي v{version} (Build {build_num}): تحسينات أمان شاملة، توثيق صارم لمسارات حذف الحساب، ترقيات ذرية لرموز MFA لمنع هجمات Replay، وحماية من تكرار المعاملات المالية."
     )
-    file_hash = os.getenv("APP_SHA256", "ff3bbf46428bd298de8a7012514a307127c9aeb3761bf9814d4e9d2255dad77b")
+    file_hash = os.getenv("APP_SHA256", "21408d8dcde46b0a372b0b974324e990cf252815aa6716d572168ebaf288187c")
 
     return {
         "version": version,

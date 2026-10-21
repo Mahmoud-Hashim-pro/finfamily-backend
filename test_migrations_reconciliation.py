@@ -542,3 +542,34 @@ def test_migration_postgresql_full_schema_and_numeric_parity():
 
     engine.dispose()
 
+
+
+def test_migration_0002_fails_closed_when_prerequisite_tables_missing():
+    """Verify that Alembic migration 0002 fails closed with a clear error when required tables are missing."""
+    fd, temp_db = tempfile.mkstemp(suffix="_failclosed.db")
+    os.close(fd)
+    db_url = f"sqlite:///{temp_db}"
+
+    try:
+        engine = sa.create_engine(db_url)
+        with engine.begin() as conn:
+            conn.execute(sa.text("CREATE TABLE alembic_version (version_num VARCHAR(32) PRIMARY KEY)"))
+            conn.execute(sa.text("INSERT INTO alembic_version VALUES ('0001_numeric_and_isolation')"))
+            conn.execute(sa.text("CREATE TABLE families (id VARCHAR PRIMARY KEY, name VARCHAR)"))
+            conn.execute(sa.text("CREATE TABLE wallets (id VARCHAR PRIMARY KEY, balance NUMERIC)"))
+        engine.dispose()
+
+        cfg = get_alembic_config(db_url)
+        with pytest.raises(Exception) as excinfo:
+            command.upgrade(cfg, "head")
+
+        err_msg = str(excinfo.value)
+        assert "0002_idemp_mfa_atomic aborted" in err_msg or "Required prerequisite table" in err_msg
+    finally:
+        import gc
+        gc.collect()
+        try:
+            if os.path.exists(temp_db):
+                os.remove(temp_db)
+        except OSError:
+            pass

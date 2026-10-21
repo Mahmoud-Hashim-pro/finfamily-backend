@@ -1079,7 +1079,7 @@ def test_app_version_sha256_matches_released_apk(monkeypatch):
     data = res.json()
     assert data["version"] == "1.1.4"
     assert data["build_number"] == 12
-    assert data["sha256"] == "ff3bbf46428bd298de8a7012514a307127c9aeb3761bf9814d4e9d2255dad77b"
+    assert data["sha256"] == "21408d8dcde46b0a372b0b974324e990cf252815aa6716d572168ebaf288187c"
 
 
 def test_verify_database_readiness_detects_missing_critical_columns():
@@ -1095,6 +1095,8 @@ def test_verify_database_readiness_detects_missing_critical_columns():
         conn.execute(text("CREATE TABLE wallets (id TEXT PRIMARY KEY, owner_id TEXT, balance NUMERIC, savings_balance NUMERIC, monthly_limit NUMERIC, card_status TEXT)"))
         conn.execute(text("CREATE TABLE card_purchases (id TEXT PRIMARY KEY, child_id TEXT, family_id TEXT, amount NUMERIC, status TEXT, idempotency_key TEXT)"))
         conn.execute(text("CREATE TABLE idempotency_records (id TEXT PRIMARY KEY, key TEXT, response_id TEXT, action TEXT)"))
+        conn.execute(text("CREATE UNIQUE INDEX ix_idemp_key ON idempotency_records (key)"))
+        conn.execute(text("CREATE UNIQUE INDEX ix_user_email ON users (email)"))
         conn.execute(text("CREATE TABLE lesson_completions (id TEXT PRIMARY KEY, child_id TEXT, lesson_id TEXT)"))
         conn.execute(text("CREATE TABLE game_completions (id TEXT PRIMARY KEY, child_id TEXT, game_id TEXT, was_rewarded BOOLEAN)"))
         conn.execute(text("CREATE TABLE mfa_recovery_codes (id TEXT PRIMARY KEY, user_id TEXT, code_hash TEXT, used BOOLEAN)"))
@@ -1104,6 +1106,81 @@ def test_verify_database_readiness_detects_missing_critical_columns():
     assert is_ready is False
     assert "missing critical columns" in msg.lower()
     assert "last_totp_timestep" in msg
+
+
+def test_verify_database_readiness_detects_non_numeric_financial_types():
+    """G2 & Area 2: Database readiness verifies fixed-point Numeric types on financial columns."""
+    from main import verify_database_readiness
+    from sqlalchemy import create_engine, text
+
+    test_engine = create_engine("sqlite:///:memory:")
+    with test_engine.connect() as conn:
+        conn.execute(text("CREATE TABLE users (id TEXT PRIMARY KEY, family_id TEXT, role TEXT, email TEXT, token_version INT, is_active BOOLEAN, mfa_enabled BOOLEAN, last_totp_timestep INT)"))
+        conn.execute(text("CREATE TABLE families (id TEXT PRIMARY KEY, name TEXT, family_code TEXT)"))
+        # Insecure FLOAT balance type instead of NUMERIC
+        conn.execute(text("CREATE TABLE wallets (id TEXT PRIMARY KEY, owner_id TEXT, balance FLOAT, savings_balance NUMERIC, monthly_limit NUMERIC, card_status TEXT)"))
+        conn.execute(text("CREATE TABLE card_purchases (id TEXT PRIMARY KEY, child_id TEXT, family_id TEXT, amount NUMERIC, status TEXT, idempotency_key TEXT)"))
+        conn.execute(text("CREATE TABLE idempotency_records (id TEXT PRIMARY KEY, key TEXT, response_id TEXT, action TEXT)"))
+        conn.execute(text("CREATE UNIQUE INDEX ix_idemp_key ON idempotency_records (key)"))
+        conn.execute(text("CREATE UNIQUE INDEX ix_user_email ON users (email)"))
+        conn.execute(text("CREATE TABLE lesson_completions (id TEXT PRIMARY KEY, child_id TEXT, lesson_id TEXT)"))
+        conn.execute(text("CREATE TABLE game_completions (id TEXT PRIMARY KEY, child_id TEXT, game_id TEXT, was_rewarded BOOLEAN)"))
+        conn.execute(text("CREATE TABLE mfa_recovery_codes (id TEXT PRIMARY KEY, user_id TEXT, code_hash TEXT, used BOOLEAN)"))
+        conn.commit()
+
+    is_ready, msg = verify_database_readiness(test_engine, is_production_mode=False)
+    assert is_ready is False
+    assert "non-numeric type" in msg.lower()
+    assert "wallets.balance" in msg
+
+
+def test_verify_database_readiness_detects_missing_unique_constraints():
+    """G2 & Area 2: Database readiness verifies unique constraints on critical unique identifiers."""
+    from main import verify_database_readiness
+    from sqlalchemy import create_engine, text
+
+    test_engine = create_engine("sqlite:///:memory:")
+    with test_engine.connect() as conn:
+        conn.execute(text("CREATE TABLE users (id TEXT PRIMARY KEY, family_id TEXT, role TEXT, email TEXT, token_version INT, is_active BOOLEAN, mfa_enabled BOOLEAN, last_totp_timestep INT)"))
+        conn.execute(text("CREATE TABLE families (id TEXT PRIMARY KEY, name TEXT, family_code TEXT)"))
+        conn.execute(text("CREATE TABLE wallets (id TEXT PRIMARY KEY, owner_id TEXT, balance NUMERIC, savings_balance NUMERIC, monthly_limit NUMERIC, card_status TEXT)"))
+        conn.execute(text("CREATE TABLE card_purchases (id TEXT PRIMARY KEY, child_id TEXT, family_id TEXT, amount NUMERIC, status TEXT, idempotency_key TEXT)"))
+        # Missing unique index on idempotency_records.key
+        conn.execute(text("CREATE TABLE idempotency_records (id TEXT PRIMARY KEY, key TEXT, response_id TEXT, action TEXT)"))
+        conn.execute(text("CREATE UNIQUE INDEX ix_user_email ON users (email)"))
+        conn.execute(text("CREATE TABLE lesson_completions (id TEXT PRIMARY KEY, child_id TEXT, lesson_id TEXT)"))
+        conn.execute(text("CREATE TABLE game_completions (id TEXT PRIMARY KEY, child_id TEXT, game_id TEXT, was_rewarded BOOLEAN)"))
+        conn.execute(text("CREATE TABLE mfa_recovery_codes (id TEXT PRIMARY KEY, user_id TEXT, code_hash TEXT, used BOOLEAN)"))
+        conn.commit()
+
+    is_ready, msg = verify_database_readiness(test_engine, is_production_mode=False)
+    assert is_ready is False
+    assert "missing a unique constraint on column 'key'" in msg
+
+
+def test_verify_database_readiness_detects_missing_primary_keys():
+    """G2 & Area 2: Database readiness verifies primary keys exist on all required domain tables."""
+    from main import verify_database_readiness
+    from sqlalchemy import create_engine, text
+
+    test_engine = create_engine("sqlite:///:memory:")
+    with test_engine.connect() as conn:
+        conn.execute(text("CREATE TABLE users (id TEXT PRIMARY KEY, family_id TEXT, role TEXT, email TEXT, token_version INT, is_active BOOLEAN, mfa_enabled BOOLEAN, last_totp_timestep INT)"))
+        conn.execute(text("CREATE TABLE families (id TEXT PRIMARY KEY, name TEXT, family_code TEXT)"))
+        # Missing PRIMARY KEY on wallets
+        conn.execute(text("CREATE TABLE wallets (id TEXT, owner_id TEXT, balance NUMERIC, savings_balance NUMERIC, monthly_limit NUMERIC, card_status TEXT)"))
+        conn.execute(text("CREATE TABLE card_purchases (id TEXT PRIMARY KEY, child_id TEXT, family_id TEXT, amount NUMERIC, status TEXT, idempotency_key TEXT)"))
+        conn.execute(text("CREATE TABLE idempotency_records (id TEXT PRIMARY KEY, key TEXT, response_id TEXT, action TEXT)"))
+        conn.execute(text("CREATE UNIQUE INDEX ix_idemp_key ON idempotency_records (key)"))
+        conn.execute(text("CREATE UNIQUE INDEX ix_user_email ON users (email)"))
+        conn.execute(text("CREATE TABLE lesson_completions (id TEXT PRIMARY KEY, child_id TEXT, lesson_id TEXT)"))
+        conn.execute(text("CREATE TABLE game_completions (id TEXT PRIMARY KEY, child_id TEXT, game_id TEXT, was_rewarded BOOLEAN)"))
+        conn.execute(text("CREATE TABLE mfa_recovery_codes (id TEXT PRIMARY KEY, user_id TEXT, code_hash TEXT, used BOOLEAN)"))
+        conn.commit()
+
+    is_ready, msg = verify_database_readiness(test_engine, is_production_mode=False)
+    assert is_ready is False
+    assert "missing a primary key constraint" in msg
 
 
 @pytest.mark.anyio
@@ -1162,18 +1239,48 @@ async def test_ai_asgi_middleware_stream_capping():
 def test_sha256_checksum_verified_against_physical_release_artifact():
     """Area 4: Mathematical verification that backend APP_SHA256 equals the SHA-256 of the physical released APK."""
     import hashlib
-    apk_path = r"C:\Users\Tie\.gemini\antigravity\scratch\apk_check_v114\FinFamily-App\app-release.apk"
-    if os.path.exists(apk_path):
-        hasher = hashlib.sha256()
-        with open(apk_path, "rb") as f:
-            while chunk := f.read(65536):
-                hasher.update(chunk)
-        physical_apk_sha256 = hasher.hexdigest().lower()
-        assert physical_apk_sha256 == "ff3bbf46428bd298de8a7012514a307127c9aeb3761bf9814d4e9d2255dad77b"
+    import urllib.request
 
-        res = client.get("/api/app/version")
-        assert res.status_code == 200
-        assert res.json()["sha256"] == physical_apk_sha256
+    # Check for release artifact locally or download from GitHub release asset
+    apk_candidates = [
+        os.getenv("RELEASE_APK_PATH", ""),
+        os.path.join(os.getcwd(), "release_artifacts", "app-release.apk"),
+        r"C:\Users\Tie\.gemini\antigravity\scratch\apk_check_v114\FinFamily-App\app-release.apk",
+    ]
+    apk_path = None
+    for cand in apk_candidates:
+        if cand and os.path.exists(cand):
+            apk_path = cand
+            break
+
+    if not apk_path:
+        # Download from official GitHub release
+        os.makedirs("release_artifacts", exist_ok=True)
+        target = os.path.join("release_artifacts", "app-release.apk")
+        url = "https://github.com/Mahmoud-Hashim-pro/finfamily-mobile-app/releases/download/v1.1.4/app-release.apk"
+        try:
+            urllib.request.urlretrieve(url, target)
+            apk_path = target
+        except Exception as e:
+            pytest.fail(f"Required release APK could not be located or downloaded from {url}: {e}")
+
+    assert os.path.exists(apk_path), f"Release APK artifact must exist at {apk_path}"
+
+    hasher = hashlib.sha256()
+    with open(apk_path, "rb") as f:
+        while chunk := f.read(65536):
+            hasher.update(chunk)
+    physical_apk_sha256 = hasher.hexdigest().lower()
+
+    # The actual published v1.1.4 release APK hash
+    EXPECTED_RELEASE_SHA256 = "21408d8dcde46b0a372b0b974324e990cf252815aa6716d572168ebaf288187c"
+    assert physical_apk_sha256 == EXPECTED_RELEASE_SHA256, (
+        f"Physical APK hash '{physical_apk_sha256}' does not match expected release digest '{EXPECTED_RELEASE_SHA256}'"
+    )
+
+    res = client.get("/api/app/version")
+    assert res.status_code == 200
+    assert res.json()["sha256"] == physical_apk_sha256
 
 
 
