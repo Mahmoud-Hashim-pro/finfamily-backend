@@ -1241,6 +1241,13 @@ def test_sha256_checksum_verified_against_physical_release_artifact():
     import hashlib
     import urllib.request
 
+    # Dynamic release artifact parameters
+    expected_release_sha256 = (
+        os.getenv("EXPECTED_RELEASE_SHA256")
+        or os.getenv("APP_SHA256")
+        or "21408d8dcde46b0a372b0b974324e990cf252815aa6716d572168ebaf288187c"
+    ).strip().lower()
+
     # Check for release artifact locally or download from GitHub release asset
     apk_candidates = [
         os.getenv("RELEASE_APK_PATH", ""),
@@ -1257,7 +1264,7 @@ def test_sha256_checksum_verified_against_physical_release_artifact():
         # Download from official GitHub release
         os.makedirs("release_artifacts", exist_ok=True)
         target = os.path.join("release_artifacts", "app-release.apk")
-        url = "https://github.com/Mahmoud-Hashim-pro/finfamily-mobile-app/releases/download/v1.1.4/app-release.apk"
+        url = os.getenv("RELEASE_APK_URL") or "https://github.com/Mahmoud-Hashim-pro/finfamily-mobile-app/releases/download/v1.1.4/app-release.apk"
         try:
             urllib.request.urlretrieve(url, target)
             apk_path = target
@@ -1272,15 +1279,39 @@ def test_sha256_checksum_verified_against_physical_release_artifact():
             hasher.update(chunk)
     physical_apk_sha256 = hasher.hexdigest().lower()
 
-    # The actual published v1.1.4 release APK hash
-    EXPECTED_RELEASE_SHA256 = "21408d8dcde46b0a372b0b974324e990cf252815aa6716d572168ebaf288187c"
-    assert physical_apk_sha256 == EXPECTED_RELEASE_SHA256, (
-        f"Physical APK hash '{physical_apk_sha256}' does not match expected release digest '{EXPECTED_RELEASE_SHA256}'"
+    assert physical_apk_sha256 == expected_release_sha256, (
+        f"Physical APK hash '{physical_apk_sha256}' does not match expected release digest '{expected_release_sha256}'"
     )
 
     res = client.get("/api/app/version")
     assert res.status_code == 200
     assert res.json()["sha256"] == physical_apk_sha256
+
+
+def test_verify_database_readiness_rejects_composite_only_unique_index():
+    """Area 2: verify_database_readiness strictly rejects composite-only unique index on critical columns."""
+    from main import verify_database_readiness
+    from sqlalchemy import create_engine, text
+
+    test_engine = create_engine("sqlite:///:memory:")
+    with test_engine.connect() as conn:
+        # Create users with composite unique index (email, role) instead of single-column index on email
+        conn.execute(text("CREATE TABLE users (id TEXT PRIMARY KEY, family_id TEXT, role TEXT, email TEXT, token_version INT, is_active BOOLEAN, mfa_enabled BOOLEAN, last_totp_timestep INT)"))
+        conn.execute(text("CREATE TABLE families (id TEXT PRIMARY KEY, name TEXT, family_code TEXT)"))
+        conn.execute(text("CREATE TABLE wallets (id TEXT PRIMARY KEY, owner_id TEXT, balance NUMERIC, savings_balance NUMERIC, monthly_limit NUMERIC, card_status TEXT)"))
+        conn.execute(text("CREATE TABLE card_purchases (id TEXT PRIMARY KEY, child_id TEXT, family_id TEXT, amount NUMERIC, status TEXT, idempotency_key TEXT)"))
+        conn.execute(text("CREATE TABLE idempotency_records (id TEXT PRIMARY KEY, key TEXT, response_id TEXT, action TEXT)"))
+        conn.execute(text("CREATE UNIQUE INDEX ix_idemp_key ON idempotency_records (key)"))
+        conn.execute(text("CREATE UNIQUE INDEX ix_user_email_role_composite ON users (email, role)"))
+        conn.execute(text("CREATE TABLE lesson_completions (id TEXT PRIMARY KEY, child_id TEXT, lesson_id TEXT)"))
+        conn.execute(text("CREATE TABLE game_completions (id TEXT PRIMARY KEY, child_id TEXT, game_id TEXT, was_rewarded BOOLEAN)"))
+        conn.execute(text("CREATE TABLE mfa_recovery_codes (id TEXT PRIMARY KEY, user_id TEXT, code_hash TEXT, used BOOLEAN)"))
+        conn.commit()
+
+    is_ready, msg = verify_database_readiness(test_engine, is_production_mode=False)
+    assert is_ready is False
+    assert "Table 'users' is missing a unique constraint on column 'email'." in msg
+
 
 
 

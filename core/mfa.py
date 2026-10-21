@@ -104,10 +104,10 @@ def verify_totp(secret: str, code: str, user_id: Optional[str] = None, db: Optio
     if not plain_secret:
         return False
 
-    # In production, require db session for durable cross-instance replay protection if user_id is provided
-    if is_production() and user_id and db is None:
+    # In production, require user_id and db session for durable cross-instance replay protection
+    if is_production() and (not user_id or db is None):
         import logging
-        logging.getLogger("mfa").error("Rejecting TOTP verification in production: db session required for replay protection")
+        logging.getLogger("mfa").error("Rejecting TOTP verification in production: user_id and db session required for replay protection")
         return False
 
     totp = pyotp.totp.TOTP(plain_secret)

@@ -125,6 +125,25 @@ def setup_test_data():
         db.close()
 
 
+def get_admin_auth_token(email="admin@finfamily.com", password="AdminPass123!", secret=None):
+    """Helper to authenticate and complete mandatory MFA to obtain a valid admin session."""
+    res = client.post("/api/admin/auth/login", json={"email": email, "password": password})
+    assert res.status_code == 200, f"Admin login failed: {res.text}"
+    data = res.json()
+    if not data.get("mfa_required"):
+        return data["access_token"]
+    temp_token = data["access_token"]
+    import pyotp
+    if data.get("mfa_enrollment_required"):
+        totp_secret = data["secret"]
+    else:
+        totp_secret = secret or "JBSWY3DPEHPK3PXP"
+    code = pyotp.TOTP(totp_secret).now()
+    v_res = client.post("/api/admin/auth/mfa/verify", json={"temp_token": temp_token, "code": code})
+    assert v_res.status_code == 200, f"Admin MFA verify failed: {v_res.text}"
+    return v_res.json()["access_token"]
+
+
 def test_admin_allowlist_solely_from_env():
     """BUG-008: Verify admin allowlist is solely driven by ADMIN_EMAILS without hardcoded fallbacks."""
     # Test 1: Configured allowlist
@@ -146,7 +165,7 @@ def test_admin_allowlist_solely_from_env():
 
 
 def test_admin_login_auth_and_no_enumeration():
-    """BUG-003, BUG-126: Verify rate limiting, MFA, and generic 401 without allowlist enumeration."""
+    """BUG-003, BUG-126: Verify rate limiting, mandatory MFA enrollment, and generic 401 without allowlist enumeration."""
     from core.limiter import limiter
     app.state.limiter.enabled = True
     limiter.enabled = True
@@ -170,17 +189,35 @@ def test_admin_login_auth_and_no_enumeration():
     assert res.status_code == 401, f"Expected 401, got {res.status_code}: {res.text}"
     assert res.json()["detail"] == "Invalid admin credentials."
 
-    # Case C: Valid allowlisted email with correct password -> 200 + token
+    # Case C: Un-enrolled admin (mfa_enabled=False) -> MUST require mandatory MFA enrollment
     res = client.post("/api/admin/auth/login", json={
         "email": "admin@finfamily.com",
         "password": "AdminPass123!"
     })
     assert res.status_code == 200, f"Login failed: {res.text}"
     token_data = res.json()
+    assert token_data.get("mfa_required") is True
+    assert token_data.get("mfa_enrollment_required") is True
     assert "access_token" in token_data
-    assert token_data["admin"]["role"] == "admin"
+    assert "secret" in token_data
+    assert "provisioning_uri" in token_data
+    # A password alone can NEVER grant full administrative access
+    assert "admin" not in token_data
 
-    # Case D: Admin with MFA enabled -> returns mfa_required challenge
+    # Complete mandatory enrollment via admin MFA verify endpoint
+    import pyotp
+    code = pyotp.TOTP(token_data["secret"]).now()
+    verify_res = client.post("/api/admin/auth/mfa/verify", json={
+        "temp_token": token_data["access_token"],
+        "code": code,
+    })
+    assert verify_res.status_code == 200
+    verify_data = verify_res.json()
+    assert "access_token" in verify_data
+    assert verify_data["admin"]["role"] == "admin"
+    assert "recovery_codes" in verify_data
+
+    # Case D: Admin with MFA already enabled -> returns regular mfa_required challenge
     res = client.post("/api/admin/auth/login", json={
         "email": "supervisor@finfamily.com",
         "password": "SupervisorPass123!"
@@ -188,7 +225,9 @@ def test_admin_login_auth_and_no_enumeration():
     assert res.status_code == 200, f"MFA login check failed: {res.text}"
     mfa_resp = res.json()
     assert mfa_resp.get("mfa_required") is True
+    assert mfa_resp.get("mfa_enrollment_required") is False
     assert "access_token" in mfa_resp
+    assert "admin" not in mfa_resp
 
     # Case E: 5th attempt in same minute
     res5 = client.post("/api/admin/auth/login", json={
@@ -207,19 +246,15 @@ def test_admin_login_auth_and_no_enumeration():
     # Reset limiter for subsequent test methods
     from core.limiter import limiter
     limiter._storage.reset()
-    print("PASS: BUG-003 & BUG-126 - Admin login enforces auth, MFA challenge, 5/min rate limit, and returns generic 401.")
+    print("PASS: BUG-003 & BUG-126 - Admin login enforces auth, mandatory MFA enrollment, 5/min rate limit, and returns generic 401.")
 
 
 def test_admin_card_status_audit_attribution():
     """BUG-128: Admin card status override must attribute family_id so it appears in family audit logs."""
     data = setup_test_data()
 
-    # Get admin token
-    res = client.post("/api/admin/auth/login", json={
-        "email": "admin@finfamily.com",
-        "password": "AdminPass123!"
-    })
-    token = res.json()["access_token"]
+    # Get admin token via mandatory MFA helper
+    token = get_admin_auth_token()
     headers = {"Authorization": f"Bearer {token}"}
 
     # Override card status to frozen
@@ -249,11 +284,7 @@ def test_admin_card_status_audit_attribution():
 def test_filter_validation_on_transactions_and_cards():
     """BUG-130: Invalid filters return HTTP 400 instead of silently returning all rows."""
     data = setup_test_data()
-    res = client.post("/api/admin/auth/login", json={
-        "email": "admin@finfamily.com",
-        "password": "AdminPass123!"
-    })
-    token = res.json()["access_token"]
+    token = get_admin_auth_token()
     headers = {"Authorization": f"Bearer {token}"}
 
     # Invalid transactions status filter -> 400
@@ -277,11 +308,7 @@ def test_filter_validation_on_transactions_and_cards():
 def test_database_health_check_sanitization():
     """BUG-034: Database health check returns sanitized JSON without raw tracebacks."""
     data = setup_test_data()
-    res = client.post("/api/admin/auth/login", json={
-        "email": "admin@finfamily.com",
-        "password": "AdminPass123!"
-    })
-    token = res.json()["access_token"]
+    token = get_admin_auth_token()
     headers = {"Authorization": f"Bearer {token}"}
 
     # Test /api/admin/health/db

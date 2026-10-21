@@ -64,7 +64,17 @@ def run_tests():
     # 8. Admin Login
     admin_res = client.post("/api/admin/auth/login", json=login_payload)
     assert admin_res.status_code == 200, f"Admin login failed: {admin_res.text}"
-    admin_token = admin_res.json()["access_token"]
+    admin_data = admin_res.json()
+    if admin_data.get("mfa_required"):
+        temp_token = admin_data["access_token"]
+        import pyotp
+        secret = admin_data.get("secret") or "JBSWY3DPEHPK3PXP"
+        code = pyotp.TOTP(secret).now()
+        v_res = client.post("/api/admin/auth/mfa/verify", json={"temp_token": temp_token, "code": code})
+        assert v_res.status_code == 200, f"Admin MFA verify failed: {v_res.text}"
+        admin_token = v_res.json()["access_token"]
+    else:
+        admin_token = admin_data["access_token"]
     print("✅ 8. POST /api/admin/auth/login: 200 OK -> Admin token granted!")
     admin_headers = {"Authorization": f"Bearer {admin_token}"}
 

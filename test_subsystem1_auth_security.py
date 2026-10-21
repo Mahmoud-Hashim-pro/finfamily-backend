@@ -399,13 +399,15 @@ def test_bug_116_and_117_mfa_disable_requires_second_factor_and_replay_check():
     recovery_codes = res.json()["codes"]
 
     # BUG-117: TOTP Replay check
-    # Attempting to use the exact same code on login or verify should fail replay check
+    # Attempting to re-use the exact same code used to enable MFA must fail replay check immediately
     db = get_fresh_db()
     user = db.query(User).filter(User.email == email).first()
-    # First verification
-    assert mfa.verify_totp(user.mfa_secret, code, user_id=user.id) is True
-    # Replay of exact same timestep code
     assert mfa.verify_totp(user.mfa_secret, code, user_id=user.id) is False
+
+    # Standalone verification proves first-use succeeds and second-use fails
+    isolated_user_id = str(uuid.uuid4())
+    assert mfa.verify_totp(user.mfa_secret, code, user_id=isolated_user_id) is True
+    assert mfa.verify_totp(user.mfa_secret, code, user_id=isolated_user_id) is False
 
     # BUG-116: Disable MFA without second factor must fail
     res = client.post("/api/auth/mfa/disable", headers=headers, json={"password": "Password123!"})

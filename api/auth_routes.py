@@ -1245,7 +1245,7 @@ def mfa_enable(
         raise HTTPException(status_code=400, detail="No MFA setup in progress. Call /mfa/setup first.")
 
     plain_secret = mfa.decrypt_mfa_secret(parent.mfa_pending_secret)
-    if not mfa.verify_totp(plain_secret, payload.code):
+    if not mfa.verify_totp(plain_secret, payload.code, user_id=parent.id, db=db):
         raise HTTPException(status_code=400, detail="Invalid code. Please try again.")
 
     parent.mfa_secret = parent.mfa_pending_secret
@@ -1388,7 +1388,12 @@ def verify_mfa_login(request: Request, payload: MfaVerifyRequest, db: Session = 
         is_admin_flag = False
 
     plain_secret = mfa.decrypt_mfa_secret(user.mfa_secret)
-    if not plain_secret or not mfa.verify_totp(plain_secret, payload.code, user_id=user.id, db=db):
+    totp_ok = bool(plain_secret and mfa.verify_totp(plain_secret, payload.code, user_id=user.id, db=db))
+    recovery_ok = False
+    if not totp_ok:
+        recovery_ok = mfa.verify_and_consume_recovery_code(db, user.id, payload.code)
+
+    if not totp_ok and not recovery_ok:
         log_action(
             db, request=request, action="mfa_failed",
             actor_id=user.id, actor_role=issued_role, family_id=user.family_id,

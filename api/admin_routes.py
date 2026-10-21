@@ -137,7 +137,8 @@ def admin_login(request: Request, payload: AdminLoginRequest, db: Session = Depe
             detail="Invalid admin credentials."
         )
 
-    # Enforce MFA challenge if admin account has MFA enabled (FF-06: bind target_role="admin")
+    from core import mfa
+    # Enforce mandatory MFA for all admin accounts
     if user.mfa_enabled:
         temp_token = create_access_token(
             data={
@@ -151,41 +152,46 @@ def admin_login(request: Request, payload: AdminLoginRequest, db: Session = Depe
         )
         return {
             "mfa_required": True,
+            "mfa_enrollment_required": False,
             "access_token": temp_token,
             "token_type": "bearer",
             "message": "MFA verification required."
         }
 
-    # Issue full admin access token (valid for 24 hours) with token version
-    token_version = getattr(user, "token_version", 1)
-    token = create_access_token(
-        data={"sub": user.id, "role": "admin", "email": clean_email, "token_version": token_version},
-        expires_delta=timedelta(hours=24)
-    )
+    # If MFA is not yet configured for this admin, enforce mandatory enrollment.
+    # A password alone can NEVER grant administrative privileges.
+    if not user.mfa_pending_secret:
+        plain_secret = mfa.generate_secret()
+        user.mfa_pending_secret = mfa.encrypt_mfa_secret(plain_secret)
+        db.commit()
+    else:
+        plain_secret = mfa.decrypt_mfa_secret(user.mfa_pending_secret)
+        if not plain_secret:
+            plain_secret = mfa.generate_secret()
+            user.mfa_pending_secret = mfa.encrypt_mfa_secret(plain_secret)
+            db.commit()
 
-    # Audit log entry for administrative sign-in
-    audit = AuditLog(
-        family_id=user.family_id,
-        actor_id=user.id,
-        actor_role="admin",
-        action="admin_login_success",
-        target_type="admin_console",
-        target_id=user.id,
-        ip_address=client_ip,
-        detail={"email": clean_email, "timestamp": datetime.utcnow().isoformat()}
+    uri = mfa.provisioning_uri(user.mfa_pending_secret, clean_email)
+    qr_data = mfa.generate_qr_data_uri(uri)
+    temp_token = create_access_token(
+        data={
+            "sub": user.id,
+            "role": "mfa_pending",
+            "target_role": "admin",
+            "email": clean_email,
+            "type": "admin_mfa_enrollment",
+        },
+        expires_delta=timedelta(minutes=10)
     )
-    db.add(audit)
-    db.commit()
-
     return {
-        "access_token": token,
+        "mfa_required": True,
+        "mfa_enrollment_required": True,
+        "access_token": temp_token,
         "token_type": "bearer",
-        "admin": {
-            "id": user.id,
-            "full_name": user.full_name,
-            "email": user.email,
-            "role": "admin"
-        }
+        "secret": plain_secret,
+        "provisioning_uri": uri,
+        "qr_code": qr_data,
+        "message": "Mandatory admin MFA enrollment required before administrative access is granted."
     }
 
 
@@ -203,7 +209,7 @@ def verify_admin_mfa(
     payload: AdminMfaVerifyRequest,
     db: Session = Depends(get_db),
 ):
-    """FF-06: Authoritative MFA verification for admin portal sign-in."""
+    """FF-06: Authoritative MFA verification and mandatory enrollment for admin portal sign-in."""
     raw_token = payload.temp_token or payload.challenge_token
     raw_code = payload.code or payload.totp_code
     if not raw_token or not raw_code:
@@ -217,34 +223,72 @@ def verify_admin_mfa(
     user_id = data.get("sub")
     role = data.get("role")
     target_role = data.get("target_role")
+    token_type = data.get("type")
     if not user_id or role != "mfa_pending" or target_role != "admin":
         raise HTTPException(status_code=401, detail="Invalid admin MFA challenge token")
 
     user = db.query(User).filter(User.id == user_id).first()
-    if not user or not user.mfa_enabled:
-        raise HTTPException(status_code=401, detail="Admin user not found or MFA not enabled")
+    if not user:
+        raise HTTPException(status_code=401, detail="Admin user not found")
 
     allowlist = get_admin_allowlist()
     if not user.email or user.email.lower() not in allowlist:
         raise HTTPException(status_code=403, detail="Access denied: Admin privileges required")
 
     from core import mfa
-    plain_secret = mfa.decrypt_mfa_secret(user.mfa_secret)
-    if not plain_secret or not mfa.verify_totp(plain_secret, raw_code, user_id=user.id, db=db):
-        client_ip = _client_ip(request)
-        audit = AuditLog(
-            family_id=user.family_id,
-            actor_id=user.id,
-            actor_role="admin",
-            action="admin_mfa_failed",
-            target_type="admin_console",
-            target_id=user.id,
-            ip_address=client_ip,
-            detail={"email": user.email, "timestamp": datetime.utcnow().isoformat()}
-        )
-        db.add(audit)
-        db.commit()
-        raise HTTPException(status_code=401, detail="Invalid authentication code")
+    client_ip = _client_ip(request)
+
+    recovery_codes = None
+    enrollment_completed = False
+
+    if token_type == "admin_mfa_enrollment" or not user.mfa_enabled:
+        if not user.mfa_pending_secret:
+            raise HTTPException(status_code=400, detail="No admin MFA enrollment in progress")
+        plain_secret = mfa.decrypt_mfa_secret(user.mfa_pending_secret)
+        if not plain_secret or not mfa.verify_totp(plain_secret, raw_code, user_id=user.id, db=db):
+            audit = AuditLog(
+                family_id=user.family_id,
+                actor_id=user.id,
+                actor_role="admin",
+                action="admin_mfa_enrollment_failed",
+                target_type="admin_console",
+                target_id=user.id,
+                ip_address=client_ip,
+                detail={"email": user.email, "timestamp": datetime.utcnow().isoformat()}
+            )
+            db.add(audit)
+            db.commit()
+            raise HTTPException(status_code=401, detail="Invalid authentication code")
+
+        # Promote pending secret to active and mark MFA enabled
+        user.mfa_secret = user.mfa_pending_secret
+        user.mfa_pending_secret = None
+        user.mfa_enabled = True
+        from api.auth_routes import _issue_recovery_codes
+        recovery_codes = _issue_recovery_codes(db, user)
+        enrollment_completed = True
+    else:
+        # Regular admin MFA verification (supports TOTP or recovery code)
+        plain_secret = mfa.decrypt_mfa_secret(user.mfa_secret)
+        is_totp = bool(plain_secret and mfa.verify_totp(plain_secret, raw_code, user_id=user.id, db=db))
+        is_recovery = False
+        if not is_totp:
+            is_recovery = mfa.verify_and_consume_recovery_code(db, user.id, raw_code)
+
+        if not is_totp and not is_recovery:
+            audit = AuditLog(
+                family_id=user.family_id,
+                actor_id=user.id,
+                actor_role="admin",
+                action="admin_mfa_failed",
+                target_type="admin_console",
+                target_id=user.id,
+                ip_address=client_ip,
+                detail={"email": user.email, "timestamp": datetime.utcnow().isoformat()}
+            )
+            db.add(audit)
+            db.commit()
+            raise HTTPException(status_code=401, detail="Invalid authentication code")
 
     used_tc = mfa._LAST_USED_TIMESTEPS.get(user.id)
     token_version = getattr(user, "token_version", 1)
@@ -253,7 +297,6 @@ def verify_admin_mfa(
         expires_delta=timedelta(hours=24)
     )
 
-    client_ip = _client_ip(request)
     audit = AuditLog(
         family_id=user.family_id,
         actor_id=user.id,
@@ -262,12 +305,12 @@ def verify_admin_mfa(
         target_type="admin_console",
         target_id=user.id,
         ip_address=client_ip,
-        detail={"email": user.email, "mfa_used": True, "totp_timestep": used_tc, "timestamp": datetime.utcnow().isoformat()}
+        detail={"email": user.email, "mfa_used": True, "enrollment_completed": enrollment_completed, "totp_timestep": used_tc, "timestamp": datetime.utcnow().isoformat()}
     )
     db.add(audit)
     db.commit()
 
-    return {
+    response = {
         "access_token": admin_token,
         "token_type": "bearer",
         "admin": {
@@ -277,6 +320,9 @@ def verify_admin_mfa(
             "role": "admin"
         }
     }
+    if recovery_codes is not None:
+        response["recovery_codes"] = recovery_codes
+    return response
 
 
 # ---------------------------------------------------------------------------

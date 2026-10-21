@@ -65,7 +65,7 @@ CRITICAL_NUMERIC_COLUMNS = {
 }
 
 
-def verify_database_readiness(target_engine, is_production_mode: bool) -> tuple[bool, str]:
+def verify_database_readiness(target_engine, is_production_mode: bool = False) -> tuple[bool, str]:
     """
     FF-34, FF-35 & G2: Deep verification of database connectivity, schema tables, critical columns,
     fixed-point numeric data types, primary keys, unique constraints, and Alembic revision without mutating DDL.
@@ -113,20 +113,20 @@ def verify_database_readiness(target_engine, is_production_mode: bool) -> tuple[
                         if not any(t in c_type for t in ("NUMERIC", "DECIMAL")):
                             return False, f"Financial column '{tbl}.{col_name}' has non-numeric type '{c_type}', expected NUMERIC/DECIMAL."
 
-            # 3. Verify unique constraints / unique indices on critical keys
-            def check_unique(tbl_name: str, col_name: str) -> bool:
+            # 3. Verify single-column unique constraints / unique indices on critical keys
+            def check_single_column_unique(tbl_name: str, col_name: str) -> bool:
                 for idx in inspector.get_indexes(tbl_name):
-                    if idx.get("unique") and col_name in idx.get("column_names", []):
+                    if idx.get("unique") and idx.get("column_names") == [col_name]:
                         return True
                 for uq in inspector.get_unique_constraints(tbl_name):
-                    if col_name in uq.get("column_names", []):
+                    if uq.get("column_names") == [col_name]:
                         return True
                 return False
 
-            if "idempotency_records" in tables and not check_unique("idempotency_records", "key"):
+            if "idempotency_records" in tables and not check_single_column_unique("idempotency_records", "key"):
                 return False, "Table 'idempotency_records' is missing a unique constraint on column 'key'."
 
-            if "users" in tables and not check_unique("users", "email"):
+            if "users" in tables and not check_single_column_unique("users", "email"):
                 return False, "Table 'users' is missing a unique constraint on column 'email'."
 
             # 4. Verify Alembic schema migration tracking
