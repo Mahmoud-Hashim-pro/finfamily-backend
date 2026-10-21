@@ -983,8 +983,11 @@ def request_reauth(
         if not payload.google_id_token:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Fresh authentication via Google ID token or password is required for re-authentication")
         from core.google_auth import verify_google_id_token
-        google_user = verify_google_id_token(payload.google_id_token)
-        if not google_user or google_user.get("email", "").lower() != (parent.email or "").lower():
+        try:
+            google_user = verify_google_id_token(payload.google_id_token)
+        except Exception as e:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid Google ID token: {e}")
+        if not google_user or google_user.get("email", "").strip().lower() != (parent.email or "").strip().lower():
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Google authentication does not match account identity")
     if parent.mfa_enabled:
         if not payload.mfa_code:
@@ -1065,11 +1068,14 @@ def delete_account(
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid password confirmation")
     elif google_id_token and not parent.password_hash:
         from core.google_auth import verify_google_id_token
-        google_user = verify_google_id_token(google_id_token)
-        if google_user and google_user.get("email", "").lower() == (parent.email or "").lower():
+        try:
+            google_user = verify_google_id_token(google_id_token)
+        except Exception as e:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid Google re-authentication token: {e}")
+        if google_user and google_user.get("email", "").strip().lower() == (parent.email or "").strip().lower():
             reauth_verified = True
         else:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Google re-authentication token")
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Google re-authentication token: identity mismatch")
     else:
         reauth_candidate = (
             request.headers.get("X-Reauth-Token")
@@ -1092,8 +1098,12 @@ def delete_account(
                         existing_used = db.query(IdempotencyRecord).filter(IdempotencyRecord.key == consumed_key).first()
                         if existing_used:
                             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Re-authentication token has already been consumed")
-                        db.add(IdempotencyRecord(key=consumed_key, family_id=parent.family_id, user_id=parent.id, action="reauth_consumed"))
-                        db.flush()
+                        try:
+                            db.add(IdempotencyRecord(key=consumed_key, family_id=None, user_id=None, action="reauth_consumed"))
+                            db.commit()
+                        except (IntegrityError, Exception):
+                            db.rollback()
+                            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Re-authentication token has already been consumed")
                     reauth_verified = True
             except HTTPException:
                 raise

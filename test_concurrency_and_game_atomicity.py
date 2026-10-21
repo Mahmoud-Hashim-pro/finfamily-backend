@@ -344,3 +344,129 @@ def test_concurrent_game_completion_daily_anti_cheat_and_atomicity():
         assert rewarded_count == 1, f"Expected exactly 1 was_rewarded=True completion, got {rewarded_count}"
     finally:
         db.close()
+
+
+def test_concurrent_reauth_token_single_use_consumption():
+    """
+    FF-03, FF-05 & Area 5:
+    Concurrent threads attempt account deletion with the exact same re-authentication token.
+    Asserts:
+    1. Exactly ONE thread succeeds (200 OK).
+    2. All other competing threads fail closed with HTTP 401 (Re-authentication token has already been consumed).
+    3. Idempotency record guarantees zero duplicate deletions or replay.
+    """
+    db = ConcurSessionLocal()
+    fam = Family(name="Concurrent Delete Fam", family_code=f"CD{uuid.uuid4().hex[:4].upper()}")
+    db.add(fam)
+    db.flush()
+
+    p = User(
+        family_id=fam.id,
+        role=UserRole.parent,
+        full_name="Concur Parent",
+        email=f"concur.delete.{uuid.uuid4().hex[:6]}@gmail.com",
+        password_hash=hash_password("StrongPass123!"),
+        is_active=True,
+    )
+    db.add(p)
+    db.commit()
+    parent_id = p.id
+    family_id = fam.id
+    db.close()
+
+    jti_val = f"jti-{uuid.uuid4().hex}"
+    from datetime import timedelta
+    reauth_token = create_access_token(
+        user_id=parent_id,
+        family_id=family_id,
+        role="parent",
+        expires_delta=timedelta(minutes=5),
+        additional_claims={
+            "purpose": "reauth",
+            "action": "account_deletion",
+            "jti": jti_val,
+        },
+    )
+
+    headers = {
+        "Authorization": f"Bearer {reauth_token}",
+        "X-Reauth-Token": reauth_token,
+    }
+
+    def _delete_request():
+        return client.request("DELETE", "/api/auth/account", headers=headers)
+
+    thread_count = 8
+    with ThreadPoolExecutor(max_workers=thread_count) as executor:
+        futures = [executor.submit(_delete_request) for _ in range(thread_count)]
+        responses = [f.result() for f in as_completed(futures)]
+
+    success_responses = [r for r in responses if r.status_code == 200]
+    rejected_responses = [r for r in responses if r.status_code in (401, 403, 404)]
+
+    # Exactly 1 request successfully consumed the token and completed deletion
+    assert len(success_responses) == 1, f"Expected 1 success, got {len(success_responses)} ({[r.status_code for r in responses]})"
+    assert len(rejected_responses) == thread_count - 1
+
+    for r in rejected_responses:
+        assert r.status_code in (401, 403, 404)
+
+
+def test_concurrent_totp_timestep_atomic_replay_prevention():
+    """
+    FF-20 & Area 5:
+    Concurrent threads attempt TOTP verification with the exact same code and timestep.
+    Asserts:
+    1. Exactly ONE thread succeeds in atomically updating user.last_totp_timestep.
+    2. All other competing threads receive False (replay protection triggered).
+    """
+    from core import mfa
+    import pyotp
+
+    db = ConcurSessionLocal()
+    fam = Family(name="TOTP Concur Fam", family_code=f"TC{uuid.uuid4().hex[:4].upper()}")
+    db.add(fam)
+    db.flush()
+
+    raw_secret = pyotp.random_base32()
+    enc_secret = mfa.encrypt_mfa_secret(raw_secret)
+    p = User(
+        family_id=fam.id,
+        role=UserRole.parent,
+        full_name="TOTP Concur Parent",
+        email=f"totp.concur.{uuid.uuid4().hex[:6]}@gmail.com",
+        mfa_secret=enc_secret,
+        mfa_enabled=True,
+        is_active=True,
+    )
+    db.add(p)
+    db.commit()
+    user_id = p.id
+    db.close()
+
+    code = pyotp.TOTP(raw_secret).now()
+
+    def _attempt_totp():
+        session = ConcurSessionLocal()
+        try:
+            res = mfa.verify_totp(raw_secret, code, user_id=user_id, db=session)
+            if res:
+                session.commit()
+            else:
+                session.rollback()
+            return res
+        except Exception:
+            session.rollback()
+            return False
+        finally:
+            session.close()
+
+    thread_count = 6
+    with ThreadPoolExecutor(max_workers=thread_count) as executor:
+        futures = [executor.submit(_attempt_totp) for _ in range(thread_count)]
+        results = [f.result() for f in as_completed(futures)]
+
+    # Exactly 1 must return True; all others False
+    true_count = sum(1 for r in results if r is True)
+    assert true_count == 1, f"Expected exactly 1 successful TOTP verification, got {true_count} out of {results}"
+

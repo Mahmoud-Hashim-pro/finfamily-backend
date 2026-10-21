@@ -8,19 +8,48 @@ from core.limiter import limiter
 from services.ai_coach import ChatMessage, get_ai_response
 from services.ai_context import build_child_context, build_family_context, redact_name
 
+MAX_AI_BODY_BYTES = 16384  # 16KB
+
+
+async def validate_ai_request_body_size(request: Request) -> bytes:
+    """
+    FF-22 & FF-47: Enforce strict byte-level body size bounds before and during body ingestion.
+    Checks Content-Length header, then streams and caps incoming request body to 16KB,
+    failing closed with HTTP 413 if the payload exceeds 16KB, even when headers are missing, spoofed,
+    or chunked.
+    """
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_AI_BODY_BYTES:
+                raise HTTPException(status_code=413, detail="Payload too large (max 16KB)")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length header")
+
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > MAX_AI_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="Payload too large (max 16KB)")
+
+    raw_bytes = bytes(body)
+    request._body = raw_bytes
+    return raw_bytes
+
+
 # BUG-017 & Subsystem 4: AI Coach Router with route rate-limiting and route aliases
 functions_router = APIRouter(tags=["AI Coach & Backend Functions"])
 
 
-@functions_router.post("/api/ai/coach/chat")
-@functions_router.post("/api/ai-coach/chat")
-@functions_router.post("/api/functions/aiCoach")
-@functions_router.post("/api/aiCoach")
-@functions_router.post("/ai/coach/chat")
-@functions_router.post("/ai-coach/chat")
-@functions_router.post("/functions/aiCoach")
+@functions_router.post("/api/ai/coach/chat", dependencies=[Depends(validate_ai_request_body_size)])
+@functions_router.post("/api/ai-coach/chat", dependencies=[Depends(validate_ai_request_body_size)])
+@functions_router.post("/api/functions/aiCoach", dependencies=[Depends(validate_ai_request_body_size)])
+@functions_router.post("/api/aiCoach", dependencies=[Depends(validate_ai_request_body_size)])
+@functions_router.post("/ai/coach/chat", dependencies=[Depends(validate_ai_request_body_size)])
+@functions_router.post("/ai-coach/chat", dependencies=[Depends(validate_ai_request_body_size)])
+@functions_router.post("/functions/aiCoach", dependencies=[Depends(validate_ai_request_body_size)])
 @limiter.limit("15/minute")
-def chat_ai_coach(
+async def chat_ai_coach(
     request: Request,
     chat: ChatMessage,
     user: User = Depends(get_current_user),
@@ -40,14 +69,6 @@ def chat_ai_coach(
         * /api/functions/aiCoach
         * /api/aiCoach
     """
-    content_length = request.headers.get("content-length")
-    if content_length:
-        try:
-            if int(content_length) > 16384:
-                raise HTTPException(status_code=413, detail="Payload too large (max 16KB)")
-        except ValueError:
-            pass
-
     clean_message = chat.message.strip() if chat.message else ""
     if not clean_message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")

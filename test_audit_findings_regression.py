@@ -979,3 +979,107 @@ def test_f2_ai_chat_rejects_oversized_total_history_size():
         ChatMessage(message="Hello", history=large_history)
 
 
+def test_ai_chat_history_rejects_extra_fields():
+    """FF-47: Strict schema rejects extra/forbidden fields on history items and root ChatMessage."""
+    from services.ai_coach import ChatMessage, HistoryItem
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        HistoryItem(role="user", text="hello", evil_extra_payload="malicious")
+
+    with pytest.raises(ValidationError):
+        ChatMessage(message="test", unknown_extra_field="rejected")
+
+
+def test_ai_chat_history_counts_content_and_message_fields():
+    """FF-47: Aggregate size validator counts 'content' and 'message' fields across HistoryItem entries."""
+    from services.ai_coach import ChatMessage
+    from pydantic import ValidationError
+
+    large_content_history = [
+        {"role": "user", "content": "X" * 900},
+        {"role": "assistant", "message": "Y" * 900},
+        {"role": "user", "text": "Z" * 900},
+        {"role": "assistant", "content": "W" * 900},
+        {"role": "user", "message": "V" * 900},
+    ]
+    with pytest.raises(ValidationError, match="Total conversation history exceeds maximum permitted size"):
+        ChatMessage(message="Valid prompt", history=large_content_history)
+
+
+def test_ai_body_size_enforcement_before_deserialization():
+    """FF-22 & FF-47: Hard 16KB body size limit enforced before/during body ingestion."""
+    db = SessionLocal()
+    fam = Family(name="AI Stream Fam", family_code="AISTR1")
+    db.add(fam)
+    db.flush()
+    user = User(
+        family_id=fam.id,
+        role=UserRole.parent,
+        full_name="AI Parent",
+        email="ai.stream.parent@gmail.com",
+        is_active=True,
+    )
+    db.add(user)
+    db.commit()
+    token = create_access_token(user_id=user.id, family_id=fam.id, role="parent")
+    db.close()
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    # 1. Body exceeding 16KB without Content-Length header -> 413
+    oversized_data = {"message": "Hello", "history": [{"role": "user", "text": "A" * 800}] * 30}
+    import json
+    raw_bytes = json.dumps(oversized_data).encode("utf-8")
+    assert len(raw_bytes) > 16384
+
+    res_oversized = client.post(
+        "/api/ai/coach/chat",
+        content=raw_bytes,
+        headers=headers,
+    )
+    assert res_oversized.status_code == 413
+    assert "Payload too large" in res_oversized.text
+
+    # 2. Valid payload within 16KB limit succeeds
+    valid_data = {"message": "ازيك يا فلهوة"}
+    res_valid = client.post(
+        "/api/ai/coach/chat",
+        json=valid_data,
+        headers=headers,
+    )
+    assert res_valid.status_code == 200
+    assert "reply" in res_valid.json()
+
+
+def test_main_database_readiness_checks():
+    """FF-34 & G2: Database readiness verifies connectivity, required tables, and Alembic revision."""
+    from main import verify_database_readiness
+    from db.database import engine
+
+    # Real engine with initialized tables must be ready
+    is_ready, msg = verify_database_readiness(engine, is_production_mode=False)
+    assert is_ready is True
+    assert "verified" in msg
+
+    # Disposable in-memory engine with zero tables must report missing tables
+    from sqlalchemy import create_engine
+    empty_engine = create_engine("sqlite:///:memory:")
+    is_ready_empty, msg_empty = verify_database_readiness(empty_engine, is_production_mode=False)
+    assert is_ready_empty is False
+    assert "Missing required database tables" in msg_empty
+
+
+def test_app_version_sha256_matches_released_apk(monkeypatch):
+    """FF-22 & Area 4: Backend /api/app/version returns exact SHA-256 matching the released APK artifact."""
+    monkeypatch.setenv("APP_VERSION", "1.1.4")
+    monkeypatch.setenv("APP_BUILD_NUMBER", "12")
+    res = client.get("/api/app/version")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["version"] == "1.1.4"
+    assert data["build_number"] == 12
+    assert data["sha256"] == "ff3bbf46428bd298de8a7012514a307127c9aeb3761bf9814d4e9d2255dad77b"
+
+
+

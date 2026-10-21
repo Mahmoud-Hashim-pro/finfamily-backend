@@ -26,7 +26,45 @@ from core.config import is_production, validate_production_configuration
 # FF-38 & FF-44: Unified production environment validation
 is_prod = is_production()
 
-db_healthy = True
+# Database readiness and health state tracking
+db_healthy = False
+
+
+def verify_database_readiness(target_engine, is_production_mode: bool) -> tuple[bool, str]:
+    """
+    FF-34, FF-35 & G2: Verify database connectivity and schema readiness without mutating DDL.
+    Checks:
+    1. Active ping connectivity via SELECT 1.
+    2. Presence of required domain tables (users, families, wallets, idempotency_records, card_purchases).
+    3. If alembic_version is tracked, ensures the schema revision matches the expected head ('0002_idemp_mfa_atomic').
+    Returns (is_ready, detail_message).
+    """
+    from sqlalchemy import text, inspect
+    try:
+        with target_engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+            inspector = inspect(conn)
+            tables = set(inspector.get_table_names())
+            required_tables = {"users", "families", "wallets", "idempotency_records", "card_purchases"}
+            missing = required_tables - tables
+            if missing:
+                return False, f"Missing required database tables: {missing}"
+
+            if "alembic_version" in tables:
+                row = conn.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).fetchone()
+                if not row or not row[0]:
+                    return False, "Alembic version table exists but contains no applied revision."
+                current_rev = str(row[0]).strip()
+                EXPECTED_HEAD_REV = "0002_idemp_mfa_atomic"
+                if current_rev != EXPECTED_HEAD_REV:
+                    return False, f"Database schema is behind: current revision '{current_rev}', expected '{EXPECTED_HEAD_REV}'."
+            elif is_production_mode:
+                return False, "Production database is missing 'alembic_version' migration tracking table."
+
+        return True, "Database connectivity and schema readiness verified."
+    except Exception as e:
+        return False, f"Database readiness check failed: {e}"
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -43,21 +81,37 @@ async def lifespan(app: FastAPI):
 
     if not skip_db_init:
         if is_prod and not (os.getenv("ALLOW_PRODUCTION_AUTO_DDL", "false").strip().lower() in ("true", "1")):
-            logger.info("Production mode: Automatic Base.metadata.create_all() suppressed in favor of Alembic migrations.")
-            db_healthy = True
+            logger.info("Production mode: Automatic Base.metadata.create_all() suppressed. Verifying schema readiness...")
+            is_ready, msg = verify_database_readiness(engine, is_production_mode=True)
+            db_healthy = is_ready
+            if not is_ready:
+                logger.critical(f"Production database schema readiness failed: {msg}")
+                raise RuntimeError(f"Database readiness failed in production: {msg}")
+            logger.info(f"Production schema readiness confirmed: {msg}")
         else:
             try:
                 Base.metadata.create_all(bind=engine)
-                db_healthy = True
-                logger.info("Database schema verified and initialized successfully.")
+                is_ready, msg = verify_database_readiness(engine, is_production_mode=False)
+                db_healthy = is_ready
+                if not is_ready:
+                    logger.error(f"Post-initialization schema check failed: {msg}")
+                else:
+                    logger.info("Database schema verified and initialized successfully.")
             except Exception as e:
                 db_healthy = False
                 logger.error(f"Database initialization failed during startup: {e}", exc_info=True)
                 if is_prod:
                     raise RuntimeError(f"Database initialization failed in production: {e}") from e
     else:
-        db_healthy = True
-        logger.info("SKIP_DB_INIT active: relying on controlled Alembic migrations.")
+        logger.info("SKIP_DB_INIT active: verifying database schema and migration readiness...")
+        is_ready, msg = verify_database_readiness(engine, is_production_mode=is_prod)
+        db_healthy = is_ready
+        if not is_ready:
+            logger.error(f"Database readiness check failed under SKIP_DB_INIT: {msg}")
+            if is_prod:
+                raise RuntimeError(f"Database readiness failed in production: {msg}")
+        else:
+            logger.info(f"Schema readiness confirmed under SKIP_DB_INIT: {msg}")
     yield
 
 app = FastAPI(
@@ -80,12 +134,21 @@ def read_root():
         logger.warning(f"Active health check ping failed: {e}")
         is_live = False
 
-    status_str = "healthy" if (db_healthy and is_live) else "unhealthy"
+    # Check database readiness dynamically if db_healthy has not been established by lifespan
+    global db_healthy
+    current_health = db_healthy
+    if not current_health and is_live:
+        is_ready, _ = verify_database_readiness(engine, is_production_mode=is_prod)
+        if is_ready:
+            current_health = True
+            db_healthy = True
+
+    status_str = "healthy" if (current_health and is_live) else "unhealthy"
     from fastapi.responses import JSONResponse
     content = {
         "status": status_str,
         "service": "FinFamily API",
-        "docs": None if is_production else "/docs",
+        "docs": None if is_prod else "/docs",
         "version": os.getenv("APP_VERSION", "1.1.4")
     }
     return JSONResponse(
@@ -110,7 +173,7 @@ def get_app_version():
         "APP_RELEASE_NOTES",
         f"إصدار رسمي v{version} (Build {build_num}): تحسينات أمان شاملة، توثيق صارم لمسارات حذف الحساب، ترقيات ذرية لرموز MFA لمنع هجمات Replay، وحماية من تكرار المعاملات المالية."
     )
-    file_hash = os.getenv("APP_SHA256", "21408d8dcde46b0a372b0b974324e990cf252815aa6716d572168ebaf288187c")
+    file_hash = os.getenv("APP_SHA256", "ff3bbf46428bd298de8a7012514a307127c9aeb3761bf9814d4e9d2255dad77b")
 
     return {
         "version": version,
