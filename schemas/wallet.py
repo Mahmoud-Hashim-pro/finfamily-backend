@@ -252,6 +252,7 @@ class CardPurchaseCreate(BaseModel):
     category: str = Field(default="Other", max_length=50)
     location: Optional[str] = Field(default=None, max_length=100)
     amount: float = Field(gt=0, le=1_000_000)
+    idempotency_key: Optional[str] = Field(default=None, max_length=100)
 
     @field_validator("amount")
     @classmethod

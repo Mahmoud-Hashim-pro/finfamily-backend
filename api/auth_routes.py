@@ -109,8 +109,25 @@ def is_admin_email(email: str) -> bool:
     return clean in env_admins or clean in known_admins
 
 
-def _check_recovery_code_lockout(user_id: str) -> None:
+def _check_recovery_code_lockout(user_id: str, db: Optional[Session] = None) -> None:
     now = datetime.utcnow()
+    # FF-04: Check database-backed audit log if db session provided (shared across all serverless workers)
+    if db is not None:
+        window_start = now - timedelta(minutes=15)
+        recent_fails = (
+            db.query(AuditLog)
+            .filter(
+                AuditLog.actor_id == user_id,
+                AuditLog.action == "mfa_recovery_failed",
+                AuditLog.created_date >= window_start,
+            )
+            .count()
+        )
+        if recent_fails >= 5:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many failed recovery code attempts. Account temporarily locked for 15 minutes.",
+            )
     attempts = _FAILED_RECOVERY_ATTEMPTS.get(user_id, [])
     # Keep attempts from last 15 minutes
     valid_attempts = [t for t in attempts if (now - t).total_seconds() < 900]
@@ -229,13 +246,26 @@ def login_parent(request: Request, payload: ParentLogin, db: Session = Depends(g
         db.commit()
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
+    # FF-02 & FF-10: Reject deactivated accounts during parent password login
+    if hasattr(user, "is_active") and not user.is_active:
+        log_action(
+            db, request=request, action="login_deactivated_rejected",
+            actor_id=user.id, actor_role="parent", family_id=user.family_id,
+            detail={"email": clean_email, "role": "parent"},
+        )
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is deactivated. Contact administration to restore access.",
+        )
+
     used_recovery_code = False
 
     # الباسورد صح. لو الأب مفعّل MFA، الخطوة دي مش كفاية لوحدها.
     if user.mfa_enabled:
         if payload.recovery_code:
-            # BUG-118 (P2): Enforce per-account lockout on recovery code brute force
-            _check_recovery_code_lockout(user.id)
+            # BUG-118 (P2) & FF-04: Enforce per-account lockout on recovery code brute force
+            _check_recovery_code_lockout(user.id, db)
             normalized = mfa.normalize_recovery_code(payload.recovery_code)
             candidates = db.query(MfaRecoveryCode).filter(MfaRecoveryCode.user_id == user.id, MfaRecoveryCode.used == False).all()  # noqa: E712
             match = next((c for c in candidates if mfa.verify_recovery_code(normalized, c.code_hash)), None)
@@ -277,7 +307,14 @@ def login_parent(request: Request, payload: ParentLogin, db: Session = Depends(g
             )
             return ParentLoginResult(mfa_required=True, temp_token=temp_token)
 
-        elif not mfa.verify_totp(user.mfa_secret, payload.otp_code, user_id=user.id):
+        # FF-06: Decrypt encrypted mfa_secret before verifying TOTP
+        elif not (
+            mfa.verify_totp(
+                mfa.decrypt_mfa_secret(user.mfa_secret) if user.mfa_secret else "",
+                payload.otp_code,
+                user_id=user.id
+            )
+        ):
             # BUG-117 (P2): Verify TOTP code with replay prevention
             log_action(
                 db, request=request, action="mfa_failed",
@@ -308,8 +345,8 @@ def login_parent(request: Request, payload: ParentLogin, db: Session = Depends(g
     )
 
 
-@router.post("/google", response_model=TokenResponse)
-@auth_compat_router.post("/google", response_model=TokenResponse)
+@router.post("/google", response_model=ParentLoginResult)
+@auth_compat_router.post("/google", response_model=ParentLoginResult)
 @limiter.limit("15/minute")
 def google_auth(request: Request, payload: GoogleLoginRequest, db: Session = Depends(get_db)):
     if not payload.id_token or not payload.id_token.strip():
@@ -357,6 +394,43 @@ def google_auth(request: Request, payload: GoogleLoginRequest, db: Session = Dep
         db.commit()
         db.refresh(user)
 
+        # FF-01: Apply TOTP MFA enforcement to Google login if parent enabled MFA
+        if user.mfa_enabled:
+            if payload.otp_code:
+                if not (
+                    mfa.verify_totp(
+                        mfa.decrypt_mfa_secret(user.mfa_secret) if user.mfa_secret else "",
+                        payload.otp_code,
+                        user_id=user.id
+                    )
+                ):
+                    log_action(
+                        db, request=request, action="google_login_mfa_failed",
+                        actor_id=user.id, actor_role="parent", family_id=user.family_id,
+                    )
+                    db.commit()
+                    raise HTTPException(status_code=401, detail="Invalid authentication code")
+            else:
+                temp_token = create_access_token(
+                    user_id=user.id,
+                    family_id=user.family_id,
+                    role="mfa_pending",
+                    token_type="mfa_challenge",
+                    mfa_pending=True,
+                    expires_delta=timedelta(minutes=5),
+                )
+                log_action(
+                    db, request=request, action="google_login_mfa_challenge",
+                    actor_id=user.id, actor_role="parent", family_id=user.family_id,
+                    detail={"email": clean_email},
+                )
+                db.commit()
+                return ParentLoginResult(
+                    mfa_required=True,
+                    temp_token=temp_token,
+                    user=UserResponse.model_validate(user),
+                )
+
         log_action(
             db, request=request, action="google_login_success",
             actor_id=user.id, actor_role="parent",
@@ -371,7 +445,12 @@ def google_auth(request: Request, payload: GoogleLoginRequest, db: Session = Dep
             email=user.email,
             token_version=getattr(user, "token_version", 1) or 1,
         )
-        return TokenResponse(access_token=token, token_type="bearer", user=UserResponse.model_validate(user))
+        return ParentLoginResult(
+            access_token=token,
+            token_type="bearer",
+            user=UserResponse.model_validate(user),
+            mfa_required=False,
+        )
 
     # New email: atomically create a Family (e.g. f"{name}'s Family"), create User with role=UserRole.parent, email, full_name, is_active=True, create their Wallet, and return access_token and user info.
     if is_admin_email(clean_email):
@@ -422,7 +501,12 @@ def google_auth(request: Request, payload: GoogleLoginRequest, db: Session = Dep
                 email=user.email,
                 token_version=getattr(user, "token_version", 1) or 1,
             )
-            return TokenResponse(access_token=token, token_type="bearer", user=UserResponse.model_validate(user))
+            return ParentLoginResult(
+                access_token=token,
+                token_type="bearer",
+                user=UserResponse.model_validate(user),
+                mfa_required=False,
+            )
         raise HTTPException(status_code=400, detail="Google authentication failed")
 
     token = create_access_token(
@@ -432,7 +516,12 @@ def google_auth(request: Request, payload: GoogleLoginRequest, db: Session = Dep
         email=parent.email,
         token_version=getattr(parent, "token_version", 1) or 1,
     )
-    return TokenResponse(access_token=token, token_type="bearer", user=UserResponse.model_validate(parent))
+    return ParentLoginResult(
+        access_token=token,
+        token_type="bearer",
+        user=UserResponse.model_validate(parent),
+        mfa_required=False,
+    )
 
 
 
@@ -460,10 +549,9 @@ def create_child(
 
     wallet = Wallet(owner_id=child.id)
     db.add(wallet)
+    db.flush()
 
-    db.commit()
-    db.refresh(child)
-
+    # FF-12: Single atomic commit for child, wallet, and audit logging
     log_action(
         db, request=request, action="child_created",
         actor_id=parent.id, actor_role="parent", family_id=parent.family_id,
@@ -471,6 +559,7 @@ def create_child(
         detail={"child_name": child.full_name},
     )
     db.commit()
+    db.refresh(child)
 
     return child
 
@@ -556,6 +645,19 @@ def child_login(request: Request, payload: ChildLogin, db: Session = Depends(get
         )
         db.commit()
         raise HTTPException(status_code=401, detail="Invalid PIN")
+
+    # FF-02 & FF-10: Reject deactivated child accounts
+    if child and hasattr(child, "is_active") and not child.is_active:
+        log_action(
+            db, request=request, action="login_deactivated_rejected",
+            family_id=family.id,
+            detail={"role": "child", "child_id": payload.child_id},
+        )
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is deactivated. Contact parents or administration to restore access.",
+        )
 
     child.failed_pin_attempts = 0
     child.pin_locked_until = None
@@ -678,8 +780,11 @@ def reset_password(request: Request, payload: ResetPasswordRequest, db: Session 
     )
     db.commit()
 
-    # BUG-114 (P2): Send security notification email after password change
-    send_password_changed_notification(user.email)
+    # BUG-114 (P2) & FF-11: Send security notification email without failing committed password change
+    try:
+        send_password_changed_notification(user.email)
+    except Exception as email_err:
+        logger.error(f"Failed to dispatch password changed notification email: {email_err}", exc_info=True)
 
     return ForgotPasswordResponse(message="Your password has been reset. You can log in now.")
 
@@ -707,8 +812,11 @@ def change_password(
     )
     db.commit()
 
-    # BUG-114 (P2): Send security notification email after password change
-    send_password_changed_notification(parent.email)
+    # BUG-114 (P2) & FF-11: Send security notification email without failing committed password change
+    try:
+        send_password_changed_notification(parent.email)
+    except Exception as email_err:
+        logger.error(f"Failed to dispatch password changed notification email: {email_err}", exc_info=True)
 
     return {"message": "Password changed successfully"}
 
@@ -803,10 +911,20 @@ def delete_account(
     parent: User = Depends(require_parent),
     db: Session = Depends(get_db),
 ):
-    """BUG-057 (P1) & BUG-140 (P2): Parent deletes account and family."""
+    """BUG-057 (P1), BUG-140 (P2), FF-03 & FF-13: Parent deletes account and family with audit preservation."""
     family_id = parent.family_id
+    parent_email = parent.email
     family_users = db.query(User).filter(User.family_id == family_id).all()
     user_ids = [u.id for u in family_users]
+
+    # FF-03 & FF-13: Log deletion audit before wiping records, retaining minimal compliance metadata
+    log_action(
+        db, request=request, action="family_account_deleted",
+        actor_id=None, actor_role="parent", family_id=None,
+        target_type="family", target_id=family_id,
+        detail={"parent_email": parent_email, "family_id": family_id, "member_count": len(user_ids)},
+    )
+    db.commit()
 
     if user_ids:
         db.query(GameCompletion).filter(GameCompletion.child_id.in_(user_ids)).delete(synchronize_session=False)
@@ -815,7 +933,8 @@ def delete_account(
         db.query(Transaction).filter(Transaction.family_id == family_id).delete(synchronize_session=False)
         db.query(PasswordResetToken).filter(PasswordResetToken.user_id.in_(user_ids)).delete(synchronize_session=False)
         db.query(MfaRecoveryCode).filter(MfaRecoveryCode.user_id.in_(user_ids)).delete(synchronize_session=False)
-        db.query(AuditLog).filter(AuditLog.family_id == family_id).delete(synchronize_session=False)
+        # Preserve audit logs by clearing foreign key references instead of deleting the compliance trail
+        db.query(AuditLog).filter(AuditLog.family_id == family_id).update({AuditLog.family_id: None, AuditLog.actor_id: None}, synchronize_session=False)
 
     family = db.query(Family).filter(Family.id == family_id).first()
     if family:

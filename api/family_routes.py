@@ -61,14 +61,21 @@ def validate_money(amount: float) -> float:
     return round(amount, 2)
 
 
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 
 def to_decimal(val) -> Decimal:
+    """
+    FF-14: Exact monetary Decimal conversion with half-up quantization.
+    Avoids binary float rounding inaccuracies.
+    """
     if val is None:
         return Decimal("0.00")
     if isinstance(val, Decimal):
-        return val
-    return Decimal(str(round(float(val), 2)))
+        return val.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    try:
+        return Decimal(str(val)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except Exception:
+        return Decimal("0.00")
 
 
 def _get_family_child(db: Session, family_id: str, child_id: str) -> User:
@@ -690,7 +697,12 @@ def family_missions(
 # ---------------------------------------------------------------------------
 
 @router.post("/card/purchases", response_model=CardPurchaseOut)
-def make_purchase(payload: CardPurchaseCreate, child: User = Depends(require_child), db: Session = Depends(get_db)):
+def make_purchase(
+    request: Request,
+    payload: CardPurchaseCreate,
+    child: User = Depends(require_child),
+    db: Session = Depends(get_db),
+):
     """
     الطفل بيعمل 'سحبة كارت' وهمية. القرار بيتاخد فورًا:
     - الكارت مش active / الفئة محظورة / الرصيد مش كافي -> ترفض فورًا (rejected)
@@ -700,6 +712,60 @@ def make_purchase(payload: CardPurchaseCreate, child: User = Depends(require_chi
     validate_money(payload.amount)
     if payload.category not in ALLOWED_SPENDING_CATEGORIES and payload.category.title() not in ALLOWED_SPENDING_CATEGORIES:
         raise HTTPException(status_code=400, detail=f"Category '{payload.category}' is not valid")
+
+    # FF-15: Explicit idempotency key support for card purchases
+    idempotency_key = (
+        request.headers.get("X-Idempotency-Key")
+        or request.headers.get("Idempotency-Key")
+        or getattr(payload, "idempotency_key", None)
+    )
+    if idempotency_key:
+        clean_key = str(idempotency_key).strip()
+        import hashlib, json
+        payload_data = {
+            "child_id": child.id,
+            "amount": float(to_decimal(payload.amount)),
+            "merchant": payload.merchant.strip(),
+            "category": payload.category.strip(),
+        }
+        payload_hash = hashlib.sha256(json.dumps(payload_data, sort_keys=True).encode()).hexdigest()
+
+        existing_rec = db.query(IdempotencyRecord).filter(IdempotencyRecord.key == clean_key).first()
+        if existing_rec:
+            if existing_rec.family_id != child.family_id or existing_rec.user_id != child.id:
+                raise HTTPException(status_code=409, detail="Idempotency key collision across different actors or families")
+            if existing_rec.action != "card_purchase":
+                raise HTTPException(status_code=409, detail="Idempotency key already used for a different operation")
+            if existing_rec.payload_hash and existing_rec.payload_hash != payload_hash:
+                raise HTTPException(status_code=409, detail="Idempotency key reused with conflicting request payload parameters")
+            existing_purchase = (
+                db.query(CardPurchase)
+                .filter(CardPurchase.child_id == child.id, CardPurchase.family_id == child.family_id)
+                .order_by(CardPurchase.created_date.desc())
+                .first()
+            )
+            if existing_purchase:
+                return existing_purchase
+
+        try:
+            db.add(IdempotencyRecord(
+                key=clean_key,
+                family_id=child.family_id,
+                user_id=child.id,
+                action="card_purchase",
+                payload_hash=payload_hash,
+            ))
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            existing_purchase = (
+                db.query(CardPurchase)
+                .filter(CardPurchase.child_id == child.id, CardPurchase.family_id == child.family_id)
+                .order_by(CardPurchase.created_date.desc())
+                .first()
+            )
+            if existing_purchase:
+                return existing_purchase
 
     wallet = _get_wallet_for(db, child, for_update=True)
 

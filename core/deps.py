@@ -56,6 +56,13 @@ def get_current_user(
             detail="Token has been revoked",
         )
 
+    # FF-02 & FF-10: Centrally reject deactivated accounts across all protected endpoints
+    if hasattr(user, "is_active") and not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Account is deactivated. Contact administration to restore access.",
+        )
+
     return user
 
 

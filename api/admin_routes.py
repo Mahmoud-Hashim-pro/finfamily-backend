@@ -15,9 +15,11 @@ from db.models import (
     CardStatus, CardPurchase, PurchaseStatus, AuditLog,
 )
 from core.security import (
-    verify_password, create_access_token, hash_password
+    verify_password, create_access_token, hash_password, decode_access_token
 )
-from core.deps import get_current_user
+from core.deps import get_current_user, bearer_scheme
+from fastapi.security import HTTPAuthorizationCredentials
+from jose import JWTError
 from core.limiter import limiter
 from core.audit import _client_ip
 
@@ -68,14 +70,31 @@ class _AdminAllowlistProxy(set):
 ADMIN_ALLOWLIST = _AdminAllowlistProxy()
 
 
-def require_admin(user: User = Depends(get_current_user)) -> User:
-    """Ensure the requester is in the authorized admin allowlist."""
+def require_admin(
+    user: User = Depends(get_current_user),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+) -> User:
+    """Ensure the requester is in the authorized admin allowlist and has an explicit admin session."""
     allowlist = get_admin_allowlist()
     if not user.email or user.email.lower() not in allowlist:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied: Admin privileges required."
         )
+    # FF-07: Ensure the token was specifically issued by the admin portal (/api/admin/auth/login)
+    if credentials and credentials.credentials:
+        try:
+            payload = decode_access_token(credentials.credentials)
+            if payload.get("role") != "admin" and not payload.get("is_admin"):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Access denied: Administrative authentication session required. Please log in via admin portal."
+                )
+        except JWTError:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired admin session token."
+            )
     return user
 
 

@@ -74,11 +74,15 @@ class HistoryItem(BaseModel):
     text: Optional[str] = None
 
 
-# BUG-017 & BUG-136: Request schema with length bounds and conversation history
+# BUG-017, BUG-136 & FF-22: Request schema with length bounds and conversation history
 class ChatMessage(BaseModel):
     message: str = Field(..., min_length=1, max_length=1000)
     mode: str = "child"  # Default child
-    history: Optional[List[Union[HistoryItem, Dict[str, Any]]]] = None
+    history: Optional[List[Union[HistoryItem, Dict[str, Any]]]] = Field(
+        default=None,
+        max_length=50,
+        description="Conversation history capped at 50 messages to prevent payload explosion (FF-22)",
+    )
 
 
 class ModerationResult:

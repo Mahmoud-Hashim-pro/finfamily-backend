@@ -21,22 +21,32 @@ from api.admin_routes import router as admin_router
 from api.legal_routes import router as legal_router
 from core.limiter import limiter
 
-is_production = os.getenv("ENVIRONMENT", os.getenv("ENV", "development")).strip().lower() in ("production", "prod")
+# FF-38: Align production environment detection across ENVIRONMENT, NODE_ENV, VERCEL_ENV
+is_production = os.getenv(
+    "ENVIRONMENT",
+    os.getenv("NODE_ENV", os.getenv("VERCEL_ENV", os.getenv("ENV", "development")))
+).strip().lower() in ("production", "prod")
 
 db_healthy = True
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db_healthy
-    try:
-        Base.metadata.create_all(bind=engine)
+    # FF-34: Controlled schema initialization in serverless environments
+    skip_db_init = os.getenv("SKIP_DB_INIT", "false").strip().lower() in ("true", "1")
+    if not skip_db_init:
+        try:
+            Base.metadata.create_all(bind=engine)
+            db_healthy = True
+            logger.info("Database schema verified and initialized successfully.")
+        except Exception as e:
+            db_healthy = False
+            logger.error(f"Database initialization failed during startup: {e}", exc_info=True)
+            if is_production:
+                raise RuntimeError(f"Database initialization failed in production: {e}") from e
+    else:
         db_healthy = True
-        logger.info("Database schema verified and initialized successfully.")
-    except Exception as e:
-        db_healthy = False
-        logger.error(f"Database initialization failed during startup: {e}", exc_info=True)
-        if is_production:
-            raise RuntimeError(f"Database initialization failed in production: {e}") from e
+        logger.info("SKIP_DB_INIT active: relying on controlled Alembic migrations.")
     yield
 
 app = FastAPI(
@@ -65,7 +75,7 @@ def read_root():
         "status": status_str,
         "service": "FinFamily API",
         "docs": None if is_production else "/docs",
-        "version": os.getenv("APP_VERSION", "1.1.0")
+        "version": os.getenv("APP_VERSION", "1.1.2")
     }
     return JSONResponse(
         status_code=200 if status_str == "healthy" else 503,
@@ -76,8 +86,9 @@ def read_root():
 @app.get("/api/app/version")
 @app.get("/app/version")
 def get_app_version():
-    version = os.getenv("APP_VERSION", "1.1.0")
-    build_num = int(os.getenv("APP_BUILD_NUMBER", "8"))
+    # FF-05 & FF-31: Default version matching current production release (1.1.2 build 10)
+    version = os.getenv("APP_VERSION", "1.1.2")
+    build_num = int(os.getenv("APP_BUILD_NUMBER", "10"))
     min_version = os.getenv("MIN_SUPPORTED_VERSION", "1.0.0")
     download_url = os.getenv(
         "APP_DOWNLOAD_URL",

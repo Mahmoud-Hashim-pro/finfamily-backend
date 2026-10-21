@@ -30,8 +30,12 @@ if is_sqlite:
         engine_kwargs["poolclass"] = StaticPool
 else:
     # PostgreSQL / Neon pooling configuration
-    engine_kwargs["pool_size"] = int(os.getenv("DB_POOL_SIZE", "10"))
-    engine_kwargs["max_overflow"] = int(os.getenv("DB_MAX_OVERFLOW", "20"))
+    # FF-39: In serverless environments (e.g. Vercel, Lambda), tune pool sizes per worker to avoid pool exhaustion
+    is_serverless = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
+    default_pool_size = "3" if is_serverless else "10"
+    default_max_overflow = "3" if is_serverless else "20"
+    engine_kwargs["pool_size"] = int(os.getenv("DB_POOL_SIZE", default_pool_size))
+    engine_kwargs["max_overflow"] = int(os.getenv("DB_MAX_OVERFLOW", default_max_overflow))
     engine_kwargs["pool_timeout"] = int(os.getenv("DB_POOL_TIMEOUT", "30"))
 
 # Build Engine with connection pooling

@@ -79,9 +79,10 @@ def verify_google_id_token(id_token: str, client_id: Optional[str] = None) -> Di
     except (TypeError, ValueError):
         raise ValueError("Invalid expiration claim in token")
 
-    # 3. Validate audience (Fail Closed: mandatory configuration and match)
+    # 3. Validate audience (Fail Closed: mandatory configuration and match; supports multiple client IDs)
+    allowed_audiences = [cid.strip() for cid in expected_client_id.split(",") if cid.strip()]
     aud = claims.get("aud")
-    if not aud or aud != expected_client_id:
+    if not aud or aud not in allowed_audiences:
         raise ValueError(f"Google ID token audience mismatch: expected {expected_client_id}, got {aud}")
 
     # 4. Enforce verified email

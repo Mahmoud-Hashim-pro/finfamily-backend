@@ -10,7 +10,9 @@
     }
   ],
   "env": {
-    "ADMIN_EMAILS": "modyhashim2006@gmail.com,pro.mahmoud.h@gmail.com,bassantmohamedelramlaw@gmail.com,abdallah.ahmed@finfamily.com,omar.osama.sw.dev@gmail.com,ashayman111@gmail.com,ramezrizkw@gmail.com,zyad.ahmed.softwareeng@gmail.com"
+    "ADMIN_EMAILS": "modyhashim2006@gmail.com,pro.mahmoud.h@gmail.com,bassantmohamedelramlaw@gmail.com,abdallah.ahmed@finfamily.com,omar.osama.sw.dev@gmail.com,ashayman111@gmail.com,ramezrizkw@gmail.com,zyad.ahmed.softwareeng@gmail.com",
+    "APP_VERSION": "1.1.2",
+    "APP_BUILD_NUMBER": "10"
   },
   "routes": [
     {
