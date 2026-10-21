@@ -25,11 +25,11 @@ from core.config import is_production
 # ---------- MFA Secrets Encryption at Rest (BUG-012 & FF-08) ----------
 
 def _get_fernet() -> Fernet:
-    raw_key = os.getenv("MFA_ENCRYPTION_KEY")
+    raw_key = os.getenv("MFA_ENCRYPTION_KEY") or os.getenv("JWT_SECRET")
     if not raw_key:
         if is_production():
-            raise RuntimeError("CRITICAL: MFA_ENCRYPTION_KEY environment variable is required in production and cannot be empty!")
-        raw_key = os.getenv("JWT_SECRET") or "finfamily-mfa-default-encryption-secret-key-2026"
+            raise RuntimeError("CRITICAL: MFA_ENCRYPTION_KEY or JWT_SECRET environment variable is required in production and cannot be empty!")
+        raw_key = "finfamily-mfa-default-encryption-secret-key-2026"
     derived = base64.urlsafe_b64encode(hashlib.sha256(raw_key.encode("utf-8")).digest())
     return Fernet(derived)
 

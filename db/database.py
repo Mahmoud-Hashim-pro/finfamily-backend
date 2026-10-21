@@ -17,6 +17,10 @@ if not SQLALCHEMY_DATABASE_URL:
     # Safe fallback for local development and ephemeral test environments
     SQLALCHEMY_DATABASE_URL = "sqlite:///./finfamily.db"
 
+# Normalizing postgresql schema identifier if needed (e.g., postgres:// -> postgresql://)
+if SQLALCHEMY_DATABASE_URL and SQLALCHEMY_DATABASE_URL.startswith("postgres://"):
+    SQLALCHEMY_DATABASE_URL = SQLALCHEMY_DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 is_sqlite = SQLALCHEMY_DATABASE_URL.startswith("sqlite")
 connect_args = {}
 engine_kwargs = {
