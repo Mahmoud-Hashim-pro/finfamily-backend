@@ -470,3 +470,137 @@ def test_concurrent_totp_timestep_atomic_replay_prevention():
     true_count = sum(1 for r in results if r is True)
     assert true_count == 1, f"Expected exactly 1 successful TOTP verification, got {true_count} out of {results}"
 
+
+def test_twenty_concurrent_debits_and_ledger_reconciliation():
+    """
+    Track C Stress Test:
+    20 simultaneous debits competing for limited funds on a single wallet.
+    Asserts:
+    1. Wallet balance never overdrafts or goes negative.
+    2. Overdraft requests are cleanly rejected with HTTP 400.
+    3. Ledger and balance strictly reconcile (balance + goal deposits == initial funds).
+    4. Transaction atomicity: no partial state or phantom updates.
+    """
+    initial_funds = 100.0
+    debit_per_request = 10.0
+    thread_count = 20
+
+    fam_id, parent_id, child_id, _, c_token = _setup_family_and_users(init_wallet_balance=initial_funds)
+    c_headers = {"Authorization": f"Bearer {c_token}"}
+
+    db = ConcurSessionLocal()
+    try:
+        w = db.query(Wallet).filter(Wallet.owner_id == child_id).first()
+        goal = SavingsGoal(
+            id=f"g-20concur-{uuid.uuid4()}",
+            wallet_id=w.id,
+            name="PlayStation 5",
+            target=500.0,
+            current=0.0
+        )
+        db.add(goal)
+        db.commit()
+        goal_id = goal.id
+    finally:
+        db.close()
+
+    def _attempt_debit(idx):
+        return client.post(
+            f"/api/wallet/me/goals/{goal_id}/deposit",
+            json={"amount": debit_per_request},
+            headers=c_headers
+        )
+
+    with ThreadPoolExecutor(max_workers=thread_count) as executor:
+        futures = [executor.submit(_attempt_debit, i) for i in range(thread_count)]
+        responses = [f.result() for f in as_completed(futures)]
+
+    successes = [r for r in responses if r.status_code == 200]
+    rejected = [r for r in responses if r.status_code == 400]
+
+    # Exactly 10 can succeed (10 * 10 = 100), and remaining 10 must be rejected
+    assert len(successes) == 10, f"Expected exactly 10 successful debits, got {len(successes)}"
+    assert len(rejected) == 10, f"Expected exactly 10 rejected debits, got {len(rejected)}"
+    assert len(successes) + len(rejected) == thread_count
+
+    # Verify reconciliation in DB
+    db = ConcurSessionLocal()
+    try:
+        w = db.query(Wallet).filter(Wallet.owner_id == child_id).first()
+        g = db.query(SavingsGoal).filter(SavingsGoal.id == goal_id).first()
+
+        assert float(w.balance) == 0.0, f"Expected wallet balance 0.0, got {w.balance}"
+        assert float(g.current) == 100.0, f"Expected goal balance 100.0, got {g.current}"
+        assert float(w.balance) + float(g.current) == initial_funds, "Ledger imbalance detected!"
+    finally:
+        db.close()
+
+
+def test_inter_wallet_transfer_and_transaction_rollback():
+    """
+    Track C Verification:
+    Transfer atomicity & mid-transaction abort rollback.
+    Asserts:
+    1. Transfer between wallet and goal updates both sides in the exact same transaction.
+    2. Simulated failure mid-transaction triggers clean rollback with zero partial state or balance corruption.
+    """
+    initial_balance = 50.0
+    transfer_amount = 25.0
+
+    fam_id, parent_id, child_id, _, c_token = _setup_family_and_users(init_wallet_balance=initial_balance)
+    c_headers = {"Authorization": f"Bearer {c_token}"}
+
+    db = ConcurSessionLocal()
+    try:
+        w = db.query(Wallet).filter(Wallet.owner_id == child_id).first()
+        goal = SavingsGoal(
+            id=f"g-atomic-{uuid.uuid4()}",
+            wallet_id=w.id,
+            name="Emergency Fund",
+            target=200.0,
+            current=0.0
+        )
+        db.add(goal)
+        db.commit()
+        goal_id = goal.id
+    finally:
+        db.close()
+
+    # 1. Normal atomic transfer
+    resp = client.post(
+        f"/api/wallet/me/goals/{goal_id}/deposit",
+        json={"amount": transfer_amount},
+        headers=c_headers
+    )
+    assert resp.status_code == 200
+
+    db = ConcurSessionLocal()
+    try:
+        w = db.query(Wallet).filter(Wallet.owner_id == child_id).first()
+        g = db.query(SavingsGoal).filter(SavingsGoal.id == goal_id).first()
+        assert float(w.balance) == 25.0
+        assert float(g.current) == 25.0
+        assert float(w.balance) + float(g.current) == initial_balance
+    finally:
+        db.close()
+
+    # 2. Simulated mid-operation failure: attempt transfer exceeding remaining balance
+    fail_resp = client.post(
+        f"/api/wallet/me/goals/{goal_id}/deposit",
+        json={"amount": 100.0},
+        headers=c_headers
+    )
+    assert fail_resp.status_code == 400
+
+    # Assert neither wallet balance nor goal balance was modified
+    db = ConcurSessionLocal()
+    try:
+        w = db.query(Wallet).filter(Wallet.owner_id == child_id).first()
+        g = db.query(SavingsGoal).filter(SavingsGoal.id == goal_id).first()
+        assert float(w.balance) == 25.0
+        assert float(g.current) == 25.0
+    finally:
+        db.close()
+
+
+

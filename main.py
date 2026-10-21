@@ -131,11 +131,12 @@ def verify_database_readiness(target_engine, is_production_mode: bool = False) -
 
             # 4. Verify Alembic schema migration tracking
             if "alembic_version" in tables:
-                row = conn.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).fetchone()
-                if not row or not row[0]:
+                rows = conn.execute(text("SELECT version_num FROM alembic_version")).fetchall()
+                applied_revs = {str(r[0]).strip() for r in rows if r and r[0]}
+                if not applied_revs:
                     return False, "Alembic version table exists but contains no applied revision."
-                current_rev = str(row[0]).strip()
-                expected_heads = {"0002_idemp_mfa_atomic"}
+
+                expected_heads = set()
                 try:
                     import os
                     from alembic.config import Config
@@ -147,12 +148,17 @@ def verify_database_readiness(target_engine, is_production_mode: bool = False) -
                         dynamic_heads = set(script_dir.get_heads())
                         if dynamic_heads:
                             expected_heads = dynamic_heads
-                except Exception:
-                    pass
+                except Exception as ex:
+                    if is_production_mode:
+                        return False, f"Failed to inspect Alembic migration heads in production: {ex}"
 
-                if current_rev not in expected_heads:
+                if not expected_heads:
+                    expected_heads = {"0002_idemp_mfa_atomic"}
+
+                if not applied_revs.issubset(expected_heads) and not expected_heads.issubset(applied_revs):
+                    applied_str = "', '".join(sorted(applied_revs))
                     heads_str = "', '".join(sorted(expected_heads))
-                    return False, f"Database schema is behind: current revision '{current_rev}', expected '{heads_str}'."
+                    return False, f"Database schema is behind: applied revision(s) '{applied_str}', expected head(s) '{heads_str}'."
             elif is_production_mode:
                 return False, "Production database is missing 'alembic_version' migration tracking table."
 

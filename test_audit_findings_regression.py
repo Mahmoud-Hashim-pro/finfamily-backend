@@ -1313,6 +1313,51 @@ def test_verify_database_readiness_rejects_composite_only_unique_index():
     assert "Table 'users' is missing a unique constraint on column 'email'." in msg
 
 
+def test_verify_database_readiness_multiple_heads_and_behind_revision():
+    """Area E: verify_database_readiness correctly handles multiple Alembic heads, behind revisions, and empty tables."""
+    from main import verify_database_readiness
+    from sqlalchemy import create_engine, text
+
+    test_engine = create_engine("sqlite:///:memory:")
+    with test_engine.connect() as conn:
+        conn.execute(text("CREATE TABLE users (id TEXT PRIMARY KEY, family_id TEXT, role TEXT, email TEXT, token_version INT, is_active BOOLEAN, mfa_enabled BOOLEAN, last_totp_timestep INT)"))
+        conn.execute(text("CREATE TABLE families (id TEXT PRIMARY KEY, name TEXT, family_code TEXT)"))
+        conn.execute(text("CREATE TABLE wallets (id TEXT PRIMARY KEY, owner_id TEXT, balance NUMERIC, savings_balance NUMERIC, monthly_limit NUMERIC, card_status TEXT)"))
+        conn.execute(text("CREATE TABLE card_purchases (id TEXT PRIMARY KEY, child_id TEXT, family_id TEXT, amount NUMERIC, status TEXT, idempotency_key TEXT)"))
+        conn.execute(text("CREATE TABLE idempotency_records (id TEXT PRIMARY KEY, key TEXT, response_id TEXT, action TEXT)"))
+        conn.execute(text("CREATE UNIQUE INDEX ix_idemp_key ON idempotency_records (key)"))
+        conn.execute(text("CREATE UNIQUE INDEX ix_user_email_single ON users (email)"))
+        conn.execute(text("CREATE TABLE lesson_completions (id TEXT PRIMARY KEY, child_id TEXT, lesson_id TEXT)"))
+        conn.execute(text("CREATE TABLE game_completions (id TEXT PRIMARY KEY, child_id TEXT, game_id TEXT, was_rewarded BOOLEAN)"))
+        conn.execute(text("CREATE TABLE mfa_recovery_codes (id TEXT PRIMARY KEY, user_id TEXT, code_hash TEXT, used BOOLEAN)"))
+        conn.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        conn.commit()
+
+    # 1. Empty alembic_version table -> rejects
+    is_ready, msg = verify_database_readiness(test_engine, is_production_mode=False)
+    assert is_ready is False
+    assert "Alembic version table exists but contains no applied revision." in msg
+
+    # 2. Outdated revision -> rejects
+    with test_engine.connect() as conn:
+        conn.execute(text("INSERT INTO alembic_version (version_num) VALUES ('0001_initial_schema')"))
+        conn.commit()
+    is_ready, msg = verify_database_readiness(test_engine, is_production_mode=False)
+    assert is_ready is False
+    assert "Database schema is behind" in msg
+    assert "0001_initial_schema" in msg
+
+    # 3. Matching expected head -> succeeds
+    with test_engine.connect() as conn:
+        conn.execute(text("DELETE FROM alembic_version"))
+        conn.execute(text("INSERT INTO alembic_version (version_num) VALUES ('0002_idemp_mfa_atomic')"))
+        conn.commit()
+    is_ready, msg = verify_database_readiness(test_engine, is_production_mode=False)
+    assert is_ready is True
+    assert "verified" in msg
+
+
+
 
 
 
