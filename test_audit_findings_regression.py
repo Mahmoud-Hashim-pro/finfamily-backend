@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 os.environ["ENVIRONMENT"] = "test"
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 os.environ["JWT_SECRET"] = "test-ci-secret-key-at-least-32-bytes-secure"
-os.environ["ADMIN_EMAILS"] = "admin@finfamily.com,supervisor@finfamily.com,modyhashim2006@gmail.com"
+os.environ["ADMIN_EMAILS"] = "admin@finfamily.com,supervisor@finfamily.com"
 os.environ["APP_VERSION"] = "1.1.2"
 os.environ["APP_BUILD_NUMBER"] = "10"
 
@@ -246,12 +246,13 @@ def test_ff06_direct_totp_password_login_with_encrypted_secret():
 
 def test_ff07_parent_token_blocked_from_admin_portal():
     """FF-07: An allowlisted user with a parent session token cannot access admin routes."""
-    # modyhashim2006@gmail.com is in the admin allowlist
+    # Ensure allowlist contains admin@finfamily.com
+    os.environ["ADMIN_EMAILS"] = "admin@finfamily.com,supervisor@finfamily.com"
     parent_token = create_access_token(
         user_id="allowlisted-parent-uuid",
         family_id="any-family-uuid",
         role="parent",
-        email="modyhashim2006@gmail.com",
+        email="admin@finfamily.com",
         token_version=1,
     )
 
@@ -264,7 +265,7 @@ def test_ff07_parent_token_blocked_from_admin_portal():
         family_id=fam.id,
         role=UserRole.parent,
         full_name="Allowlisted Admin/Parent",
-        email="modyhashim2006@gmail.com",
+        email="admin@finfamily.com",
         is_active=True,
         token_version=1,
     )
