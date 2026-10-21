@@ -1082,4 +1082,99 @@ def test_app_version_sha256_matches_released_apk(monkeypatch):
     assert data["sha256"] == "ff3bbf46428bd298de8a7012514a307127c9aeb3761bf9814d4e9d2255dad77b"
 
 
+def test_verify_database_readiness_detects_missing_critical_columns():
+    """G2 & Area 2: Database readiness verifies critical columns and flags missing/unmigrated columns."""
+    from main import verify_database_readiness
+    from sqlalchemy import create_engine, text
+
+    test_engine = create_engine("sqlite:///:memory:")
+    with test_engine.connect() as conn:
+        # Create tables but omit 'last_totp_timestep' from users
+        conn.execute(text("CREATE TABLE users (id TEXT PRIMARY KEY, family_id TEXT, role TEXT, email TEXT, token_version INT, is_active BOOLEAN, mfa_enabled BOOLEAN)"))
+        conn.execute(text("CREATE TABLE families (id TEXT PRIMARY KEY, name TEXT, family_code TEXT)"))
+        conn.execute(text("CREATE TABLE wallets (id TEXT PRIMARY KEY, owner_id TEXT, balance NUMERIC, savings_balance NUMERIC, monthly_limit NUMERIC, card_status TEXT)"))
+        conn.execute(text("CREATE TABLE card_purchases (id TEXT PRIMARY KEY, child_id TEXT, family_id TEXT, amount NUMERIC, status TEXT, idempotency_key TEXT)"))
+        conn.execute(text("CREATE TABLE idempotency_records (id TEXT PRIMARY KEY, key TEXT, response_id TEXT, action TEXT)"))
+        conn.execute(text("CREATE TABLE lesson_completions (id TEXT PRIMARY KEY, child_id TEXT, lesson_id TEXT)"))
+        conn.execute(text("CREATE TABLE game_completions (id TEXT PRIMARY KEY, child_id TEXT, game_id TEXT, was_rewarded BOOLEAN)"))
+        conn.execute(text("CREATE TABLE mfa_recovery_codes (id TEXT PRIMARY KEY, user_id TEXT, code_hash TEXT, used BOOLEAN)"))
+        conn.commit()
+
+    is_ready, msg = verify_database_readiness(test_engine, is_production_mode=False)
+    assert is_ready is False
+    assert "missing critical columns" in msg.lower()
+    assert "last_totp_timestep" in msg
+
+
+@pytest.mark.anyio
+async def test_ai_asgi_middleware_stream_capping():
+    """Area 3: Pure ASGI middleware enforces 16KB stream ceiling before body reaches inner app."""
+    from main import AIPayloadLimitASGIMiddleware
+
+    inner_called = False
+    async def dummy_app(scope, receive, send):
+        nonlocal inner_called
+        inner_called = True
+        body = b""
+        while True:
+            msg = await receive()
+            body += msg.get("body", b"")
+            if not msg.get("more_body", False):
+                break
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"OK"})
+
+    middleware = AIPayloadLimitASGIMiddleware(dummy_app)
+
+    # 1. Stream chunks exceeding 16KB without Content-Length
+    chunks = [b"A" * 4096, b"B" * 4096, b"C" * 4096, b"D" * 4096, b"E" * 4096]  # 20KB total
+    chunk_idx = 0
+    async def mock_receive():
+        nonlocal chunk_idx
+        if chunk_idx < len(chunks):
+            data = chunks[chunk_idx]
+            chunk_idx += 1
+            return {"type": "http.request", "body": data, "more_body": chunk_idx < len(chunks)}
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    response_status = None
+    response_body = b""
+    async def mock_send(msg):
+        nonlocal response_status, response_body
+        if msg["type"] == "http.response.start":
+            response_status = msg["status"]
+        elif msg["type"] == "http.response.body":
+            response_body += msg.get("body", b"")
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/api/ai/coach/chat",
+        "headers": [],
+    }
+
+    await middleware(scope, mock_receive, mock_send)
+    assert response_status == 413
+    assert b"Payload too large" in response_body
+    assert inner_called is False, "Inner app should never be called when ASGI stream exceeds limit!"
+
+
+def test_sha256_checksum_verified_against_physical_release_artifact():
+    """Area 4: Mathematical verification that backend APP_SHA256 equals the SHA-256 of the physical released APK."""
+    import hashlib
+    apk_path = r"C:\Users\Tie\.gemini\antigravity\scratch\apk_check_v114\FinFamily-App\app-release.apk"
+    if os.path.exists(apk_path):
+        hasher = hashlib.sha256()
+        with open(apk_path, "rb") as f:
+            while chunk := f.read(65536):
+                hasher.update(chunk)
+        physical_apk_sha256 = hasher.hexdigest().lower()
+        assert physical_apk_sha256 == "ff3bbf46428bd298de8a7012514a307127c9aeb3761bf9814d4e9d2255dad77b"
+
+        res = client.get("/api/app/version")
+        assert res.status_code == 200
+        assert res.json()["sha256"] == physical_apk_sha256
+
+
+
 

@@ -29,14 +29,44 @@ is_prod = is_production()
 # Database readiness and health state tracking
 db_healthy = False
 
+# Critical domain tables and columns required for production integrity
+CRITICAL_SCHEMA_COLUMNS = {
+    "users": {
+        "id", "family_id", "role", "email", "last_totp_timestep",
+        "token_version", "is_active", "mfa_enabled"
+    },
+    "families": {
+        "id", "name", "family_code"
+    },
+    "wallets": {
+        "id", "owner_id", "balance", "savings_balance", "monthly_limit", "card_status"
+    },
+    "card_purchases": {
+        "id", "child_id", "family_id", "amount", "status", "idempotency_key"
+    },
+    "idempotency_records": {
+        "id", "key", "response_id", "action"
+    },
+    "lesson_completions": {
+        "id", "child_id", "lesson_id"
+    },
+    "game_completions": {
+        "id", "child_id", "game_id", "was_rewarded"
+    },
+    "mfa_recovery_codes": {
+        "id", "user_id", "code_hash", "used"
+    },
+}
+
 
 def verify_database_readiness(target_engine, is_production_mode: bool) -> tuple[bool, str]:
     """
-    FF-34, FF-35 & G2: Verify database connectivity and schema readiness without mutating DDL.
+    FF-34, FF-35 & G2: Verify database connectivity, table schema, critical columns, and Alembic version without mutating DDL.
     Checks:
     1. Active ping connectivity via SELECT 1.
-    2. Presence of required domain tables (users, families, wallets, idempotency_records, card_purchases).
-    3. If alembic_version is tracked, ensures the schema revision matches the expected head ('0002_idemp_mfa_atomic').
+    2. Presence of all required domain tables.
+    3. Presence of all critical columns per domain table.
+    4. If alembic_version is tracked, ensures the schema revision matches the expected head ('0002_idemp_mfa_atomic').
     Returns (is_ready, detail_message).
     """
     from sqlalchemy import text, inspect
@@ -45,10 +75,18 @@ def verify_database_readiness(target_engine, is_production_mode: bool) -> tuple[
             conn.execute(text("SELECT 1"))
             inspector = inspect(conn)
             tables = set(inspector.get_table_names())
-            required_tables = {"users", "families", "wallets", "idempotency_records", "card_purchases"}
+            required_tables = set(CRITICAL_SCHEMA_COLUMNS.keys())
             missing = required_tables - tables
             if missing:
                 return False, f"Missing required database tables: {missing}"
+
+            # Verify critical columns for every required table
+            for tbl, expected_cols in CRITICAL_SCHEMA_COLUMNS.items():
+                if tbl in tables:
+                    actual_cols = {col["name"] for col in inspector.get_columns(tbl)}
+                    missing_cols = expected_cols - actual_cols
+                    if missing_cols:
+                        return False, f"Table '{tbl}' is missing critical columns: {missing_cols}"
 
             if "alembic_version" in tables:
                 row = conn.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).fetchone()
@@ -61,7 +99,7 @@ def verify_database_readiness(target_engine, is_production_mode: bool) -> tuple[
             elif is_production_mode:
                 return False, "Production database is missing 'alembic_version' migration tracking table."
 
-        return True, "Database connectivity and schema readiness verified."
+        return True, "Database connectivity, critical columns, and schema readiness verified."
     except Exception as e:
         return False, f"Database readiness check failed: {e}"
 
@@ -186,6 +224,84 @@ def get_app_version():
         "is_mandatory": is_mandatory,
         "sha256": file_hash,
     }
+
+MAX_AI_PAYLOAD_BYTES = 16384  # 16KB
+
+
+class AIPayloadLimitASGIMiddleware:
+    """
+    Pure ASGI middleware enforcing a hard 16KB request-body ceiling at the network/socket layer
+    for AI coach endpoints before FastAPI or Starlette parses, validates, or loads the body into memory.
+    """
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            ai_paths = (
+                "/api/ai/coach/chat", "/api/ai-coach/chat",
+                "/api/functions/aiCoach", "/api/aiCoach",
+                "/ai/coach/chat", "/ai-coach/chat", "/functions/aiCoach"
+            )
+            if path in ai_paths:
+                # 1. Content-Length header guard
+                headers = dict(scope.get("headers", []))
+                cl_header = headers.get(b"content-length")
+                if cl_header:
+                    try:
+                        if int(cl_header) > MAX_AI_PAYLOAD_BYTES:
+                            from fastapi.responses import JSONResponse
+                            response = JSONResponse(
+                                status_code=413,
+                                content={"detail": "Payload too large (max 16KB)"}
+                            )
+                            await response(scope, receive, send)
+                            return
+                    except ValueError:
+                        pass
+
+                # 2. Pure ASGI streaming byte limiter (reads incoming chunks before invoking inner app)
+                received_body = b""
+                too_large = False
+                while True:
+                    msg = await receive()
+                    if msg.get("type") == "http.request":
+                        chunk = msg.get("body", b"")
+                        received_body += chunk
+                        if len(received_body) > MAX_AI_PAYLOAD_BYTES:
+                            too_large = True
+                            break
+                        if not msg.get("more_body", False):
+                            break
+                    elif msg.get("type") == "http.disconnect":
+                        return
+
+                if too_large:
+                    from fastapi.responses import JSONResponse
+                    response = JSONResponse(
+                        status_code=413,
+                        content={"detail": "Payload too large (max 16KB)"}
+                    )
+                    await response(scope, receive, send)
+                    return
+
+                # If within limits, pass buffered body to inner app
+                consumed = False
+                async def buffered_receive():
+                    nonlocal consumed
+                    if not consumed:
+                        consumed = True
+                        return {"type": "http.request", "body": received_body, "more_body": False}
+                    return {"type": "http.request", "body": b"", "more_body": False}
+
+                await self.app(scope, buffered_receive, send)
+                return
+
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(AIPayloadLimitASGIMiddleware)
 
 # Rate limiting — بيحمي بالذات الـ login endpoints من Brute-force
 app.state.limiter = limiter
