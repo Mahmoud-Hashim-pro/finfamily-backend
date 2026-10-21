@@ -343,9 +343,10 @@ def get_admin_overview(admin: User = Depends(require_admin), db: Session = Depen
     deactivated_cards = db.query(Wallet).filter(Wallet.card_status == CardStatus.deactivated).count()
 
     # System Liquidity (EGP)
-    wallets_balance_sum = db.query(func.coalesce(func.sum(Wallet.balance), 0.0)).scalar() or 0.0
-    savings_balance_sum = db.query(func.coalesce(func.sum(Wallet.savings_balance), 0.0)).scalar() or 0.0
-    total_system_liquidity = float(wallets_balance_sum + savings_balance_sum)
+    from decimal import Decimal
+    wallets_balance_sum = db.query(func.coalesce(func.sum(Wallet.balance), 0)).scalar() or 0
+    savings_balance_sum = db.query(func.coalesce(func.sum(Wallet.savings_balance), 0)).scalar() or 0
+    total_system_liquidity = float(Decimal(str(wallets_balance_sum)) + Decimal(str(savings_balance_sum)))
 
     # Transactions & Purchases count
     total_transactions = db.query(Transaction).count()

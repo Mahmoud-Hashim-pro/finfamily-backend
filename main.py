@@ -135,9 +135,24 @@ def verify_database_readiness(target_engine, is_production_mode: bool = False) -
                 if not row or not row[0]:
                     return False, "Alembic version table exists but contains no applied revision."
                 current_rev = str(row[0]).strip()
-                EXPECTED_HEAD_REV = "0002_idemp_mfa_atomic"
-                if current_rev != EXPECTED_HEAD_REV:
-                    return False, f"Database schema is behind: current revision '{current_rev}', expected '{EXPECTED_HEAD_REV}'."
+                expected_heads = {"0002_idemp_mfa_atomic"}
+                try:
+                    import os
+                    from alembic.config import Config
+                    from alembic.script import ScriptDirectory
+                    alembic_ini = os.path.abspath(os.path.join(os.path.dirname(__file__), "alembic.ini"))
+                    if os.path.exists(alembic_ini):
+                        cfg = Config(alembic_ini)
+                        script_dir = ScriptDirectory.from_config(cfg)
+                        dynamic_heads = set(script_dir.get_heads())
+                        if dynamic_heads:
+                            expected_heads = dynamic_heads
+                except Exception:
+                    pass
+
+                if current_rev not in expected_heads:
+                    heads_str = "', '".join(sorted(expected_heads))
+                    return False, f"Database schema is behind: current revision '{current_rev}', expected '{heads_str}'."
             elif is_production_mode:
                 return False, "Production database is missing 'alembic_version' migration tracking table."
 

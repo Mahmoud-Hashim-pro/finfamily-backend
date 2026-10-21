@@ -249,6 +249,233 @@ def test_admin_login_auth_and_no_enumeration():
     print("PASS: BUG-003 & BUG-126 - Admin login enforces auth, mandatory MFA enrollment, 5/min rate limit, and returns generic 401.")
 
 
+def test_admin_mfa_scenarios_and_security_guarantees():
+    """
+    Exhaustive verification of Section 3.أ & Section 4 requirements:
+    1. New admin account completes mandatory MFA enrollment on first login.
+    2. Enrolled admin logs in successfully with valid TOTP code.
+    3. Replay attack rejection: previously used TOTP code is rejected immediately (both in-process & across instances).
+    4. Recovery code is single-use only: accepted once, rejected on replay, cross-account consumption blocked.
+    5. Expired temporary token prevents enrollment and login.
+    6. Temporary token is rejected on protected admin endpoints.
+    7. Non-allowlisted user rejected without enumeration.
+    """
+    from datetime import timedelta
+    import hashlib
+    import pyotp
+    from core.limiter import limiter
+    from core import mfa
+    from db.models import MfaRecoveryCode
+
+    limiter._storage.reset()
+    data = setup_test_data()
+    db = Session(bind=engine)
+
+    try:
+        # -----------------------------------------------------------------
+        # 1. New Admin Account (mfa_enabled=False) -> Mandatory Enrollment
+        # -----------------------------------------------------------------
+        login_res = client.post("/api/admin/auth/login", json={
+            "email": "admin@finfamily.com",
+            "password": "AdminPass123!"
+        })
+        assert login_res.status_code == 200, f"Login failed: {login_res.text}"
+        enroll_data = login_res.json()
+        assert enroll_data.get("mfa_required") is True
+        assert enroll_data.get("mfa_enrollment_required") is True
+        assert "access_token" in enroll_data
+        assert "secret" in enroll_data
+        assert "provisioning_uri" in enroll_data
+        assert "admin" not in enroll_data  # Zero administrative privilege before MFA
+
+        enroll_temp_token = enroll_data["access_token"]
+        enroll_secret = enroll_data["secret"]
+
+        # 6a. Attempt to access protected admin endpoint with enrollment temp token -> MUST be rejected
+        blocked_res = client.get("/api/admin/overview", headers={"Authorization": f"Bearer {enroll_temp_token}"})
+        assert blocked_res.status_code in (401, 403), f"Temp token accessed protected endpoint: {blocked_res.text}"
+
+        # 1a. Submitting invalid TOTP code during enrollment -> MUST fail
+        bad_code_res = client.post("/api/admin/auth/mfa/verify", json={
+            "temp_token": enroll_temp_token,
+            "code": "000000"
+        })
+        assert bad_code_res.status_code == 401, f"Invalid code accepted: {bad_code_res.text}"
+
+        # 1b. Complete enrollment with valid TOTP code
+        enroll_code = pyotp.TOTP(enroll_secret).now()
+        verify_enroll = client.post("/api/admin/auth/mfa/verify", json={
+            "temp_token": enroll_temp_token,
+            "code": enroll_code
+        })
+        assert verify_enroll.status_code == 200, f"Enrollment verification failed: {verify_enroll.text}"
+        enroll_result = verify_enroll.json()
+        assert "access_token" in enroll_result
+        assert enroll_result["admin"]["role"] == "admin"
+        assert "recovery_codes" in enroll_result
+        recovery_codes = enroll_result["recovery_codes"]
+        assert len(recovery_codes) == 10, f"Expected 10 recovery codes, got {len(recovery_codes)}"
+
+        # Verify DB state: admin is now mfa_enabled=True, mfa_pending_secret cleared
+        admin_db = db.query(User).filter(User.email == "admin@finfamily.com").first()
+        assert admin_db.mfa_enabled is True
+        assert admin_db.mfa_pending_secret is None
+
+        # -----------------------------------------------------------------
+        # 2. Enrolled Admin Logs In with Correct TOTP Code
+        # -----------------------------------------------------------------
+        limiter._storage.reset()
+        sup_login = client.post("/api/admin/auth/login", json={
+            "email": "supervisor@finfamily.com",
+            "password": "SupervisorPass123!"
+        })
+        assert sup_login.status_code == 200
+        sup_data = sup_login.json()
+        assert sup_data.get("mfa_required") is True
+        assert sup_data.get("mfa_enrollment_required") is False
+        assert "admin" not in sup_data
+        sup_temp_token = sup_data["access_token"]
+
+        # 6b. Attempt to access protected endpoint with challenge temp token -> MUST be rejected
+        sup_blocked = client.get("/api/admin/overview", headers={"Authorization": f"Bearer {sup_temp_token}"})
+        assert sup_blocked.status_code in (401, 403)
+
+        # Successful verification with valid TOTP code
+        sup_secret = "JBSWY3DPEHPK3PXP"
+        sup_code = pyotp.TOTP(sup_secret).now()
+        sup_verify = client.post("/api/admin/auth/mfa/verify", json={
+            "temp_token": sup_temp_token,
+            "code": sup_code
+        })
+        assert sup_verify.status_code == 200
+        sup_result = sup_verify.json()
+        assert sup_result["admin"]["role"] == "admin"
+        sup_admin_token = sup_result["access_token"]
+
+        # Verify full access to protected overview endpoint
+        overview_res = client.get("/api/admin/overview", headers={"Authorization": f"Bearer {sup_admin_token}"})
+        assert overview_res.status_code == 200, f"Admin overview access failed: {overview_res.text}"
+
+        # -----------------------------------------------------------------
+        # 3. TOTP Replay Attack Rejection
+        # -----------------------------------------------------------------
+        # Obtain a fresh temp token for supervisor
+        limiter._storage.reset()
+        sup_login_replay = client.post("/api/admin/auth/login", json={
+            "email": "supervisor@finfamily.com",
+            "password": "SupervisorPass123!"
+        })
+        fresh_temp_token = sup_login_replay.json()["access_token"]
+
+        # Re-submitting the exact same sup_code that was just used -> MUST be rejected as replay
+        replay_verify = client.post("/api/admin/auth/mfa/verify", json={
+            "temp_token": fresh_temp_token,
+            "code": sup_code
+        })
+        assert replay_verify.status_code == 401, f"Replayed TOTP code was accepted! Status: {replay_verify.status_code}"
+        assert replay_verify.json()["detail"] == "Invalid authentication code"
+
+        # Also verify durable cross-instance rejection helper directly
+        sup_user = db.query(User).filter(User.email == "supervisor@finfamily.com").first()
+        assert mfa.verify_totp(sup_user.mfa_secret, sup_code, user_id=sup_user.id, db=db) is False
+
+        # -----------------------------------------------------------------
+        # 4. Recovery Code: Single-Use Only and Cross-Account Isolation
+        # -----------------------------------------------------------------
+        valid_rec_code = recovery_codes[0]
+
+        # Login admin@finfamily.com to get challenge token
+        limiter._storage.reset()
+        admin_login_rec = client.post("/api/admin/auth/login", json={
+            "email": "admin@finfamily.com",
+            "password": "AdminPass123!"
+        })
+        admin_rec_temp = admin_login_rec.json()["access_token"]
+
+        # First use of recovery code -> MUST succeed
+        rec_verify_1 = client.post("/api/admin/auth/mfa/verify", json={
+            "temp_token": admin_rec_temp,
+            "code": valid_rec_code
+        })
+        assert rec_verify_1.status_code == 200, f"Recovery code verification failed: {rec_verify_1.text}"
+        assert rec_verify_1.json()["admin"]["role"] == "admin"
+
+        # Verify in DB that the recovery code is now marked used
+        db.expire_all()
+        normalized_code = mfa.normalize_recovery_code(valid_rec_code)
+        code_digest = f"sha256:{hashlib.sha256(normalized_code.encode('utf-8')).hexdigest()}"
+        consumed_rec = db.query(MfaRecoveryCode).filter(
+            MfaRecoveryCode.user_id == admin_db.id,
+            MfaRecoveryCode.code_hash == code_digest
+        ).first()
+        assert consumed_rec is not None
+        assert consumed_rec.used is True
+
+        # Second use of same recovery code on a new login -> MUST fail
+        limiter._storage.reset()
+        admin_login_rec_2 = client.post("/api/admin/auth/login", json={
+            "email": "admin@finfamily.com",
+            "password": "AdminPass123!"
+        })
+        admin_rec_temp_2 = admin_login_rec_2.json()["access_token"]
+
+        rec_verify_2 = client.post("/api/admin/auth/mfa/verify", json={
+            "temp_token": admin_rec_temp_2,
+            "code": valid_rec_code
+        })
+        assert rec_verify_2.status_code == 401, "Used recovery code was accepted a second time!"
+
+        # Cross-account isolation: Supervisor cannot use Admin's unused recovery code
+        unused_rec_code = recovery_codes[1]
+        limiter._storage.reset()
+        sup_login_cross = client.post("/api/admin/auth/login", json={
+            "email": "supervisor@finfamily.com",
+            "password": "SupervisorPass123!"
+        })
+        sup_cross_temp = sup_login_cross.json()["access_token"]
+        cross_res = client.post("/api/admin/auth/mfa/verify", json={
+            "temp_token": sup_cross_temp,
+            "code": unused_rec_code
+        })
+        assert cross_res.status_code == 401, "Recovery code from user A was accepted for user B!"
+
+        # -----------------------------------------------------------------
+        # 5. Expired Temporary Token Prevents Verification
+        # -----------------------------------------------------------------
+        expired_token = create_access_token(
+            data={
+                "sub": admin_db.id,
+                "role": "mfa_pending",
+                "target_role": "admin",
+                "email": "admin@finfamily.com",
+                "type": "mfa_challenge"
+            },
+            expires_delta=timedelta(seconds=-60)
+        )
+        plain_admin_secret = mfa.decrypt_mfa_secret(admin_db.mfa_secret)
+        exp_res = client.post("/api/admin/auth/mfa/verify", json={
+            "temp_token": expired_token,
+            "code": pyotp.TOTP(plain_admin_secret).now()
+        })
+        assert exp_res.status_code == 401, f"Expired temporary token was accepted! Status: {exp_res.status_code}"
+        assert "expired" in exp_res.json()["detail"].lower()
+
+        # -----------------------------------------------------------------
+        # 7. Non-Allowlisted User Rejected Without Enumeration
+        # -----------------------------------------------------------------
+        limiter._storage.reset()
+        unauth_login = client.post("/api/admin/auth/login", json={
+            "email": "outsider@notallowlisted.com",
+            "password": "Password123!"
+        })
+        assert unauth_login.status_code == 401
+        assert unauth_login.json()["detail"] == "Invalid admin credentials."
+
+    finally:
+        db.close()
+        limiter._storage.reset()
+
+
 def test_admin_card_status_audit_attribution():
     """BUG-128: Admin card status override must attribute family_id so it appears in family audit logs."""
     data = setup_test_data()
