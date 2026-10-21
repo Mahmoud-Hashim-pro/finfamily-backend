@@ -342,6 +342,45 @@ def test_migration_upgrade_from_legacy_schema():
             pass
 
 
+def test_migration_upgrade_from_0001_to_0002_forward_only():
+    """Verify that a database currently at 0001_numeric_and_isolation cleanly upgrades to 0002."""
+    fd, temp_db = tempfile.mkstemp(suffix="_upg0001.db")
+    os.close(fd)
+    db_url = f"sqlite:///{temp_db}"
+
+    try:
+        cfg = get_alembic_config(db_url)
+        # 1. Upgrade specifically to 0001
+        command.upgrade(cfg, "0001_numeric_and_isolation")
+
+        engine = sa.create_engine(db_url)
+        inspector = sa.inspect(engine)
+        user_cols = {c["name"] for c in inspector.get_columns("users")}
+        assert "last_totp_timestep" not in user_cols
+
+        # 2. Upgrade to head (which applies 0002)
+        command.upgrade(cfg, "head")
+
+        inspector = sa.inspect(engine)
+        user_cols_after = {c["name"] for c in inspector.get_columns("users")}
+        assert "last_totp_timestep" in user_cols_after
+
+        card_cols_after = {c["name"] for c in inspector.get_columns("card_purchases")}
+        assert "idempotency_key" in card_cols_after
+
+        idem_cols_after = {c["name"] for c in inspector.get_columns("idempotency_records")}
+        assert "response_id" in idem_cols_after
+        engine.dispose()
+    finally:
+        import gc
+        gc.collect()
+        try:
+            if os.path.exists(temp_db):
+                os.remove(temp_db)
+        except OSError:
+            pass
+
+
 def test_migration_safe_downgrade_policy():
     """Verify that attempting to downgrade raises RuntimeError to prevent accidental data destruction."""
     fd, temp_db = tempfile.mkstemp(suffix="_downgrade.db")

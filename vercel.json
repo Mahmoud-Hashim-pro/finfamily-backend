@@ -11,8 +11,8 @@
   ],
   "env": {
     "ADMIN_EMAILS": "modyhashim2006@gmail.com,pro.mahmoud.h@gmail.com,bassantmohamedelramlaw@gmail.com,abdallah.ahmed@finfamily.com,omar.osama.sw.dev@gmail.com,ashayman111@gmail.com,ramezrizkw@gmail.com,zyad.ahmed.softwareeng@gmail.com",
-    "APP_VERSION": "1.1.3",
-    "APP_BUILD_NUMBER": "11"
+    "APP_VERSION": "1.1.4",
+    "APP_BUILD_NUMBER": "12"
   },
   "routes": [
     {

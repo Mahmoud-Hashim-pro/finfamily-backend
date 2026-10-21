@@ -128,6 +128,7 @@ def setup_test_data():
 def test_admin_allowlist_solely_from_env():
     """BUG-008: Verify admin allowlist is solely driven by ADMIN_EMAILS without hardcoded fallbacks."""
     # Test 1: Configured allowlist
+    os.environ["ADMIN_EMAILS"] = "admin@finfamily.com,supervisor@finfamily.com"
     allowlist = admin_routes.get_admin_allowlist()
     assert "admin@finfamily.com" in allowlist
     assert "supervisor@finfamily.com" in allowlist

@@ -76,7 +76,7 @@ def read_root():
         "status": status_str,
         "service": "FinFamily API",
         "docs": None if is_production else "/docs",
-        "version": os.getenv("APP_VERSION", "1.1.3")
+        "version": os.getenv("APP_VERSION", "1.1.4")
     }
     return JSONResponse(
         status_code=200 if status_str == "healthy" else 503,
@@ -87,18 +87,18 @@ def read_root():
 @app.get("/api/app/version")
 @app.get("/app/version")
 def get_app_version():
-    # FF-05 & FF-31: Default version matching current production release (1.1.3 build 11)
-    version = os.getenv("APP_VERSION", "1.1.3")
-    build_num = int(os.getenv("APP_BUILD_NUMBER", "11"))
+    # FF-05 & FF-31: Default version matching current production release (1.1.4 build 12)
+    version = os.getenv("APP_VERSION", "1.1.4")
+    build_num = int(os.getenv("APP_BUILD_NUMBER", "12"))
     min_version = os.getenv("MIN_SUPPORTED_VERSION", "1.0.0")
     download_url = os.getenv(
         "APP_DOWNLOAD_URL",
-        "https://github.com/Mahmoud-Hashim-pro/finfamily-mobile-app/releases/latest/download/app-release.apk"
+        f"https://github.com/Mahmoud-Hashim-pro/finfamily-mobile-app/releases/download/v{version}/app-release.apk"
     )
     is_mandatory = os.getenv("APP_IS_MANDATORY", "false").strip().lower() in ("true", "1", "yes")
     release_notes = os.getenv(
         "APP_RELEASE_NOTES",
-        "إصدار رسمي v1.1.0: تسجيل الدخول عبر Google، الحفاظ التام على الجلسة ومنع فقدان الحساب عند إغلاق التطبيق، سياسات العزل الصارمة بين العائلات، وترقيات أمان شاملة."
+        f"إصدار رسمي v{version} (Build {build_num}): تحسينات أمان شاملة، توثيق صارم لمسارات حذف الحساب، ترقيات ذرية لرموز MFA لمنع هجمات Replay، وحماية من تكرار المعاملات المالية."
     )
     file_hash = os.getenv("APP_SHA256", "")
 

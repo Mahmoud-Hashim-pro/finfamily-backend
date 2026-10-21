@@ -79,6 +79,7 @@ def test_bug_001_mfa_pending_token_rejected_on_protected_routes():
 
 def test_bug_002_and_006_admin_email_registration_blocked():
     print("Testing BUG-002 & BUG-006: Block registration of allowlisted admin emails (case insensitive)...")
+    os.environ["ADMIN_EMAILS"] = "admin@finfamily.com,supervisor@finfamily.com,modyhashim2006@gmail.com"
     admin_emails = [
         "admin@finfamily.com",
         "ADMIN@FINFAMILY.COM",
@@ -347,8 +348,8 @@ def test_bug_057_child_pin_reset_and_account_deletion():
     res = client.post("/api/auth/child/login", json={"family_code": family_code, "child_id": child_id, "pin": "222222"})
     assert res.status_code in (401, 404)
 
-    # Delete account
-    res = client.delete("/api/auth/account", headers=headers)
+    # Delete account (with mandatory password confirmation)
+    res = client.delete("/api/auth/account", headers={**headers, "X-Confirm-Password": "Password123!"})
     assert res.status_code == 200
 
     # Verify parent cannot login anymore

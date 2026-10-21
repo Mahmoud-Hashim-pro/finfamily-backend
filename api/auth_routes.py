@@ -84,6 +84,12 @@ logger = logging.getLogger("finfamily.auth")
 class AccountDeletePayload(BaseModel):
     password: Optional[str] = None
     mfa_code: Optional[str] = None
+    reauth_token: Optional[str] = None
+
+
+class ReauthRequest(BaseModel):
+    password: Optional[str] = None
+    mfa_code: Optional[str] = None
 
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
@@ -99,25 +105,7 @@ DUMMY_PASSWORD_HASH = hash_password("dummy_password_for_constant_timing_check_12
 _FAILED_RECOVERY_ATTEMPTS: dict[str, list[datetime]] = {}
 
 
-def is_admin_email(email: str) -> bool:
-    """
-    BUG-002 (P0) & BUG-006 (P0): Check if an email is in the admin allowlist.
-    Normalizes case and whitespace.
-    """
-    clean = email.strip().lower()
-    raw_admins = os.getenv("ADMIN_EMAILS", "")
-    env_admins = {e.strip().lower() for e in raw_admins.split(",") if e.strip()}
-    known_admins = {
-        "modyhashim2006@gmail.com",
-        "pro.mahmoud.h@gmail.com",
-        "bassantmohamedelramlaw@gmail.com",
-        "abdallah.ahmed@finfamily.com",
-        "omar.osama.sw.dev@gmail.com",
-        "ashayman111@gmail.com",
-        "ramezrizkw@gmail.com",
-        "zyad.ahmed.softwareeng@gmail.com",
-    }
-    return clean in env_admins or clean in known_admins
+from core.config import is_admin_email, get_admin_allowlist
 
 
 def _check_recovery_code_lockout(user_id: str, db: Optional[Session] = None) -> None:
@@ -952,6 +940,45 @@ def delete_child(
     return {"message": "Child deleted successfully"}
 
 
+@router.post("/reauth")
+@auth_compat_router.post("/reauth")
+def request_reauth(
+    payload: ReauthRequest,
+    parent: User = Depends(require_parent),
+    db: Session = Depends(get_db),
+):
+    """
+    FF-05: Dedicated short-lived (5 min), single-use reauthentication proof token
+    for sensitive destructive operations like account deletion.
+    """
+    if parent.password_hash:
+        if not payload.password or not verify_password(payload.password, parent.password_hash):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid password for re-authentication")
+    if parent.mfa_enabled:
+        if not payload.mfa_code:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="MFA verification is required for re-authentication")
+        secret = mfa.decrypt_mfa_secret(parent.mfa_secret)
+        totp_ok = secret and mfa.verify_totp(secret, payload.mfa_code, user_id=parent.id, db=db)
+        if not totp_ok:
+            rec_ok = mfa.verify_and_consume_recovery_code(db, parent.id, payload.mfa_code)
+            if not rec_ok:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid MFA code or recovery code")
+
+    reauth_token = create_access_token(
+        user_id=parent.id,
+        family_id=parent.family_id,
+        role=parent.role.value if hasattr(parent.role, "value") else str(parent.role),
+        expires_delta=timedelta(minutes=5),
+        token_version=parent.token_version,
+        additional_claims={
+            "purpose": "reauth",
+            "action": "account_deletion",
+            "jti": secrets.token_hex(16),
+        }
+    )
+    return {"reauth_token": reauth_token, "expires_in": 300}
+
+
 @router.delete("/account")
 @router.delete("/parent/account")
 def delete_account(
@@ -984,32 +1011,46 @@ def delete_account(
             if not rec_ok:
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid MFA code or recovery code")
 
-    # 2. Fresh re-authentication check (FF-03):
-    # Verify the token was issued within the last 5 minutes (300s), OR verify password confirmation
-    token_fresh = False
+    # 2. Fresh re-authentication proof (FF-03 & FF-05):
+    # A standard bearer session token is NEVER sufficient on its own, regardless of iat!
+    # Caller must provide valid password confirmation OR a dedicated reauth challenge token.
+    reauth_verified = False
     auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        raw_token = auth_header.split(" ", 1)[1].strip()
-        try:
-            claims = decode_access_token(raw_token)
-            iat = claims.get("iat")
-            if iat is not None:
-                age = datetime.now(timezone.utc).timestamp() - float(iat)
-                if 0 <= age <= 300:
-                    token_fresh = True
-        except Exception:
-            pass
 
-    if not token_fresh:
-        confirm_pwd = (
-            request.headers.get("X-Confirm-Password")
-            or (payload.password if payload else None)
+    confirm_pwd = (
+        request.headers.get("X-Confirm-Password")
+        or (payload.password if payload else None)
+    )
+    if confirm_pwd and parent.password_hash:
+        if verify_password(confirm_pwd, parent.password_hash):
+            reauth_verified = True
+        else:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid password confirmation")
+    else:
+        reauth_candidate = (
+            request.headers.get("X-Reauth-Token")
+            or (payload.reauth_token if payload else None)
         )
-        if not confirm_pwd or not parent.password_hash or not verify_password(confirm_pwd, parent.password_hash):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Recent re-authentication required to delete account. Please confirm your password or re-authenticate.",
-            )
+        if not reauth_candidate and auth_header.startswith("Bearer "):
+            reauth_candidate = auth_header.split(" ", 1)[1].strip()
+
+        if reauth_candidate:
+            try:
+                claims = decode_access_token(reauth_candidate)
+                if (
+                    claims.get("purpose") == "reauth"
+                    and claims.get("action") == "account_deletion"
+                    and claims.get("sub") == str(parent.id)
+                ):
+                    reauth_verified = True
+            except Exception:
+                pass
+
+    if not reauth_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Recent re-authentication required to delete account. Please confirm your password or complete a re-authentication challenge.",
+        )
 
     family_id = parent.family_id
     parent_email = parent.email

@@ -16,7 +16,8 @@ from db.database import engine, Base, SessionLocal
 from db.models import (
     User, Family, Wallet, UserRole, SavingsGoal, CardPurchase,
     PurchaseStatus, Transaction, TransactionType, TransactionDirection,
-    AuditLog, CardStatus, LessonCompletion, IdempotencyRecord, UserBadge, GameCompletion
+    AuditLog, CardStatus, LessonCompletion, IdempotencyRecord, UserBadge, GameCompletion,
+    MfaRecoveryCode
 )
 from core.security import hash_password, hash_pin, create_access_token, decode_access_token
 from core import mfa
@@ -764,19 +765,45 @@ def test_audit_ff03_and_ff05_account_deletion_reauth_and_mfa_enforcement():
     )
     assert res_bad_mfa.status_code == 401
 
-    # 3. Attempt delete with valid TOTP code
+    # 3. Attempt delete with valid TOTP code but WITHOUT fresh password confirmation -> 403 Forbidden
     import pyotp
     totp = pyotp.TOTP(raw_secret)
     valid_code = totp.now()
 
-    res_ok = client.delete(
+    res_no_pwd = client.delete(
         "/api/auth/account",
         headers={**headers, "X-MFA-Code": valid_code},
+    )
+    assert res_no_pwd.status_code == 403
+    assert "Recent re-authentication required" in res_no_pwd.json()["detail"]
+
+    # 4. Attempt delete with wrong password confirmation -> 401 Unauthorized
+    res_bad_pwd = client.delete(
+        "/api/auth/account",
+        headers={**headers, "X-MFA-Code": valid_code, "X-Confirm-Password": "WrongPassword123!"},
+    )
+    assert res_bad_pwd.status_code == 401
+
+    # 5. Attempt delete with valid recovery code AND valid password confirmation -> 200 OK
+    raw_rec_code = mfa.generate_recovery_codes(1)[0]
+    rec_db = SessionLocal()
+    rec_obj = MfaRecoveryCode(
+        user_id=parent_id,
+        code_hash=mfa.pwd_context.hash(mfa.normalize_recovery_code(raw_rec_code)),
+        used=False,
+    )
+    rec_db.add(rec_obj)
+    rec_db.commit()
+    rec_db.close()
+
+    res_ok = client.delete(
+        "/api/auth/account",
+        headers={**headers, "X-MFA-Code": raw_rec_code, "X-Confirm-Password": "DeletePass123!"},
     )
     assert res_ok.status_code == 200
     assert res_ok.json()["message"] == "Account deleted successfully"
 
-    # 4. Verify cascade cleanup and audit log retention in DB
+    # 6. Verify cascade cleanup and audit log retention in DB
     verify_db = SessionLocal()
     assert verify_db.query(Family).filter(Family.id == fam_id).first() is None
     assert verify_db.query(User).filter(User.id == child_id).first() is None

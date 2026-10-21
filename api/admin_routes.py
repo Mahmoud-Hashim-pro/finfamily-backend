@@ -28,39 +28,15 @@ logger = logging.getLogger("finfamily.admin")
 router = APIRouter(prefix="/api/admin", tags=["Admin Portal & Security Operations"])
 
 # ---------------------------------------------------------------------------
-# Admin Access Control & Whitelist (Solely from ADMIN_EMAILS environment variable)
+# Admin Access Control & Whitelist (Solely from core.config / ADMIN_EMAILS environment variable)
 # ---------------------------------------------------------------------------
-
-DEFAULT_ADMIN_EMAILS = {
-    "modyhashim2006@gmail.com",
-    "pro.mahmoud.h@gmail.com",
-    "bassantmohamedelramlaw@gmail.com",
-    "abdallah.ahmed@finfamily.com",
-    "omar.osama.sw.dev@gmail.com",
-    "ashayman111@gmail.com",
-    "ramezrizkw@gmail.com",
-    "zyad.ahmed.softwareeng@gmail.com",
-}
-
-
-def get_admin_allowlist() -> set:
-    """
-    Returns the set of authorized admin email addresses.
-    Loaded from the ADMIN_EMAILS environment variable, or defaults to the founding admin team.
-    If ADMIN_EMAILS is explicitly empty (""), returns an empty set.
-    """
-    raw_admins = os.getenv("ADMIN_EMAILS")
-    if raw_admins is None:
-        return set(DEFAULT_ADMIN_EMAILS)
-    if not raw_admins.strip():
-        return set()
-    return {e.strip().lower() for e in raw_admins.split(",") if e.strip()}
+from core.config import get_admin_allowlist, is_admin_email
 
 
 class _AdminAllowlistProxy(set):
-    """Dynamic set proxy that evaluates against the current ADMIN_EMAILS environment variable."""
+    """Dynamic set proxy that evaluates against the central authoritative get_admin_allowlist()."""
     def __contains__(self, item):
-        return (item.strip().lower() if isinstance(item, str) else item) in get_admin_allowlist()
+        return is_admin_email(item) if isinstance(item, str) else False
     def __iter__(self):
         return iter(get_admin_allowlist())
     def __len__(self):

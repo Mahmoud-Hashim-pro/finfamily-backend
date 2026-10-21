@@ -89,10 +89,12 @@ _LAST_USED_TIMESTEPS: dict[str, int] = {}
 def verify_totp(secret: str, code: str, user_id: Optional[str] = None, db: Optional[Any] = None) -> bool:
     """
     valid_window=1 مع التحقق من عدم إعادة استخدام نفس الكود في نافذة الصلاحية (BUG-117 & FF-07).
-    يتحقق محلياً في الذاكرة ومحفوظاً في قاعدة البيانات لمنع إعادة الاستخدام عبر سيرفرات متعددة.
+    يحدث حقل User.last_totp_timestep ذرياً في قاعدة البيانات لضمان منع الـ Replay عبر السيرفرات المتعددة.
+    يفشل مغلقاً (Fail-Closed) في حال حدوث أي خطأ في قاعدة البيانات.
     """
-    if not code or not code.isdigit():
+    if not code or not str(code).strip().isdigit():
         return False
+    clean_code = str(code).strip()
     plain_secret = decrypt_mfa_secret(secret) or secret
     if not plain_secret:
         return False
@@ -102,29 +104,39 @@ def verify_totp(secret: str, code: str, user_id: Optional[str] = None, db: Optio
 
     for offset in (0, -1, 1):
         target_tc = current_tc + offset
-        if totp.generate_otp(target_tc) == code:
+        if totp.generate_otp(target_tc) == clean_code:
             if user_id:
+                # 1. Fast in-memory check
                 last_tc = _LAST_USED_TIMESTEPS.get(user_id)
                 if last_tc is not None and target_tc <= last_tc:
                     return False  # Replay rejected in-process!
+
+                # 2. Durable atomic cross-instance database check and update (FF-07)
                 if db is not None:
                     try:
-                        from db.models import AuditLog
-                        recent = (
-                            db.query(AuditLog)
+                        from db.models import User
+                        from sqlalchemy import or_
+                        affected = (
+                            db.query(User)
                             .filter(
-                                AuditLog.actor_id == user_id,
-                                AuditLog.action.in_(("login_success", "mfa_login_success", "mfa_verified"))
+                                User.id == user_id,
+                                or_(
+                                    User.last_totp_timestep.is_(None),
+                                    User.last_totp_timestep < target_tc
+                                )
                             )
-                            .order_by(AuditLog.created_date.desc())
-                            .first()
+                            .update({"last_totp_timestep": target_tc}, synchronize_session=False)
                         )
-                        if recent and recent.detail and isinstance(recent.detail, dict):
-                            db_tc = recent.detail.get("totp_timestep")
-                            if db_tc is not None and target_tc <= int(db_tc):
-                                return False  # Replay rejected cross-worker via database!
-                    except Exception:
-                        pass
+                        if affected == 0:
+                            # Replay attack or older timestep submitted concurrently across instances
+                            return False
+                        db.flush()
+                    except Exception as ex:
+                        # Fail closed on DB error
+                        import logging
+                        logging.getLogger("mfa").error(f"Durable TOTP replay check failed closed: {ex}")
+                        return False
+
                 _LAST_USED_TIMESTEPS[user_id] = target_tc
             return True
 

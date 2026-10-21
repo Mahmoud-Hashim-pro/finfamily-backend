@@ -33,7 +33,6 @@ def upgrade() -> None:
             sa.Column('user_id', sa.String(), nullable=True),
             sa.Column('action', sa.String(), nullable=False),
             sa.Column('payload_hash', sa.String(length=64), nullable=True),
-            sa.Column('response_id', sa.String(), nullable=True),
             sa.Column('created_date', sa.DateTime(), nullable=True),
             sa.ForeignKeyConstraint(['family_id'], ['families.id'], ),
             sa.ForeignKeyConstraint(['user_id'], ['users.id'], ),
@@ -43,11 +42,6 @@ def upgrade() -> None:
         op.create_index(op.f('ix_idempotency_records_key'), 'idempotency_records', ['key'], unique=True)
         op.create_index(op.f('ix_idempotency_records_family_id'), 'idempotency_records', ['family_id'], unique=False)
         op.create_index(op.f('ix_idempotency_records_user_id'), 'idempotency_records', ['user_id'], unique=False)
-    else:
-        idem_cols = {c['name'] for c in inspector.get_columns('idempotency_records')}
-        with op.batch_alter_table('idempotency_records', schema=None) as batch_op:
-            if 'response_id' not in idem_cols:
-                batch_op.add_column(sa.Column('response_id', sa.String(), nullable=True))
 
     # 2. Create lesson_completions table
     if 'lesson_completions' not in existing_tables:
@@ -150,9 +144,6 @@ def upgrade() -> None:
                            type_=sa.Numeric(precision=12, scale=2),
                            existing_nullable=False,
                            postgresql_using='amount::numeric(12, 2)')
-            if 'idempotency_key' not in purchases_cols:
-                batch_op.add_column(sa.Column('idempotency_key', sa.String(length=128), nullable=True))
-                batch_op.create_index(batch_op.f('ix_card_purchases_idempotency_key'), ['idempotency_key'], unique=False)
 
     # game_completions
     if 'game_completions' in existing_tables:

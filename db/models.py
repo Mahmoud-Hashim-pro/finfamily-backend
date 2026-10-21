@@ -127,6 +127,7 @@ class User(Base):
     mfa_enabled = Column(Boolean, default=False, nullable=False)
     mfa_secret = Column(String, nullable=True)          # السيكريت الفعلي بعد ما يتفعّل
     mfa_pending_secret = Column(String, nullable=True)  # سيكريت مؤقت وقت setup لحد ما يتأكد بكود صحيح
+    last_totp_timestep = Column(Integer, nullable=True)  # آخر timestep تم استهلاكه لمنع هجمات replay بشكل ذري عبر كل السيرفرات
 
     wallet = relationship("Wallet", back_populates="owner", uselist=False, cascade="all, delete-orphan")
     badges = relationship("UserBadge", back_populates="user", cascade="all, delete-orphan")
