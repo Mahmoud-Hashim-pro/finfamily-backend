@@ -25,11 +25,14 @@ from core.config import is_production
 # ---------- MFA Secrets Encryption at Rest (BUG-012 & FF-08) ----------
 
 def _get_fernet() -> Fernet:
-    raw_key = os.getenv("MFA_ENCRYPTION_KEY") or os.getenv("JWT_SECRET")
-    if not raw_key:
-        if is_production():
-            raise RuntimeError("CRITICAL: MFA_ENCRYPTION_KEY or JWT_SECRET environment variable is required in production and cannot be empty!")
-        raw_key = "finfamily-mfa-default-encryption-secret-key-2026"
+    if is_production():
+        raw_key = os.getenv("MFA_ENCRYPTION_KEY", "").strip()
+        if not raw_key or len(raw_key) < 16 or "default" in raw_key.lower():
+            raise RuntimeError("CRITICAL: Dedicated MFA_ENCRYPTION_KEY environment variable of at least 16 characters is required in production!")
+    else:
+        raw_key = os.getenv("MFA_ENCRYPTION_KEY") or os.getenv("JWT_SECRET")
+        if not raw_key:
+            raw_key = "finfamily-mfa-default-encryption-secret-key-2026"
     derived = base64.urlsafe_b64encode(hashlib.sha256(raw_key.encode("utf-8")).digest())
     return Fernet(derived)
 
@@ -69,7 +72,9 @@ def generate_secret() -> str:
 
 def provisioning_uri(secret: str, account_email: str) -> str:
     """otpauth:// URI اللي تطبيق الـ Authenticator بيفهمه (سواء من QR أو إدخال يدوي)."""
-    plain_secret = decrypt_mfa_secret(secret) or secret
+    plain_secret = decrypt_mfa_secret(secret)
+    if not plain_secret:
+        raise ValueError("Invalid or undecryptable MFA secret")
     return pyotp.totp.TOTP(plain_secret).provisioning_uri(name=account_email, issuer_name=ISSUER_NAME)
 
 
@@ -95,9 +100,16 @@ def verify_totp(secret: str, code: str, user_id: Optional[str] = None, db: Optio
     if not code or not str(code).strip().isdigit():
         return False
     clean_code = str(code).strip()
-    plain_secret = decrypt_mfa_secret(secret) or secret
+    plain_secret = decrypt_mfa_secret(secret)
     if not plain_secret:
         return False
+
+    # In production, require db session for durable cross-instance replay protection if user_id is provided
+    if is_production() and user_id and db is None:
+        import logging
+        logging.getLogger("mfa").error("Rejecting TOTP verification in production: db session required for replay protection")
+        return False
+
     totp = pyotp.totp.TOTP(plain_secret)
     now = datetime.now(timezone.utc)
     current_tc = totp.timecode(now)
@@ -186,21 +198,41 @@ def verify_recovery_code(plain_code: str, stored_hash: str) -> bool:
 def verify_and_consume_recovery_code(db: Any, user_id: str, raw_code: str) -> bool:
     """
     Atomically verify and consume a one-time recovery code for the given user (BUG-118, FF-03 & FF-05).
+    Uses direct SQL UPDATE with SHA-256 digest match to eliminate concurrent consumption races.
     """
     if not db or not user_id or not raw_code:
         return False
     from db.models import MfaRecoveryCode
     normalized = normalize_recovery_code(raw_code)
+    digest_hash = f"sha256:{hashlib.sha256(normalized.encode('utf-8')).hexdigest()}"
+
+    # Fast direct atomic update for sha256-hashed recovery codes
+    updated = (
+        db.query(MfaRecoveryCode)
+        .filter(
+            MfaRecoveryCode.user_id == user_id,
+            MfaRecoveryCode.used == False,  # noqa: E712
+            MfaRecoveryCode.code_hash == digest_hash,
+        )
+        .update({"used": True, "used_date": datetime.now(timezone.utc).replace(tzinfo=None)}, synchronize_session=False)
+    )
+    if updated == 1:
+        db.flush()
+        return True
+
+    # Legacy fallback for bcrypt
     candidates = db.query(MfaRecoveryCode).filter(
         MfaRecoveryCode.user_id == user_id,
         MfaRecoveryCode.used == False,  # noqa: E712
     ).all()
     match = next((c for c in candidates if verify_recovery_code(normalized, c.code_hash)), None)
-    if not match:
-        return False
-    updated = (
-        db.query(MfaRecoveryCode)
-        .filter(MfaRecoveryCode.id == match.id, MfaRecoveryCode.used == False)  # noqa: E712
-        .update({"used": True, "used_date": datetime.now(timezone.utc).replace(tzinfo=None)})
-    )
-    return updated == 1
+    if match:
+        updated = (
+            db.query(MfaRecoveryCode)
+            .filter(MfaRecoveryCode.id == match.id, MfaRecoveryCode.used == False)  # noqa: E712
+            .update({"used": True, "used_date": datetime.now(timezone.utc).replace(tzinfo=None)}, synchronize_session=False)
+        )
+        if updated == 1:
+            db.flush()
+            return True
+    return False

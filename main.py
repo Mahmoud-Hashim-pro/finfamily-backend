@@ -33,18 +33,28 @@ async def lifespan(app: FastAPI):
     global db_healthy
     # Validate production required secrets and configurations
     validate_production_configuration()
-    # FF-34: Controlled schema initialization in serverless environments
-    skip_db_init = os.getenv("SKIP_DB_INIT", "false").strip().lower() in ("true", "1")
+    # FF-34 & FF-30: Controlled schema initialization in serverless environments
+    skip_db_init_raw = os.getenv("SKIP_DB_INIT")
+    if skip_db_init_raw is None:
+        # In production, default to skipping create_all to prevent silent schema modifications
+        skip_db_init = is_prod
+    else:
+        skip_db_init = skip_db_init_raw.strip().lower() in ("true", "1", "yes")
+
     if not skip_db_init:
-        try:
-            Base.metadata.create_all(bind=engine)
+        if is_prod and not (os.getenv("ALLOW_PRODUCTION_AUTO_DDL", "false").strip().lower() in ("true", "1")):
+            logger.info("Production mode: Automatic Base.metadata.create_all() suppressed in favor of Alembic migrations.")
             db_healthy = True
-            logger.info("Database schema verified and initialized successfully.")
-        except Exception as e:
-            db_healthy = False
-            logger.error(f"Database initialization failed during startup: {e}", exc_info=True)
-            if is_prod:
-                raise RuntimeError(f"Database initialization failed in production: {e}") from e
+        else:
+            try:
+                Base.metadata.create_all(bind=engine)
+                db_healthy = True
+                logger.info("Database schema verified and initialized successfully.")
+            except Exception as e:
+                db_healthy = False
+                logger.error(f"Database initialization failed during startup: {e}", exc_info=True)
+                if is_prod:
+                    raise RuntimeError(f"Database initialization failed in production: {e}") from e
     else:
         db_healthy = True
         logger.info("SKIP_DB_INIT active: relying on controlled Alembic migrations.")
@@ -100,7 +110,7 @@ def get_app_version():
         "APP_RELEASE_NOTES",
         f"إصدار رسمي v{version} (Build {build_num}): تحسينات أمان شاملة، توثيق صارم لمسارات حذف الحساب، ترقيات ذرية لرموز MFA لمنع هجمات Replay، وحماية من تكرار المعاملات المالية."
     )
-    file_hash = os.getenv("APP_SHA256", "")
+    file_hash = os.getenv("APP_SHA256", "21408d8dcde46b0a372b0b974324e990cf252815aa6716d572168ebaf288187c")
 
     return {
         "version": version,

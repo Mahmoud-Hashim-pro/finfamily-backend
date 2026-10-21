@@ -12,7 +12,7 @@ from openai import (
     APIConnectionError,
     AuthenticationError,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from dotenv import load_dotenv
 
 from services.ai_context import redact_sensitive_text
@@ -89,6 +89,25 @@ class ChatMessage(BaseModel):
         max_length=50,
         description="Conversation history capped at 50 messages to prevent payload explosion (FF-22)",
     )
+
+    @field_validator("history")
+    @classmethod
+    def validate_history_size(cls, v):
+        """FF-28 & FF-47: Enforce aggregate character limit across conversation history."""
+        if not v:
+            return v
+        total_len = 0
+        for item in v:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("message") or ""
+            elif hasattr(item, "text"):
+                text = item.text or ""
+            else:
+                text = str(item)
+            total_len += len(text)
+        if total_len > 4000:
+            raise ValueError("Total conversation history exceeds maximum permitted size (4000 characters)")
+        return v
 
 
 class ModerationResult:

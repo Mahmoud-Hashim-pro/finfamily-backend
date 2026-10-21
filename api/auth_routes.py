@@ -85,11 +85,13 @@ class AccountDeletePayload(BaseModel):
     password: Optional[str] = None
     mfa_code: Optional[str] = None
     reauth_token: Optional[str] = None
+    google_id_token: Optional[str] = None
 
 
 class ReauthRequest(BaseModel):
     password: Optional[str] = None
     mfa_code: Optional[str] = None
+    google_id_token: Optional[str] = None
 
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
@@ -311,8 +313,10 @@ def login_parent(request: Request, payload: ParentLogin, db: Session = Depends(g
             mfa.verify_totp(
                 mfa.decrypt_mfa_secret(user.mfa_secret) if user.mfa_secret else "",
                 payload.otp_code,
-                user_id=user.id
+                user_id=user.id,
+                db=db,
             )
+            or mfa.verify_and_consume_recovery_code(db, user.id, payload.otp_code)
         ):
             # BUG-117 (P2): Verify TOTP code with replay prevention
             log_action(
@@ -400,8 +404,10 @@ def google_auth(request: Request, payload: GoogleLoginRequest, db: Session = Dep
                     mfa.verify_totp(
                         mfa.decrypt_mfa_secret(user.mfa_secret) if user.mfa_secret else "",
                         payload.otp_code,
-                        user_id=user.id
+                        user_id=user.id,
+                        db=db,
                     )
+                    or mfa.verify_and_consume_recovery_code(db, user.id, payload.otp_code)
                 ):
                     log_action(
                         db, request=request, action="google_login_mfa_failed",
@@ -567,6 +573,24 @@ def create_child(
 def get_family_code(parent: User = Depends(require_parent), db: Session = Depends(get_db)):
     family = db.query(Family).filter(Family.id == parent.family_id).first()
     return {"family_code": family.family_code, "family_name": family.name}
+
+
+@router.post("/family/code/rotate")
+def rotate_family_code(request: Request, parent: User = Depends(require_parent), db: Session = Depends(get_db)):
+    """B3 & FF-27: Allow authenticated parent to rotate their family invitation code to prevent leaks."""
+    family = db.query(Family).filter(Family.id == parent.family_id).first()
+    if not family:
+        raise HTTPException(status_code=404, detail="Family not found")
+    new_code = generate_unique_family_code(db)
+    old_code = family.family_code
+    family.family_code = new_code
+    log_action(
+        db, request=request, action="family_code_rotated",
+        actor_id=parent.id, actor_role="parent", family_id=family.id,
+        detail={"old_code": old_code, "new_code": new_code},
+    )
+    db.commit()
+    return {"family_code": new_code, "message": "Family code rotated successfully"}
 
 
 @router.get("/family/children", response_model=FamilyChildrenResponse)
@@ -954,6 +978,14 @@ def request_reauth(
     if parent.password_hash:
         if not payload.password or not verify_password(payload.password, parent.password_hash):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid password for re-authentication")
+    else:
+        # OAuth-only accounts without password hash: require valid Google ID token for fresh re-auth
+        if not payload.google_id_token:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Fresh authentication via Google ID token or password is required for re-authentication")
+        from core.google_auth import verify_google_id_token
+        google_user = verify_google_id_token(payload.google_id_token)
+        if not google_user or google_user.get("email", "").lower() != (parent.email or "").lower():
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Google authentication does not match account identity")
     if parent.mfa_enabled:
         if not payload.mfa_code:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="MFA verification is required for re-authentication")
@@ -1021,11 +1053,23 @@ def delete_account(
         request.headers.get("X-Confirm-Password")
         or (payload.password if payload else None)
     )
+    google_id_token = (
+        request.headers.get("X-Google-Id-Token")
+        or (payload.google_id_token if payload else None)
+    )
+
     if confirm_pwd and parent.password_hash:
         if verify_password(confirm_pwd, parent.password_hash):
             reauth_verified = True
         else:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid password confirmation")
+    elif google_id_token and not parent.password_hash:
+        from core.google_auth import verify_google_id_token
+        google_user = verify_google_id_token(google_id_token)
+        if google_user and google_user.get("email", "").lower() == (parent.email or "").lower():
+            reauth_verified = True
+        else:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Google re-authentication token")
     else:
         reauth_candidate = (
             request.headers.get("X-Reauth-Token")
@@ -1042,7 +1086,17 @@ def delete_account(
                     and claims.get("action") == "account_deletion"
                     and claims.get("sub") == str(parent.id)
                 ):
+                    jti = claims.get("jti")
+                    if jti:
+                        consumed_key = f"consumed_reauth:{jti}"
+                        existing_used = db.query(IdempotencyRecord).filter(IdempotencyRecord.key == consumed_key).first()
+                        if existing_used:
+                            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Re-authentication token has already been consumed")
+                        db.add(IdempotencyRecord(key=consumed_key, family_id=parent.family_id, user_id=parent.id, action="reauth_consumed"))
+                        db.flush()
                     reauth_verified = True
+            except HTTPException:
+                raise
             except Exception:
                 pass
 
@@ -1216,20 +1270,11 @@ def mfa_disable(
     mfa_verified = False
     if payload.code:
         plain_secret = mfa.decrypt_mfa_secret(parent.mfa_secret)
-        if mfa.verify_totp(plain_secret, payload.code, user_id=parent.id):
+        if mfa.verify_totp(plain_secret, payload.code, user_id=parent.id, db=db):
             mfa_verified = True
     elif payload.recovery_code:
-        normalized = mfa.normalize_recovery_code(payload.recovery_code)
-        candidates = db.query(MfaRecoveryCode).filter(MfaRecoveryCode.user_id == parent.id, MfaRecoveryCode.used == False).all()  # noqa: E712
-        match = next((c for c in candidates if mfa.verify_recovery_code(normalized, c.code_hash)), None)
-        if match:
-            updated = (
-                db.query(MfaRecoveryCode)
-                .filter(MfaRecoveryCode.id == match.id, MfaRecoveryCode.used == False)  # noqa: E712
-                .update({"used": True, "used_date": datetime.utcnow()})
-            )
-            if updated == 1:
-                mfa_verified = True
+        if mfa.verify_and_consume_recovery_code(db, parent.id, payload.recovery_code):
+            mfa_verified = True
 
     if not mfa_verified:
         raise HTTPException(
@@ -1279,20 +1324,11 @@ def regenerate_recovery_codes(
     mfa_verified = False
     if payload.code:
         plain_secret = mfa.decrypt_mfa_secret(parent.mfa_secret)
-        if mfa.verify_totp(plain_secret, payload.code, user_id=parent.id):
+        if mfa.verify_totp(plain_secret, payload.code, user_id=parent.id, db=db):
             mfa_verified = True
     elif payload.recovery_code:
-        normalized = mfa.normalize_recovery_code(payload.recovery_code)
-        candidates = db.query(MfaRecoveryCode).filter(MfaRecoveryCode.user_id == parent.id, MfaRecoveryCode.used == False).all()  # noqa: E712
-        match = next((c for c in candidates if mfa.verify_recovery_code(normalized, c.code_hash)), None)
-        if match:
-            updated = (
-                db.query(MfaRecoveryCode)
-                .filter(MfaRecoveryCode.id == match.id, MfaRecoveryCode.used == False)  # noqa: E712
-                .update({"used": True, "used_date": datetime.utcnow()})
-            )
-            if updated == 1:
-                mfa_verified = True
+        if mfa.verify_and_consume_recovery_code(db, parent.id, payload.recovery_code):
+            mfa_verified = True
 
     if not mfa_verified:
         raise HTTPException(

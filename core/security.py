@@ -120,6 +120,8 @@ def create_access_token(*args, **kwargs) -> str:
     }
     if token_type:
         payload["type"] = token_type
+    if "additional_claims" in kwargs and isinstance(kwargs["additional_claims"], dict):
+        payload.update(kwargs["additional_claims"])
 
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 

@@ -821,3 +821,161 @@ def test_audit_ff03_and_ff05_account_deletion_reauth_and_mfa_enforcement():
     assert deletion_audit.actor_id is None
     verify_db.close()
 
+
+def test_a2_undecryptable_mfa_secret_fails_closed_without_ciphertext_fallback():
+    """A2: Corrupt or undecryptable MFA secret must fail closed without treating ciphertext as plaintext."""
+    corrupt_encrypted_secret = "enc:gAAAAABnMalformedCiphertextThatCannotBeDecryptedByFernetKey=="
+    assert mfa.decrypt_mfa_secret(corrupt_encrypted_secret) is None
+    # Must return False rather than falling back to verifying against the ciphertext
+    assert mfa.verify_totp(corrupt_encrypted_secret, "123456") is False
+
+    with pytest.raises(ValueError, match="Invalid or undecryptable MFA secret"):
+        mfa.provisioning_uri(corrupt_encrypted_secret, "user@test.com")
+
+
+def test_a5_reauth_token_single_use_atomic_consumption():
+    """A5: A re-authentication token can only be consumed once for account deletion."""
+    db = SessionLocal()
+    fam = Family(name="SingleUse Fam", family_code="SNG001")
+    db.add(fam)
+    db.flush()
+
+    user = User(
+        family_id=fam.id,
+        role=UserRole.parent,
+        full_name="Single Use Parent",
+        email="singleuse.parent@gmail.com",
+        password_hash=hash_password("Password123!"),
+        is_active=True,
+        mfa_enabled=False,
+    )
+    db.add(user)
+    db.commit()
+    user_id = user.id
+    fam_id = fam.id
+    db.close()
+
+    # Request re-auth token
+    login_token = create_access_token(user_id=user_id, family_id=fam_id, role="parent")
+    reauth_res = client.post(
+        "/api/auth/reauth",
+        json={"password": "Password123!"},
+        headers={"Authorization": f"Bearer {login_token}"},
+    )
+    assert reauth_res.status_code == 200
+    reauth_token = reauth_res.json()["reauth_token"]
+
+    # 1st delete attempt with this reauth token succeeds
+    del_res1 = client.delete(
+        "/api/auth/account",
+        headers={"Authorization": f"Bearer {login_token}", "X-Reauth-Token": reauth_token},
+    )
+    assert del_res1.status_code == 200
+
+    # 2nd attempt with same reauth token must fail with 401 (already consumed)
+    del_res2 = client.delete(
+        "/api/auth/account",
+        headers={"Authorization": f"Bearer {login_token}", "X-Reauth-Token": reauth_token},
+    )
+    assert del_res2.status_code in (401, 403, 404)
+
+
+def test_a5_oauth_account_reauth_with_google_id_token():
+    """A5: OAuth-only account without password can re-authenticate with fresh Google ID token."""
+    db = SessionLocal()
+    fam = Family(name="OAuth Reauth Fam", family_code="OAR001")
+    db.add(fam)
+    db.flush()
+
+    user = User(
+        family_id=fam.id,
+        role=UserRole.parent,
+        full_name="OAuth Reauth Parent",
+        email="oauth.reauth@gmail.com",
+        password_hash=None,  # Pure OAuth user
+        is_active=True,
+        mfa_enabled=False,
+    )
+    db.add(user)
+    db.commit()
+    user_id = user.id
+    fam_id = fam.id
+    db.close()
+
+    set_mock_google_verifier(lambda token, client_id=None: {
+        "sub": "oauth-google-reauth-sub-123",
+        "email": "oauth.reauth@gmail.com",
+        "email_verified": True,
+        "name": "OAuth Reauth Parent",
+    })
+
+    login_token = create_access_token(user_id=user_id, family_id=fam_id, role="parent")
+
+    # Reauth request without google_id_token fails
+    fail_res = client.post(
+        "/api/auth/reauth",
+        json={},
+        headers={"Authorization": f"Bearer {login_token}"},
+    )
+    assert fail_res.status_code == 401
+
+    # Reauth request with valid google_id_token succeeds
+    succ_res = client.post(
+        "/api/auth/reauth",
+        json={"google_id_token": "valid-fresh-google-id-token"},
+        headers={"Authorization": f"Bearer {login_token}"},
+    )
+    assert succ_res.status_code == 200
+    assert "reauth_token" in succ_res.json()
+
+
+def test_b3_parent_can_rotate_family_code():
+    """B3 & FF-27: Authenticated parent can rotate family invitation code."""
+    db = SessionLocal()
+    fam = Family(name="Rotatable Fam", family_code="ROT001")
+    db.add(fam)
+    db.flush()
+
+    user = User(
+        family_id=fam.id,
+        role=UserRole.parent,
+        full_name="Rotate Parent",
+        email="rotate.parent@gmail.com",
+        is_active=True,
+    )
+    db.add(user)
+    db.commit()
+    fam_id = fam.id
+    token = create_access_token(user_id=user.id, family_id=fam_id, role="parent")
+    db.close()
+
+    res = client.post("/api/auth/family/code/rotate", headers={"Authorization": f"Bearer {token}"})
+    assert res.status_code == 200
+    new_code = res.json()["family_code"]
+    assert new_code != "ROT001"
+    assert len(new_code) == 6
+
+    # Verify updated in database
+    verify_db = SessionLocal()
+    fam_obj = verify_db.query(Family).filter(Family.id == fam_id).first()
+    assert fam_obj.family_code == new_code
+    verify_db.close()
+
+
+def test_f2_ai_chat_rejects_oversized_total_history_size():
+    """F2 & FF-47: AI ChatMessage rejects total history length exceeding 4000 characters."""
+    from services.ai_coach import ChatMessage
+    from pydantic import ValidationError
+
+    # Create history with messages totaling > 4000 chars
+    large_history = [
+        {"role": "user", "text": "A" * 900},
+        {"role": "assistant", "text": "B" * 900},
+        {"role": "user", "text": "C" * 900},
+        {"role": "assistant", "text": "D" * 900},
+        {"role": "user", "text": "E" * 900},
+    ]
+    with pytest.raises(ValidationError, match="Total conversation history exceeds maximum permitted size"):
+        ChatMessage(message="Hello", history=large_history)
+
+

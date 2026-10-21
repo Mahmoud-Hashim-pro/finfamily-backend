@@ -40,6 +40,14 @@ def chat_ai_coach(
         * /api/functions/aiCoach
         * /api/aiCoach
     """
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > 16384:
+                raise HTTPException(status_code=413, detail="Payload too large (max 16KB)")
+        except ValueError:
+            pass
+
     clean_message = chat.message.strip() if chat.message else ""
     if not clean_message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
