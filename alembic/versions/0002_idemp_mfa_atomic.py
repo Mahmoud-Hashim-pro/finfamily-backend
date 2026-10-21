@@ -1,6 +1,6 @@
 """idempotency_and_mfa_atomic_timestep
 
-Revision ID: 0002_idempotency_and_mfa_atomic_timestep
+Revision ID: 0002_idemp_mfa_atomic
 Revises: 0001_numeric_and_isolation
 Create Date: 2026-10-21 16:00:00.000000
 
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision: str = '0002_idempotency_and_mfa_atomic_timestep'
+revision: str = '0002_idemp_mfa_atomic'
 down_revision: Union[str, None] = '0001_numeric_and_isolation'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
