@@ -8,10 +8,11 @@ load_dotenv(override=False)
 
 SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL")
 
+from core.config import is_production
+
 # Validate DATABASE_URL configuration
 if not SQLALCHEMY_DATABASE_URL:
-    env = os.getenv("ENVIRONMENT", os.getenv("ENV", "development")).strip().lower()
-    if env in ("production", "prod"):
+    if is_production():
         raise RuntimeError("DATABASE_URL environment variable is required in production and cannot be empty.")
     # Safe fallback for local development and ephemeral test environments
     SQLALCHEMY_DATABASE_URL = "sqlite:///./finfamily.db"

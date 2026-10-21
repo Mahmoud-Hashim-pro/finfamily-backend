@@ -21,17 +21,18 @@ from api.admin_routes import router as admin_router
 from api.legal_routes import router as legal_router
 from core.limiter import limiter
 
-# FF-38: Align production environment detection across ENVIRONMENT, NODE_ENV, VERCEL_ENV
-is_production = os.getenv(
-    "ENVIRONMENT",
-    os.getenv("NODE_ENV", os.getenv("VERCEL_ENV", os.getenv("ENV", "development")))
-).strip().lower() in ("production", "prod")
+from core.config import is_production, validate_production_configuration
+
+# FF-38 & FF-44: Unified production environment validation
+is_prod = is_production()
 
 db_healthy = True
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db_healthy
+    # Validate production required secrets and configurations
+    validate_production_configuration()
     # FF-34: Controlled schema initialization in serverless environments
     skip_db_init = os.getenv("SKIP_DB_INIT", "false").strip().lower() in ("true", "1")
     if not skip_db_init:
@@ -42,7 +43,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             db_healthy = False
             logger.error(f"Database initialization failed during startup: {e}", exc_info=True)
-            if is_production:
+            if is_prod:
                 raise RuntimeError(f"Database initialization failed in production: {e}") from e
     else:
         db_healthy = True
@@ -51,9 +52,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="FinFamily API",
-    docs_url=None if is_production else "/docs",
-    redoc_url=None if is_production else "/redoc",
-    openapi_url=None if is_production else "/openapi.json",
+    docs_url=None if is_prod else "/docs",
+    redoc_url=None if is_prod else "/redoc",
+    openapi_url=None if is_prod else "/openapi.json",
     lifespan=lifespan
 )
 
@@ -75,7 +76,7 @@ def read_root():
         "status": status_str,
         "service": "FinFamily API",
         "docs": None if is_production else "/docs",
-        "version": os.getenv("APP_VERSION", "1.1.2")
+        "version": os.getenv("APP_VERSION", "1.1.3")
     }
     return JSONResponse(
         status_code=200 if status_str == "healthy" else 503,
@@ -86,9 +87,9 @@ def read_root():
 @app.get("/api/app/version")
 @app.get("/app/version")
 def get_app_version():
-    # FF-05 & FF-31: Default version matching current production release (1.1.2 build 10)
-    version = os.getenv("APP_VERSION", "1.1.2")
-    build_num = int(os.getenv("APP_BUILD_NUMBER", "10"))
+    # FF-05 & FF-31: Default version matching current production release (1.1.3 build 11)
+    version = os.getenv("APP_VERSION", "1.1.3")
+    build_num = int(os.getenv("APP_BUILD_NUMBER", "11"))
     min_version = os.getenv("MIN_SUPPORTED_VERSION", "1.0.0")
     download_url = os.getenv(
         "APP_DOWNLOAD_URL",

@@ -10,14 +10,16 @@ from passlib.context import CryptContext
 
 load_dotenv(override=False)
 
+from core.config import is_production, get_environment
+
 # لازم يتحط في backend/.env — لو مش موجود بنرفض نشتغل في الـ production
-ENVIRONMENT = os.getenv("ENVIRONMENT", os.getenv("NODE_ENV", os.getenv("ENV", "development"))).lower()
+ENVIRONMENT = get_environment()
 JWT_SECRET = os.getenv("JWT_SECRET")
 
 # BUG-004 (P0): Remove hardcoded fallback and enforce env or secure random fallback with warning
 INSECURE_DEFAULT_SECRET = "dev-insecure-secret-key-change-in-production-only-local"
 if not JWT_SECRET or JWT_SECRET == INSECURE_DEFAULT_SECRET:
-    if ENVIRONMENT in ("production", "prod"):
+    if is_production():
         raise RuntimeError("JWT_SECRET environment variable is required in production and cannot be empty or default insecure key")
     warnings.warn(
         "JWT_SECRET environment variable is unset or using insecure default. "
@@ -69,7 +71,10 @@ def create_access_token(*args, **kwargs) -> str:
     if "data" in kwargs:
         payload = dict(kwargs["data"]).copy()
         delta = kwargs.get("expires_delta") or timedelta(minutes=PARENT_TOKEN_EXPIRE_MINUTES)
-        payload["exp"] = datetime.now(timezone.utc) + delta
+        now_dt = datetime.now(timezone.utc)
+        payload["exp"] = now_dt + delta
+        if "iat" not in payload:
+            payload["iat"] = int(now_dt.timestamp())
         if "token_version" in kwargs and "token_version" not in payload:
             payload["token_version"] = kwargs["token_version"]
         if "email" in kwargs and "email" not in payload:
@@ -108,6 +113,7 @@ def create_access_token(*args, **kwargs) -> str:
         "family_id": str(family_id) if family_id is not None else "",
         "role": role,
         "email": email or "",
+        "iat": int(datetime.now(timezone.utc).timestamp()),
         "exp": expire,
         "token_version": token_version,
         "mfa_pending": bool(mfa_pending),

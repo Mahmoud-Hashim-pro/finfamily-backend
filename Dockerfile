@@ -1,5 +1,5 @@
-# Stage 1: Build stage with compilation tools
-FROM python:3.10-slim AS builder
+# Stage 1: Build stage with compilation tools (Python 3.12 LTS - FF-43)
+FROM python:3.12-slim AS builder
 
 WORKDIR /app
 
@@ -13,7 +13,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # Stage 2: Hardened runtime stage (no gcc or compilers)
-FROM python:3.10-slim AS runtime
+FROM python:3.12-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1

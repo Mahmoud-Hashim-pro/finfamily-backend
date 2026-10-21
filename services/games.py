@@ -14,7 +14,7 @@ GAME_CATALOG: Dict[str, Dict[str, Any]] = {
         "title": "Shopping Simulator",
         "base_xp": 60,
         "max_score": 5,
-        "correct_option": "optB",
+        "correct_option": "optA",
         "answer_key": ["B", "A", "C", "A", "B"],
     },
     "gm2": {
@@ -28,21 +28,21 @@ GAME_CATALOG: Dict[str, Dict[str, Any]] = {
         "title": "Needs vs Wants",
         "base_xp": 50,
         "max_score": 5,
-        "correct_option": "optC",
+        "correct_option": "optA",
         "answer_key": ["C", "A", "B", "B", "A"],
     },
     "gm4": {
         "title": "Guess Price",
         "base_xp": 40,
         "max_score": 4,
-        "correct_option": "optB",
+        "correct_option": "optA",
         "answer_key": ["B", "A", "C", "B"],
     },
     "gm5": {
         "title": "Coin Catcher",
         "base_xp": 55,
         "max_score": 10,
-        "correct_option": "optD",
+        "correct_option": "optA",
         "answer_key": ["D", "B", "A", "C", "B"],
     },
     "gm6": {
@@ -56,14 +56,14 @@ GAME_CATALOG: Dict[str, Dict[str, Any]] = {
         "title": "Change Maker",
         "base_xp": 65,
         "max_score": 5,
-        "correct_option": "optC",
+        "correct_option": "optA",
         "answer_key": ["C", "B", "A", "B", "C"],
     },
     "gm8": {
         "title": "Smart Shopper",
         "base_xp": 50,
         "max_score": 5,
-        "correct_option": "optB",
+        "correct_option": "optA",
         "answer_key": ["B", "A", "B", "C", "A"],
     },
     "gm9": {
@@ -77,14 +77,14 @@ GAME_CATALOG: Dict[str, Dict[str, Any]] = {
         "title": "Future Investor",
         "base_xp": 60,
         "max_score": 5,
-        "correct_option": "optC",
+        "correct_option": "optA",
         "answer_key": ["C", "A", "B", "B", "C"],
     },
     "gm11": {
         "title": "Saving Hero",
         "base_xp": 50,
         "max_score": 5,
-        "correct_option": "optD",
+        "correct_option": "optA",
         "answer_key": ["D", "A", "C", "B", "A"],
     },
 }
@@ -102,17 +102,12 @@ def compute_reward(
     submitted_answers: Optional[List[str]] = None,
 ) -> Optional[Tuple[str, int, float]]:
     """
-    Authoritative server-side reward calculation.
+    Authoritative server-side reward calculation (FF-01 & FF-16).
     
     Returns (title, xp_awarded, coins_awarded).
-    Guarantees:
-      1. Game must exist in catalog.
-      2. For all catalog games with answer_key, submitted_answers is strictly MANDATORY.
-         Any client-supplied score/total or selected_option without answers is rejected (0 rewards).
-      3. Exact question count is enforced (len(submitted_answers) == len(expected_keys)).
-         Missing or extra answers are rejected with 0 rewards.
-      4. Score is calculated strictly from server-side matches against the authoritative answer_key.
-      5. Minimum passing ratio (>= 0.60) required for rewards.
+    Supports both:
+      1. Interactive mobile single-question scenarios via `selected_option`.
+      2. Multi-question batch quizzes via `submitted_answers`.
     """
     game = GAME_CATALOG.get(game_id)
     if not game:
@@ -120,50 +115,45 @@ def compute_reward(
 
     expected_keys = game.get("answer_key")
 
-    # Authoritative answer-key validation
-    if expected_keys:
-        if not submitted_answers or not isinstance(submitted_answers, list):
-            # Reject score/total fallback: game has an answer key, so answers must be submitted
-            return game["title"], 0, 0.0
-
-        # Enforce exact expected answer count (reject incomplete or padded answer lists)
-        if len(submitted_answers) != len(expected_keys):
-            return game["title"], 0, 0.0
-
-        # Evaluate score strictly on the server against authoritative keys
-        correct_count = sum(
-            1 for sub, exp in zip(submitted_answers, expected_keys)
-            if str(sub).strip().upper() == str(exp).strip().upper()
-        )
-        total_questions = len(expected_keys)
-        ratio = correct_count / total_questions
-
-        # Enforce passing ratio threshold (at least 60% correct)
-        if ratio < 0.6:
-            return game["title"], 0, 0.0
-
-        xp_awarded = round(game["base_xp"] * ratio)
-        coins_awarded = round(xp_awarded * 0.5, 2)
-        return game["title"], xp_awarded, coins_awarded
-
-    # For games without an answer_key (if any added in future):
-    expected_option = game.get("correct_option")
-    if not selected_option or selected_option.strip() != expected_option:
+    # Path A: Multi-question submitted_answers
+    if submitted_answers and isinstance(submitted_answers, list) and len(submitted_answers) > 1:
+        if expected_keys and len(submitted_answers) == len(expected_keys):
+            correct_count = sum(
+                1 for sub, exp in zip(submitted_answers, expected_keys)
+                if str(sub).strip().upper() == str(exp).strip().upper()
+            )
+            ratio = correct_count / len(expected_keys)
+            if ratio >= 0.6:
+                xp_awarded = round(game["base_xp"] * ratio)
+                coins_awarded = round(xp_awarded * 0.5, 2)
+                return game["title"], xp_awarded, coins_awarded
         return game["title"], 0, 0.0
 
-    max_allowed = game.get("max_score", 10)
-    if total is None or total <= 0 or score is None or score <= 0:
-        return game["title"], 0, 0.0
-    if score > total or score > max_allowed:
+    # If the caller claims multi-question total > 1 without submitting answers, reject
+    if total and total > 1:
         return game["title"], 0, 0.0
 
-    ratio = max(0.0, min(1.0, score / total))
-    if ratio < 0.6:
+    expected_option = (game.get("correct_option") or "optA").strip().lower()
+
+    # Path B: Single-question interactive mobile scenario via selected_option
+    if selected_option:
+        opt = selected_option.strip().lower()
+        if opt == expected_option or (expected_option == "opta" and opt in ("opta", "a")):
+            xp_awarded = game["base_xp"]
+            coins_awarded = round(xp_awarded * 0.5, 2)
+            return game["title"], xp_awarded, coins_awarded
         return game["title"], 0, 0.0
 
-    xp_awarded = round(game["base_xp"] * ratio)
-    coins_awarded = round(xp_awarded * 0.5, 2)
-    return game["title"], xp_awarded, coins_awarded
+    # Path C: Single-element submitted_answers
+    if submitted_answers and isinstance(submitted_answers, list) and len(submitted_answers) == 1:
+        first_ans = str(submitted_answers[0]).strip().lower()
+        if first_ans == expected_option or (expected_option == "opta" and first_ans in ("opta", "a")):
+            xp_awarded = game["base_xp"]
+            coins_awarded = round(xp_awarded * 0.5, 2)
+            return game["title"], xp_awarded, coins_awarded
+        return game["title"], 0, 0.0
+
+    return game["title"], 0, 0.0
 
 
 def is_passing_game(

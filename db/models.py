@@ -263,6 +263,7 @@ class CardPurchase(Base):
     status = Column(Enum(PurchaseStatus), nullable=False, default=PurchaseStatus.pending)
     decline_reason = Column(String, nullable=True)  # ليه اترفضت فورًا (فئة محظورة / كارت مجمد...)
     is_simulated = Column(Boolean, default=True, nullable=False)  # BUG-098: Simulated card transaction
+    idempotency_key = Column(String(128), nullable=True, index=True)  # FF-04: Strict 1-to-1 idempotency replay key
 
     reviewed_by_id = Column(String, nullable=True)
     reviewed_date = Column(DateTime, nullable=True)
@@ -391,6 +392,7 @@ class IdempotencyRecord(Base):
     user_id = Column(String, ForeignKey("users.id"), nullable=True, index=True)
     action = Column(String, nullable=False)
     payload_hash = Column(String(64), nullable=True)
+    response_id = Column(String, nullable=True)  # FF-04: Authoritative linked operation/entity ID
     created_date = Column(DateTime, default=utcnow)
 
 

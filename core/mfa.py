@@ -4,7 +4,7 @@ import io
 import os
 import secrets
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Any
 
 import pyotp
 import qrcode
@@ -20,14 +20,16 @@ RECOVERY_CODES_COUNT = 10
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
-# ---------- MFA Secrets Encryption at Rest (BUG-012) ----------
+from core.config import is_production
+
+# ---------- MFA Secrets Encryption at Rest (BUG-012 & FF-08) ----------
 
 def _get_fernet() -> Fernet:
-    raw_key = (
-        os.getenv("MFA_ENCRYPTION_KEY")
-        or os.getenv("JWT_SECRET")
-        or "finfamily-mfa-default-encryption-secret-key-2026"
-    )
+    raw_key = os.getenv("MFA_ENCRYPTION_KEY")
+    if not raw_key:
+        if is_production():
+            raise RuntimeError("CRITICAL: MFA_ENCRYPTION_KEY environment variable is required in production and cannot be empty!")
+        raw_key = os.getenv("JWT_SECRET") or "finfamily-mfa-default-encryption-secret-key-2026"
     derived = base64.urlsafe_b64encode(hashlib.sha256(raw_key.encode("utf-8")).digest())
     return Fernet(derived)
 
@@ -44,7 +46,10 @@ def encrypt_mfa_secret(secret: Optional[str]) -> Optional[str]:
 
 
 def decrypt_mfa_secret(stored_val: Optional[str]) -> Optional[str]:
-    """Decrypt TOTP secret retrieved from database (BUG-012). Supports legacy plaintext."""
+    """
+    Decrypt TOTP secret retrieved from database (BUG-012 & FF-08).
+    Supports legacy plaintext. Fails closed on decryption failure instead of returning ciphertext.
+    """
     if not stored_val:
         return stored_val
     if not stored_val.startswith("enc:"):
@@ -53,7 +58,8 @@ def decrypt_mfa_secret(stored_val: Optional[str]) -> Optional[str]:
         fernet = _get_fernet()
         return fernet.decrypt(stored_val[4:].encode("ascii")).decode("utf-8")
     except Exception:
-        return stored_val
+        # FF-08: Fail closed on decryption failure
+        return None
 
 
 def generate_secret() -> str:
@@ -80,13 +86,16 @@ def generate_qr_data_uri(uri: str) -> str:
 _LAST_USED_TIMESTEPS: dict[str, int] = {}
 
 
-def verify_totp(secret: str, code: str, user_id: Optional[str] = None) -> bool:
+def verify_totp(secret: str, code: str, user_id: Optional[str] = None, db: Optional[Any] = None) -> bool:
     """
-    valid_window=1 مع التحقق من عدم إعادة استخدام نفس الكود في نافذة الصلاحية (BUG-117).
+    valid_window=1 مع التحقق من عدم إعادة استخدام نفس الكود في نافذة الصلاحية (BUG-117 & FF-07).
+    يتحقق محلياً في الذاكرة ومحفوظاً في قاعدة البيانات لمنع إعادة الاستخدام عبر سيرفرات متعددة.
     """
     if not code or not code.isdigit():
         return False
     plain_secret = decrypt_mfa_secret(secret) or secret
+    if not plain_secret:
+        return False
     totp = pyotp.totp.TOTP(plain_secret)
     now = datetime.now(timezone.utc)
     current_tc = totp.timecode(now)
@@ -97,7 +106,25 @@ def verify_totp(secret: str, code: str, user_id: Optional[str] = None) -> bool:
             if user_id:
                 last_tc = _LAST_USED_TIMESTEPS.get(user_id)
                 if last_tc is not None and target_tc <= last_tc:
-                    return False  # Replay rejected!
+                    return False  # Replay rejected in-process!
+                if db is not None:
+                    try:
+                        from db.models import AuditLog
+                        recent = (
+                            db.query(AuditLog)
+                            .filter(
+                                AuditLog.actor_id == user_id,
+                                AuditLog.action.in_(("login_success", "mfa_login_success", "mfa_verified"))
+                            )
+                            .order_by(AuditLog.created_date.desc())
+                            .first()
+                        )
+                        if recent and recent.detail and isinstance(recent.detail, dict):
+                            db_tc = recent.detail.get("totp_timestep")
+                            if db_tc is not None and target_tc <= int(db_tc):
+                                return False  # Replay rejected cross-worker via database!
+                    except Exception:
+                        pass
                 _LAST_USED_TIMESTEPS[user_id] = target_tc
             return True
 
@@ -142,3 +169,26 @@ def verify_recovery_code(plain_code: str, stored_hash: str) -> bool:
         return pwd_context.verify(normalized, stored_hash)
     except Exception:
         return False
+
+
+def verify_and_consume_recovery_code(db: Any, user_id: str, raw_code: str) -> bool:
+    """
+    Atomically verify and consume a one-time recovery code for the given user (BUG-118, FF-03 & FF-05).
+    """
+    if not db or not user_id or not raw_code:
+        return False
+    from db.models import MfaRecoveryCode
+    normalized = normalize_recovery_code(raw_code)
+    candidates = db.query(MfaRecoveryCode).filter(
+        MfaRecoveryCode.user_id == user_id,
+        MfaRecoveryCode.used == False,  # noqa: E712
+    ).all()
+    match = next((c for c in candidates if verify_recovery_code(normalized, c.code_hash)), None)
+    if not match:
+        return False
+    updated = (
+        db.query(MfaRecoveryCode)
+        .filter(MfaRecoveryCode.id == match.id, MfaRecoveryCode.used == False)  # noqa: E712
+        .update({"used": True, "used_date": datetime.now(timezone.utc).replace(tzinfo=None)})
+    )
+    return updated == 1

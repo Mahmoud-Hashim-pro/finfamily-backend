@@ -16,9 +16,9 @@ from db.database import engine, Base, SessionLocal
 from db.models import (
     User, Family, Wallet, UserRole, SavingsGoal, CardPurchase,
     PurchaseStatus, Transaction, TransactionType, TransactionDirection,
-    AuditLog, CardStatus
+    AuditLog, CardStatus, LessonCompletion, IdempotencyRecord, UserBadge, GameCompletion
 )
-from core.security import hash_password, hash_pin, create_access_token
+from core.security import hash_password, hash_pin, create_access_token, decode_access_token
 from core import mfa
 from core.google_auth import set_mock_google_verifier
 from api.family_routes import to_decimal
@@ -417,3 +417,380 @@ def test_ff22_ai_chat_message_history_bounded():
 
     with pytest.raises(ValidationError):
         ChatMessage(message="Hello", history=oversized_history)
+
+
+# ===========================================================================
+# Audit Pass 2 Deep Verification Suites (FF-01, FF-02, FF-03, FF-04, FF-06)
+# ===========================================================================
+
+def test_audit_ff01_game_interactive_mobile_contract_and_failed_attempt_preserves_reward():
+    """FF-01 & FF-16: Mobile interactive game completion contract and zero-reward attempt preservation."""
+    db = SessionLocal()
+    fam = Family(name="Game Test Fam", family_code="GAMEX1")
+    db.add(fam)
+    db.flush()
+
+    child = User(
+        family_id=fam.id,
+        role=UserRole.child,
+        full_name="Gamer Kid",
+        pin_hash=hash_pin("123456"),
+        xp=0,
+        level=1,
+        is_active=True,
+    )
+    db.add(child)
+    db.flush()
+    wallet = Wallet(owner_id=child.id, balance=Decimal("100.00"))
+    db.add(wallet)
+    db.commit()
+
+    token = create_access_token(user_id=child.id, family_id=fam.id, role="child")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # 1. Correct mobile single-question submission for gm1 (optA)
+    res = client.post("/api/games/complete", json={
+        "game_id": "gm1",
+        "score": 1.0,
+        "total": 1.0,
+        "selected_option": "optA",
+    }, headers=headers)
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["xp_awarded"] == 60
+    assert data["coins_awarded"] == 30.0
+    assert data["new_xp"] == 60
+    assert data["already_rewarded_today"] is False
+
+    # 2. Replay of same game today gives zero rewards but records completion
+    res_repeat = client.post("/api/games/complete", json={
+        "game_id": "gm1",
+        "score": 1.0,
+        "total": 1.0,
+        "selected_option": "optA",
+    }, headers=headers)
+    assert res_repeat.status_code == 200
+    assert res_repeat.json()["already_rewarded_today"] is True
+    assert res_repeat.json()["xp_awarded"] == 0
+
+    # 3. Wrong answer for gm2 (optB)
+    res_wrong = client.post("/api/games/complete", json={
+        "game_id": "gm2",
+        "score": 0.0,
+        "total": 1.0,
+        "selected_option": "optB",
+    }, headers=headers)
+    assert res_wrong.status_code == 200
+    assert res_wrong.json()["xp_awarded"] == 0
+    assert res_wrong.json()["coins_awarded"] == 0.0
+
+    # Verify that wrong answer did NOT consume the daily reward opportunity
+    db.expire_all()
+    wrong_comp = db.query(GameCompletion).filter(
+        GameCompletion.child_id == child.id, GameCompletion.game_id == "gm2"
+    ).first()
+    assert wrong_comp is not None
+    assert wrong_comp.was_rewarded is False
+    assert wrong_comp.reward_date is None
+
+    # Child immediately retries with correct answer -> must successfully receive full rewards!
+    res_retry = client.post("/api/games/complete", json={
+        "game_id": "gm2",
+        "score": 1.0,
+        "total": 1.0,
+        "selected_option": "optA",
+    }, headers=headers)
+    assert res_retry.status_code == 200
+    assert res_retry.json()["xp_awarded"] == 70
+    assert res_retry.json()["already_rewarded_today"] is False
+    db.close()
+
+
+def test_audit_ff02_lesson_catalog_authoritative_rejection_and_xp_tamper_proofing():
+    """FF-02: Lessons reject uncataloged IDs and ignore client-submitted XP values."""
+    db = SessionLocal()
+    fam = Family(name="Lesson Fam", family_code="LESX01")
+    db.add(fam)
+    db.flush()
+
+    child = User(
+        family_id=fam.id,
+        role=UserRole.child,
+        full_name="Student Kid",
+        pin_hash=hash_pin("123456"),
+        xp=0,
+        level=1,
+        is_active=True,
+    )
+    db.add(child)
+    db.commit()
+
+    token = create_access_token(user_id=child.id, family_id=fam.id, role="child")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # 1. Uncataloged lesson ID is rejected with 404
+    res_unknown = client.post("/api/lessons/complete", json={
+        "lesson_id": "forged_nonexistent_lesson_99",
+        "xp": 50,
+    }, headers=headers)
+    assert res_unknown.status_code == 404
+    assert "Unknown or unapproved lesson_id" in res_unknown.json()["detail"]
+
+    # 2. Client attempts to tamper XP with 99999 for les_1 (catalog gives 100)
+    res_tamper = client.post("/api/lessons/complete", json={
+        "lesson_id": "les_1",
+        "xp": 99999,
+    }, headers=headers)
+    assert res_tamper.status_code == 200
+    data = res_tamper.json()
+    assert data["xp_awarded"] == 100
+    assert data["current_xp"] == 100
+    assert data["already_completed"] is False
+
+    # 3. Duplicate completion awards 0 XP idempotently
+    res_dup = client.post("/api/lessons/complete", json={
+        "lesson_id": "les_1",
+        "xp": 20,
+    }, headers=headers)
+    assert res_dup.status_code == 200
+    assert res_dup.json()["already_completed"] is True
+    assert res_dup.json()["xp_awarded"] == 0
+    assert res_dup.json()["current_xp"] == 100
+    db.close()
+
+
+def test_audit_ff04_card_purchase_exact_idempotency_replay():
+    """FF-04: Idempotency replay returns the exact purchase made under that key, not the latest purchase."""
+    db = SessionLocal()
+    fam = Family(name="Purchase Fam", family_code="PURX01")
+    db.add(fam)
+    db.flush()
+
+    child = User(
+        family_id=fam.id,
+        role=UserRole.child,
+        full_name="Shopper Kid",
+        pin_hash=hash_pin("123456"),
+        is_active=True,
+    )
+    db.add(child)
+    db.flush()
+    wallet = Wallet(owner_id=child.id, balance=Decimal("1000.00"), card_status=CardStatus.active)
+    db.add(wallet)
+    db.commit()
+
+    token = create_access_token(user_id=child.id, family_id=fam.id, role="child")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    key1 = f"key-p1-{uuid.uuid4().hex}"
+    key2 = f"key-p2-{uuid.uuid4().hex}"
+
+    # First purchase: Book for 30 EGP under key1
+    res1 = client.post(
+        "/api/card/purchases",
+        json={"merchant": "Book Store", "category": "Books", "amount": 30.0},
+        headers={**headers, "X-Idempotency-Key": key1},
+    )
+    assert res1.status_code == 200
+    p1_id = res1.json()["id"]
+    assert res1.json()["merchant"] == "Book Store"
+    assert res1.json()["amount"] == 30.0
+
+    # Second purchase: Shoes for 150 EGP under key2
+    res2 = client.post(
+        "/api/card/purchases",
+        json={"merchant": "Shoe Store", "category": "Shopping", "amount": 150.0},
+        headers={**headers, "X-Idempotency-Key": key2},
+    )
+    assert res2.status_code == 200
+    p2_id = res2.json()["id"]
+    assert res2.json()["merchant"] == "Shoe Store"
+    assert res2.json()["amount"] == 150.0
+    assert p1_id != p2_id
+
+    # Replay key1: Must return Purchase 1 (Book Store, 30.0), NOT the latest purchase (Shoe Store, 150.0)
+    res_replay1 = client.post(
+        "/api/card/purchases",
+        json={"merchant": "Book Store", "category": "Books", "amount": 30.0},
+        headers={**headers, "X-Idempotency-Key": key1},
+    )
+    assert res_replay1.status_code == 200
+    assert res_replay1.json()["id"] == p1_id
+    assert res_replay1.json()["merchant"] == "Book Store"
+    assert res_replay1.json()["amount"] == 30.0
+
+    # Replay key2: Must return Purchase 2
+    res_replay2 = client.post(
+        "/api/card/purchases",
+        json={"merchant": "Shoe Store", "category": "Shopping", "amount": 150.0},
+        headers={**headers, "X-Idempotency-Key": key2},
+    )
+    assert res_replay2.status_code == 200
+    assert res_replay2.json()["id"] == p2_id
+    assert res_replay2.json()["merchant"] == "Shoe Store"
+    db.close()
+
+
+def test_audit_ff06_admin_mfa_flow_preserves_admin_role():
+    """FF-06: Admin MFA challenge verification issues an admin-role session, not a degraded parent session."""
+    db = SessionLocal()
+    fam = Family(name="Admin Fam", family_code="ADMF01")
+    db.add(fam)
+    db.flush()
+
+    admin_email = f"admin_{uuid.uuid4().hex[:6]}@finfamily.com"
+    os.environ["ADMIN_EMAILS"] = f"{os.environ.get('ADMIN_EMAILS', '')},{admin_email}"
+
+    raw_secret = mfa.generate_secret()
+    encrypted_secret = mfa.encrypt_mfa_secret(raw_secret)
+
+    admin_user = User(
+        family_id=fam.id,
+        role=UserRole.admin,
+        full_name="Chief Admin",
+        email=admin_email,
+        password_hash=hash_password("SuperSecretAdminPass123!"),
+        mfa_enabled=True,
+        mfa_secret=encrypted_secret,
+        is_active=True,
+    )
+    db.add(admin_user)
+    db.commit()
+
+    # 1. Admin login with password
+    login_res = client.post("/api/admin/auth/login", json={
+        "email": admin_email,
+        "password": "SuperSecretAdminPass123!",
+    })
+    assert login_res.status_code == 200
+    data = login_res.json()
+    assert data["mfa_required"] is True
+    challenge_token = data["access_token"]
+
+    # 2. Verify MFA challenge token claims
+    claims = decode_access_token(challenge_token)
+    assert claims["role"] == "mfa_pending"
+    assert claims.get("target_role") == "admin"
+
+    # 3. Complete MFA via admin MFA verify endpoint
+    import pyotp
+    totp = pyotp.TOTP(raw_secret)
+    valid_code = totp.now()
+
+    mfa_res = client.post("/api/admin/auth/mfa/verify", json={
+        "challenge_token": challenge_token,
+        "totp_code": valid_code,
+    })
+    assert mfa_res.status_code == 200
+    admin_session_token = mfa_res.json()["access_token"]
+
+    # 4. Assert issued token is admin role
+    session_claims = decode_access_token(admin_session_token)
+    assert session_claims["role"] == "admin"
+
+    # 5. Access admin-protected endpoint with the token
+    metrics_res = client.get("/api/admin/overview", headers={"Authorization": f"Bearer {admin_session_token}"})
+    assert metrics_res.status_code == 200
+    db.close()
+
+
+def test_audit_ff03_and_ff05_account_deletion_reauth_and_mfa_enforcement():
+    """FF-03 & FF-05: Account deletion requires MFA when enabled, re-auth when stale, and cleans up all FKs."""
+    db = SessionLocal()
+    fam = Family(name="Delete Test Fam", family_code="DELX01")
+    db.add(fam)
+    db.flush()
+    fam_id = str(fam.id)
+
+    raw_secret = mfa.generate_secret()
+    encrypted_secret = mfa.encrypt_mfa_secret(raw_secret)
+
+    parent = User(
+        family_id=fam.id,
+        role=UserRole.parent,
+        full_name="Parent To Delete",
+        email="parent.delete@test.com",
+        password_hash=hash_password("DeletePass123!"),
+        mfa_enabled=True,
+        mfa_secret=encrypted_secret,
+        is_active=True,
+    )
+    db.add(parent)
+    db.flush()
+    parent_id = str(parent.id)
+
+    child = User(
+        family_id=fam.id,
+        role=UserRole.child,
+        full_name="Child To Cascade",
+        pin_hash=hash_pin("123456"),
+        is_active=True,
+    )
+    db.add(child)
+    db.flush()
+    child_id = str(child.id)
+
+    child_wallet = Wallet(owner_id=child.id, balance=Decimal("100.00"))
+    db.add(child_wallet)
+    db.flush()
+
+    goal = SavingsGoal(wallet_id=child_wallet.id, name="Bike", target=Decimal("100.00"))
+    db.add(goal)
+    db.flush()
+
+    lesson_comp = LessonCompletion(child_id=child.id, lesson_id="les_1", xp_awarded=20)
+    db.add(lesson_comp)
+
+    badge = UserBadge(user_id=child.id, badge_id="first_login")
+    db.add(badge)
+
+    idem = IdempotencyRecord(key="idem-key-del-1", family_id=fam.id, user_id=child.id, action="card_purchase")
+    db.add(idem)
+    db.commit()
+    db.close()
+
+    token = create_access_token(user_id=parent_id, family_id=fam_id, role="parent")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # 1. Attempt delete without MFA code -> 403 Forbidden
+    res_no_mfa = client.delete("/api/auth/account", headers=headers)
+    assert res_no_mfa.status_code == 403
+    assert "MFA verification is required" in res_no_mfa.json()["detail"]
+
+    # 2. Attempt delete with invalid MFA code -> 401 Unauthorized
+    res_bad_mfa = client.delete(
+        "/api/auth/account",
+        headers={**headers, "X-MFA-Code": "000000"},
+    )
+    assert res_bad_mfa.status_code == 401
+
+    # 3. Attempt delete with valid TOTP code
+    import pyotp
+    totp = pyotp.TOTP(raw_secret)
+    valid_code = totp.now()
+
+    res_ok = client.delete(
+        "/api/auth/account",
+        headers={**headers, "X-MFA-Code": valid_code},
+    )
+    assert res_ok.status_code == 200
+    assert res_ok.json()["message"] == "Account deleted successfully"
+
+    # 4. Verify cascade cleanup and audit log retention in DB
+    verify_db = SessionLocal()
+    assert verify_db.query(Family).filter(Family.id == fam_id).first() is None
+    assert verify_db.query(User).filter(User.id == child_id).first() is None
+    assert verify_db.query(LessonCompletion).filter(LessonCompletion.child_id == child_id).first() is None
+    assert verify_db.query(UserBadge).filter(UserBadge.user_id == child_id).first() is None
+    assert verify_db.query(IdempotencyRecord).filter(IdempotencyRecord.key == "idem-key-del-1").first() is None
+
+    # Audit trail is preserved with nullified foreign keys
+    deletion_audit = verify_db.query(AuditLog).filter(
+        AuditLog.action == "family_account_deleted",
+        AuditLog.target_id == fam_id,
+    ).first()
+    assert deletion_audit is not None
+    assert deletion_audit.family_id is None
+    assert deletion_audit.actor_id is None
+    verify_db.close()
+

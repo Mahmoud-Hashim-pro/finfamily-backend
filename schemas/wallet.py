@@ -1,6 +1,7 @@
 import math
 import re
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, List, Set
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -31,7 +32,8 @@ HEX_COLOR_REGEX = re.compile(r"^#(?:[0-9a-fA-F]{3}){1,2}$")
 
 def validate_finite_positive(v: float, min_val: float = 0.01, max_val: float = 1_000_000.0) -> float:
     """
-    BUG-021 & BUG-163: Validate that money amount is finite, positive, and bounded.
+    BUG-021, BUG-163 & FF-11: Validate that money amount is finite, positive, bounded,
+    and quantized to 2 decimal places using half-up rounding.
     """
     if v is None or not math.isfinite(v) or math.isnan(v) or math.isinf(v):
         raise ValueError("Amount must be a finite number")
@@ -39,7 +41,8 @@ def validate_finite_positive(v: float, min_val: float = 0.01, max_val: float = 1
         raise ValueError(f"Amount must be at least {min_val}")
     if v > max_val:
         raise ValueError(f"Amount cannot exceed {max_val}")
-    return round(v, 2)
+    d = Decimal(str(v)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return float(d)
 
 
 # ---------------- Savings Goals ----------------
@@ -135,7 +138,10 @@ class WalletLimitsUpdate(BaseModel):
             raise ValueError("Limit cannot be less than -1")
         if v > 1_000_000:
             raise ValueError("Limit cannot exceed 1,000,000")
-        return round(v, 2)
+        if v == -1:
+            return -1.0
+        d = Decimal(str(v)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return float(d)
 
     @field_validator("blocked_categories")
     @classmethod

@@ -250,6 +250,7 @@ def upgrade() -> None:
             sa.Column('status', sa.String(length=20), default='pending', nullable=False),
             sa.Column('decline_reason', sa.String(), nullable=True),
             sa.Column('is_simulated', sa.Boolean(), default=True, nullable=False),
+            sa.Column('idempotency_key', sa.String(length=128), nullable=True),
             sa.Column('reviewed_by_id', sa.String(), nullable=True),
             sa.Column('reviewed_date', sa.DateTime(), nullable=True),
             sa.Column('created_date', sa.DateTime(), nullable=True),
@@ -258,6 +259,7 @@ def upgrade() -> None:
         op.create_index('ix_card_purchases_wallet_id', 'card_purchases', ['wallet_id'])
         op.create_index('ix_card_purchases_family_id', 'card_purchases', ['family_id'])
         op.create_index('ix_card_purchases_child_id', 'card_purchases', ['child_id'])
+        op.create_index('ix_card_purchases_idempotency_key', 'card_purchases', ['idempotency_key'])
     else:
         existing_cols = {col['name'] for col in inspector.get_columns('card_purchases')}
         with op.batch_alter_table('card_purchases', schema=None) as batch_op:
@@ -373,6 +375,7 @@ def upgrade() -> None:
             sa.Column('user_id', sa.String(), sa.ForeignKey('users.id'), nullable=True),
             sa.Column('action', sa.String(), nullable=False),
             sa.Column('payload_hash', sa.String(length=64), nullable=True),
+            sa.Column('response_id', sa.String(), nullable=True),
             sa.Column('created_date', sa.DateTime(), nullable=True),
         )
         op.create_index('ix_idempotency_records_id', 'idempotency_records', ['id'])

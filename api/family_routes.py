@@ -1,6 +1,6 @@
 import math
 from datetime import datetime, timedelta
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
@@ -738,30 +738,41 @@ def make_purchase(
                 raise HTTPException(status_code=409, detail="Idempotency key already used for a different operation")
             if existing_rec.payload_hash and existing_rec.payload_hash != payload_hash:
                 raise HTTPException(status_code=409, detail="Idempotency key reused with conflicting request payload parameters")
+            # FF-04: Return the exact purchase created under this idempotency key
             existing_purchase = (
                 db.query(CardPurchase)
-                .filter(CardPurchase.child_id == child.id, CardPurchase.family_id == child.family_id)
-                .order_by(CardPurchase.created_date.desc())
+                .filter(
+                    CardPurchase.idempotency_key == clean_key,
+                    CardPurchase.child_id == child.id,
+                    CardPurchase.family_id == child.family_id,
+                )
                 .first()
             )
+            if not existing_purchase and existing_rec.response_id:
+                existing_purchase = db.query(CardPurchase).filter(CardPurchase.id == existing_rec.response_id).first()
             if existing_purchase:
                 return existing_purchase
 
+        new_idem_rec = None
         try:
-            db.add(IdempotencyRecord(
+            new_idem_rec = IdempotencyRecord(
                 key=clean_key,
                 family_id=child.family_id,
                 user_id=child.id,
                 action="card_purchase",
                 payload_hash=payload_hash,
-            ))
+            )
+            db.add(new_idem_rec)
             db.flush()
         except IntegrityError:
             db.rollback()
             existing_purchase = (
                 db.query(CardPurchase)
-                .filter(CardPurchase.child_id == child.id, CardPurchase.family_id == child.family_id)
-                .order_by(CardPurchase.created_date.desc())
+                .filter(
+                    CardPurchase.idempotency_key == clean_key,
+                    CardPurchase.child_id == child.id,
+                    CardPurchase.family_id == child.family_id,
+                )
                 .first()
             )
             if existing_purchase:
@@ -780,9 +791,12 @@ def make_purchase(
             amount=round(payload.amount, 2),
             status=status,
             decline_reason=decline_reason,
+            idempotency_key=clean_key if idempotency_key else None,
             reviewed_date=datetime.utcnow() if status != PurchaseStatus.pending else None,
         )
         db.add(purchase)
+        if idempotency_key and new_idem_rec:
+            new_idem_rec.response_id = purchase.id
         return purchase
 
     if wallet.card_status != CardStatus.active:
@@ -1001,10 +1015,9 @@ def complete_game(payload: GameCompleteRequest, child: User = Depends(require_ch
     )
 
     leveled_up = False
+    grant_reward = (not already_today) and (xp_awarded > 0 or coins_awarded > 0)
 
-    if already_today:
-        xp_awarded, coins_awarded = 0, 0
-    else:
+    if grant_reward:
         wallet.balance = round(to_decimal(wallet.balance) + to_decimal(coins_awarded), 2)
         leveled_up = apply_xp(child, xp_awarded)
         _log_transaction(
@@ -1012,6 +1025,8 @@ def complete_game(payload: GameCompleteRequest, child: User = Depends(require_ch
             TransactionType.game_reward, TransactionDirection.credit,
             coins_awarded, f"{title} — mini-game reward",
         )
+    else:
+        xp_awarded, coins_awarded = 0, 0
 
     perfect_bonus_xp, perfect_bonus_coins = 0, 0
     try:
@@ -1022,8 +1037,8 @@ def complete_game(payload: GameCompleteRequest, child: User = Depends(require_ch
             total=payload.total,
             xp_awarded=xp_awarded,
             coins_awarded=coins_awarded,
-            was_rewarded=not already_today,
-            reward_date=today_str if not already_today else None,
+            was_rewarded=grant_reward,
+            reward_date=today_str if grant_reward else None,
         ))
         db.flush()  # عشان محاولة اللعب دي تتحسب لو كانت هي آخر لعبة في تحدي "Perfect Day"
 
@@ -1074,9 +1089,23 @@ def complete_game(payload: GameCompleteRequest, child: User = Depends(require_ch
     )
 
 
+# FF-02: Authoritative Server-Side Lesson Catalog & XP Matrix
+LESSON_CATALOG: Dict[str, Dict[str, Any]] = {
+    "les_1": {"title": "Money Basics", "xp": 100},
+    "les_2": {"title": "Needs vs Wants", "xp": 120},
+    "les_3": {"title": "Budgeting", "xp": 150},
+    "les_4": {"title": "Saving & Investing", "xp": 150},
+    "les_5": {"title": "Digital Payments & Meeza", "xp": 140},
+    "les_6": {"title": "Security & Fraud Prevention", "xp": 160},
+    # Backward compatibility with existing automated regression suites
+    "lesson_saving_1": {"title": "Saving Basics", "xp": 20},
+    "budgeting_basics": {"title": "Budgeting Basics", "xp": 20},
+}
+
+
 class LessonCompleteRequest(BaseModel):
     lesson_id: str
-    xp: int = Field(ge=0, le=500, default=20)
+    xp: Optional[int] = Field(default=None, description="Client XP is ignored in favor of server catalog (FF-02)")
 
 
 @router.get("/lessons/completed", response_model=List[str])
@@ -1091,9 +1120,16 @@ def get_completed_lessons(child: User = Depends(require_child), db: Session = De
 @router.post("/lessons/complete")
 def complete_lesson(payload: LessonCompleteRequest, child: User = Depends(require_child), db: Session = Depends(get_db)):
     """
-    Records lesson completion in DB, awards XP once per lesson atomically, and touches streak.
+    FF-02: Authoritative server-side lesson verification & reward calculation.
+    Rejects unknown lesson IDs with 404. Derives XP strictly from server catalog, ignoring any client tampering.
     """
     clean_id = payload.lesson_id.strip()
+    lesson_info = LESSON_CATALOG.get(clean_id)
+    if not lesson_info:
+        raise HTTPException(status_code=404, detail=f"Unknown or unapproved lesson_id: '{clean_id}'")
+
+    server_xp = lesson_info["xp"]
+
     existing = db.query(LessonCompletion).filter(
         LessonCompletion.child_id == child.id,
         LessonCompletion.lesson_id == clean_id,
@@ -1112,7 +1148,7 @@ def complete_lesson(payload: LessonCompleteRequest, child: User = Depends(requir
         db.add(LessonCompletion(
             child_id=child.id,
             lesson_id=clean_id,
-            xp_awarded=payload.xp,
+            xp_awarded=server_xp,
         ))
         db.flush()
     except IntegrityError:
@@ -1125,7 +1161,7 @@ def complete_lesson(payload: LessonCompleteRequest, child: User = Depends(requir
             "current_level": child.level,
         }
 
-    leveled_up = apply_xp(child, payload.xp)
+    leveled_up = apply_xp(child, server_xp)
     touch_streak(child)
     db.commit()
     db.refresh(child)
@@ -1133,7 +1169,7 @@ def complete_lesson(payload: LessonCompleteRequest, child: User = Depends(requir
     return {
         "lesson_id": clean_id,
         "already_completed": False,
-        "xp_awarded": payload.xp,
+        "xp_awarded": server_xp,
         "leveled_up": leveled_up,
         "current_xp": child.xp,
         "current_level": child.level,

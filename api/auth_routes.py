@@ -1,11 +1,12 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 import os
 import secrets
 import string
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status, Body
+from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -16,6 +17,7 @@ from db.models import (
     Family,
     UserRole,
     Wallet,
+    SavingsGoal,
     PasswordResetToken,
     MfaRecoveryCode,
     Mission,
@@ -23,6 +25,9 @@ from db.models import (
     CardPurchase,
     GameCompletion,
     AuditLog,
+    UserBadge,
+    IdempotencyRecord,
+    LessonCompletion,
 )
 from core.security import (
     hash_password,
@@ -74,6 +79,12 @@ from schemas.auth import (
 )
 
 logger = logging.getLogger("finfamily.auth")
+
+
+class AccountDeletePayload(BaseModel):
+    password: Optional[str] = None
+    mfa_code: Optional[str] = None
+
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 auth_compat_router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -878,7 +889,7 @@ def delete_child(
     parent: User = Depends(require_parent),
     db: Session = Depends(get_db),
 ):
-    """BUG-057 (P1) & BUG-140 (P2): Parent deletes child and cascades related data."""
+    """BUG-057 (P1), BUG-140 (P2), FF-03 & FF-05: Parent deletes child and cascades all related data atomically."""
     child = (
         db.query(User)
         .filter(User.id == child_id, User.family_id == parent.family_id, User.role == UserRole.child)
@@ -887,17 +898,54 @@ def delete_child(
     if not child:
         raise HTTPException(status_code=404, detail="Child not found")
 
-    # Clean up dependent records
+    # 1. Lesson completions
+    db.query(LessonCompletion).filter(LessonCompletion.child_id == child.id).delete(synchronize_session=False)
+
+    # 2. Game completions
     db.query(GameCompletion).filter(GameCompletion.child_id == child.id).delete(synchronize_session=False)
-    db.query(CardPurchase).filter(CardPurchase.child_id == child.id).delete(synchronize_session=False)
-    db.query(Mission).filter((Mission.assigned_to_id == child.id) | (Mission.created_by_id == child.id)).delete(synchronize_session=False)
+
+    # 3. Badges
+    db.query(UserBadge).filter(UserBadge.user_id == child.id).delete(synchronize_session=False)
+
+    # 4. Idempotency records for this child
+    db.query(IdempotencyRecord).filter(IdempotencyRecord.user_id == child.id).delete(synchronize_session=False)
+
+    # 5. Missions assigned to or created by child (clear related transactions first)
+    child_mission_ids = [
+        m[0] for m in db.query(Mission.id).filter(
+            (Mission.assigned_to_id == child.id) | (Mission.created_by_id == child.id)
+        ).all()
+    ]
+    if child_mission_ids:
+        db.query(Transaction).filter(
+            Transaction.related_mission_id.in_(child_mission_ids)
+        ).update({Transaction.related_mission_id: None}, synchronize_session=False)
+        db.query(Mission).filter(Mission.id.in_(child_mission_ids)).delete(synchronize_session=False)
+
+    # 6. Child wallet, savings goals, card purchases, transactions
+    child_wallet = db.query(Wallet).filter(Wallet.owner_id == child.id).first()
+    if child_wallet:
+        db.query(SavingsGoal).filter(SavingsGoal.wallet_id == child_wallet.id).delete(synchronize_session=False)
+        db.query(CardPurchase).filter(
+            (CardPurchase.wallet_id == child_wallet.id) | (CardPurchase.child_id == child.id)
+        ).delete(synchronize_session=False)
+        db.query(Transaction).filter(Transaction.wallet_id == child_wallet.id).delete(synchronize_session=False)
+        db.delete(child_wallet)
+    else:
+        db.query(CardPurchase).filter(CardPurchase.child_id == child.id).delete(synchronize_session=False)
+
+    # 7. Nullify child references in AuditLog
     db.query(AuditLog).filter(AuditLog.actor_id == child.id).update({"actor_id": None}, synchronize_session=False)
 
+    # 8. Delete the child user
     db.delete(child)
+
+    # 9. Atomic audit logging
     log_action(
         db, request=request, action="child_deleted",
         actor_id=parent.id, actor_role="parent", family_id=parent.family_id,
         target_type="user", target_id=child_id,
+        detail={"child_name": child.full_name},
     )
     db.commit()
 
@@ -908,37 +956,125 @@ def delete_child(
 @router.delete("/parent/account")
 def delete_account(
     request: Request,
+    payload: Optional[AccountDeletePayload] = Body(None),
     parent: User = Depends(require_parent),
     db: Session = Depends(get_db),
 ):
-    """BUG-057 (P1), BUG-140 (P2), FF-03 & FF-13: Parent deletes account and family with audit preservation."""
+    """
+    BUG-057 (P1), BUG-140 (P2), FF-03, FF-05 & FF-13:
+    Parent deletes account and family with reauthentication, MFA verification,
+    and complete atomic cascade deletion with audit preservation.
+    """
+    # 1. Require MFA verification if parent has MFA enabled (FF-03 & FF-05)
+    if getattr(parent, "mfa_enabled", False):
+        mfa_code = (
+            request.headers.get("X-MFA-Code")
+            or (payload.mfa_code if payload else None)
+        )
+        if not mfa_code or not str(mfa_code).strip():
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="MFA verification is required to delete this account.",
+            )
+        clean_mfa_code = str(mfa_code).strip()
+        secret = mfa.decrypt_mfa_secret(parent.mfa_secret)
+        totp_ok = secret and mfa.verify_totp(secret, clean_mfa_code, db=db, user_id=parent.id)
+        if not totp_ok:
+            rec_ok = mfa.verify_and_consume_recovery_code(db, parent.id, clean_mfa_code)
+            if not rec_ok:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid MFA code or recovery code")
+
+    # 2. Fresh re-authentication check (FF-03):
+    # Verify the token was issued within the last 5 minutes (300s), OR verify password confirmation
+    token_fresh = False
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        raw_token = auth_header.split(" ", 1)[1].strip()
+        try:
+            claims = decode_access_token(raw_token)
+            iat = claims.get("iat")
+            if iat is not None:
+                age = datetime.now(timezone.utc).timestamp() - float(iat)
+                if 0 <= age <= 300:
+                    token_fresh = True
+        except Exception:
+            pass
+
+    if not token_fresh:
+        confirm_pwd = (
+            request.headers.get("X-Confirm-Password")
+            or (payload.password if payload else None)
+        )
+        if not confirm_pwd or not parent.password_hash or not verify_password(confirm_pwd, parent.password_hash):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Recent re-authentication required to delete account. Please confirm your password or re-authenticate.",
+            )
+
     family_id = parent.family_id
     parent_email = parent.email
     family_users = db.query(User).filter(User.family_id == family_id).all()
     user_ids = [u.id for u in family_users]
 
-    # FF-03 & FF-13: Log deletion audit before wiping records, retaining minimal compliance metadata
+    # Pre-deletion compliance audit logging in the SAME database transaction
+    # Store family_id and actor_id as NULL to avoid FK constraint issues upon deleting family/users
     log_action(
         db, request=request, action="family_account_deleted",
         actor_id=None, actor_role="parent", family_id=None,
         target_type="family", target_id=family_id,
         detail={"parent_email": parent_email, "family_id": family_id, "member_count": len(user_ids)},
     )
-    db.commit()
 
     if user_ids:
+        # 1. Lesson completions
+        db.query(LessonCompletion).filter(LessonCompletion.child_id.in_(user_ids)).delete(synchronize_session=False)
+        # 2. Game completions
         db.query(GameCompletion).filter(GameCompletion.child_id.in_(user_ids)).delete(synchronize_session=False)
-        db.query(CardPurchase).filter((CardPurchase.child_id.in_(user_ids)) | (CardPurchase.family_id == family_id)).delete(synchronize_session=False)
-        db.query(Mission).filter((Mission.family_id == family_id) | (Mission.assigned_to_id.in_(user_ids)) | (Mission.created_by_id.in_(user_ids))).delete(synchronize_session=False)
-        db.query(Transaction).filter(Transaction.family_id == family_id).delete(synchronize_session=False)
+        # 3. Badges
+        db.query(UserBadge).filter(UserBadge.user_id.in_(user_ids)).delete(synchronize_session=False)
+        # 4. Idempotency records
+        db.query(IdempotencyRecord).filter(
+            (IdempotencyRecord.family_id == family_id) | (IdempotencyRecord.user_id.in_(user_ids))
+        ).delete(synchronize_session=False)
+        # 5. Password reset tokens & MFA recovery codes
         db.query(PasswordResetToken).filter(PasswordResetToken.user_id.in_(user_ids)).delete(synchronize_session=False)
         db.query(MfaRecoveryCode).filter(MfaRecoveryCode.user_id.in_(user_ids)).delete(synchronize_session=False)
-        # Preserve audit logs by clearing foreign key references instead of deleting the compliance trail
-        db.query(AuditLog).filter(AuditLog.family_id == family_id).update({AuditLog.family_id: None, AuditLog.actor_id: None}, synchronize_session=False)
 
+    # 6. Wallets, SavingsGoals, CardPurchases, Transactions
+    family_wallets = db.query(Wallet).filter(Wallet.owner_id.in_(user_ids)).all() if user_ids else []
+    wallet_ids = [w.id for w in family_wallets]
+    if wallet_ids:
+        db.query(SavingsGoal).filter(SavingsGoal.wallet_id.in_(wallet_ids)).delete(synchronize_session=False)
+        db.query(CardPurchase).filter(
+            (CardPurchase.wallet_id.in_(wallet_ids)) | (CardPurchase.family_id == family_id)
+        ).delete(synchronize_session=False)
+        db.query(Transaction).filter(
+            (Transaction.wallet_id.in_(wallet_ids)) | (Transaction.family_id == family_id)
+        ).delete(synchronize_session=False)
+        for w in family_wallets:
+            db.delete(w)
+    else:
+        db.query(CardPurchase).filter(CardPurchase.family_id == family_id).delete(synchronize_session=False)
+        db.query(Transaction).filter(Transaction.family_id == family_id).delete(synchronize_session=False)
+
+    # 7. Missions
+    db.query(Mission).filter(Mission.family_id == family_id).delete(synchronize_session=False)
+
+    # 8. Nullify existing AuditLog foreign keys for the family/users so compliance trail is retained
+    filter_cond = AuditLog.family_id == family_id
+    if user_ids:
+        filter_cond = filter_cond | AuditLog.actor_id.in_(user_ids)
+    db.query(AuditLog).filter(filter_cond).update(
+        {AuditLog.family_id: None, AuditLog.actor_id: None},
+        synchronize_session=False,
+    )
+
+    # 9. Delete family (User relationship has cascade="all, delete-orphan")
     family = db.query(Family).filter(Family.id == family_id).first()
     if family:
         db.delete(family)
+
+    # Single atomic commit for everything
     db.commit()
 
     return {"message": "Account deleted successfully"}
@@ -1084,6 +1220,7 @@ def recovery_codes_status(parent: User = Depends(require_parent), db: Session = 
 
 
 @router.post("/mfa/recovery-codes/regenerate", response_model=RecoveryCodesResponse)
+@limiter.limit("5/minute")
 def regenerate_recovery_codes(
     request: Request,
     payload: MfaDisableRequest,
@@ -1151,29 +1288,42 @@ def verify_mfa_login(request: Request, payload: MfaVerifyRequest, db: Session = 
     if not user or not user.mfa_enabled:
         raise HTTPException(status_code=401, detail="User not found or MFA not enabled")
 
-    # BUG-117 (P2): Verify TOTP code with replay prevention
+    # BUG-117 (P2), FF-06 & FF-07: Verify TOTP code with replay prevention and role preservation
+    target_role = data.get("target_role") or "parent"
+    if target_role == "admin":
+        from api.admin_routes import get_admin_allowlist
+        if not user.email or user.email.lower() not in get_admin_allowlist():
+            raise HTTPException(status_code=403, detail="Access denied: Admin privileges required")
+        issued_role = "admin"
+        is_admin_flag = True
+    else:
+        issued_role = "parent"
+        is_admin_flag = False
+
     plain_secret = mfa.decrypt_mfa_secret(user.mfa_secret)
-    if not mfa.verify_totp(plain_secret, payload.code, user_id=user.id):
+    if not plain_secret or not mfa.verify_totp(plain_secret, payload.code, user_id=user.id, db=db):
         log_action(
             db, request=request, action="mfa_failed",
-            actor_id=user.id, actor_role="parent", family_id=user.family_id,
+            actor_id=user.id, actor_role=issued_role, family_id=user.family_id,
         )
         db.commit()
         raise HTTPException(status_code=401, detail="Invalid authentication code")
 
+    used_tc = mfa._LAST_USED_TIMESTEPS.get(user.id)
     log_action(
         db, request=request, action="login_success",
-        actor_id=user.id, actor_role="parent", family_id=user.family_id,
-        detail={"mfa_used": True},
+        actor_id=user.id, actor_role=issued_role, family_id=user.family_id,
+        detail={"mfa_used": True, "totp_timestep": used_tc},
     )
     db.commit()
 
     token = create_access_token(
         user_id=user.id,
         family_id=user.family_id,
-        role="parent",
+        role=issued_role,
         email=user.email,
         token_version=getattr(user, "token_version", 1),
+        is_admin=is_admin_flag,
     )
     return TokenResponse(access_token=token, token_type="bearer", user=UserResponse.model_validate(user))
 
