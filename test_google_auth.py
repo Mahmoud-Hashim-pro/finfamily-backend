@@ -292,3 +292,31 @@ def test_verify_google_id_token_audience_mismatch_and_sub_enforcement(monkeypatc
     finally:
         set_mock_google_verifier(mock_verifier)
 
+
+def test_google_login_unregistered_account_with_create_if_missing_false():
+    """Verify that when create_if_missing=False, an unregistered Google user receives 404 instead of auto-registration."""
+    payload = {
+        "id_token": "valid_token_clark",
+        "create_if_missing": False
+    }
+
+    # Should return 404 Not Found
+    res = client.post("/api/auth/google", json=payload)
+    assert res.status_code == 404
+    data = res.json()
+    assert "غير مسجل" in data["detail"]
+
+    # Verify no user or family was created in database
+    db = SessionLocal()
+    user = db.query(User).filter(User.email == "clark@gmail.com").first()
+    assert user is None
+    db.close()
+
+    # Now if create_if_missing=True (e.g. registration flow), it succeeds and creates the user
+    payload["create_if_missing"] = True
+    res_reg = client.post("/api/auth/google", json=payload)
+    assert res_reg.status_code == 200
+    reg_data = res_reg.json()
+    assert reg_data["user"]["email"] == "clark@gmail.com"
+
+

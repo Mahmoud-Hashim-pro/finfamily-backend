@@ -85,6 +85,7 @@ class GoogleLoginRequest(BaseModel):
     id_token: str = Field(min_length=1, description="Cryptographically signed Google ID Token")
     family_name: Optional[str] = Field(default=None, max_length=100)
     otp_code: Optional[str] = Field(default=None, max_length=10, description="Optional TOTP code if MFA enabled")
+    create_if_missing: Optional[bool] = Field(default=True, description="Whether to automatically register if user does not exist")
     # The fields below may be sent by client wrappers but are ignored by backend authentication
     email: Optional[EmailStr] = None
     name: Optional[str] = None

@@ -457,6 +457,13 @@ def google_auth(request: Request, payload: GoogleLoginRequest, db: Session = Dep
             mfa_required=False,
         )
 
+    # Account not found and auto-creation disabled (login-only flow)
+    if not payload.create_if_missing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="هذا الحساب غير مسجل بعد في FinFamily. يرجى إنشاء حساب جديد.",
+        )
+
     # New email: atomically create a Family (e.g. f"{name}'s Family"), create User with role=UserRole.parent, email, full_name, is_active=True, create their Wallet, and return access_token and user info.
     if is_admin_email(clean_email):
         raise HTTPException(status_code=400, detail="Admin email reserved")
