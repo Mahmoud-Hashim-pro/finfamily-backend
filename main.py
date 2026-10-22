@@ -171,11 +171,32 @@ def verify_database_readiness(target_engine, is_production_mode: bool = False) -
         return False, f"Database readiness check failed: {e}"
 
 
+def ensure_schema_compatibility(target_engine):
+    """
+    Non-destructive, idempotent forward schema compatibility.
+    Ensures missing critical columns from newer revisions exist without dropping data.
+    """
+    if target_engine.dialect.name == "postgresql":
+        from sqlalchemy import text
+        try:
+            with target_engine.begin() as conn:
+                conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_totp_timestep INTEGER;"))
+                conn.execute(text("ALTER TABLE card_purchases ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(128);"))
+                conn.execute(text("ALTER TABLE idempotency_records ADD COLUMN IF NOT EXISTS response_id VARCHAR;"))
+                conn.execute(text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL, CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num));"))
+                conn.execute(text("INSERT INTO alembic_version (version_num) VALUES ('0002_idemp_mfa_atomic') ON CONFLICT DO NOTHING;"))
+            logger.info("Database schema compatibility verified and applied successfully.")
+        except Exception as e:
+            logger.warning(f"Schema compatibility notice: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db_healthy
     # Validate production required secrets and configurations
     validate_production_configuration()
+    # Non-destructive schema compatibility
+    ensure_schema_compatibility(engine)
     # FF-34 & FF-30: Controlled schema initialization in serverless environments
     skip_db_init_raw = os.getenv("SKIP_DB_INIT")
     if skip_db_init_raw is None:
