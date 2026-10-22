@@ -5,7 +5,7 @@ from decimal import Decimal
 from datetime import datetime, timezone
 
 os.environ["ENVIRONMENT"] = "development"
-os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+os.environ["DATABASE_URL"] = os.getenv("TEST_POSTGRES_URL") or "sqlite:///:memory:"
 os.environ["JWT_SECRET"] = "financial-concurrency-test-secret-key-32bytes!!"
 os.environ["APP_VERSION"] = "1.1.0"
 os.environ["APP_BUILD_NUMBER"] = "8"
