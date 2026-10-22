@@ -75,7 +75,7 @@ def _scope_concur_db():
 client = TestClient(app)
 
 
-def _setup_family_and_users(init_wallet_balance=0.0):
+def _setup_family_and_users(init_wallet_balance=Decimal("0.00")):
     db = ConcurSessionLocal()
     try:
         fam_id = f"fam-concur-{uuid.uuid4()}"
@@ -110,7 +110,7 @@ def _setup_family_and_users(init_wallet_balance=0.0):
         db.add_all([parent, child])
         db.commit()
 
-        c_wallet = Wallet(owner_id=child_id, balance=init_wallet_balance, savings_balance=0.0)
+        c_wallet = Wallet(owner_id=child_id, balance=Decimal(str(init_wallet_balance)), savings_balance=Decimal("0.00"))
         db.add(c_wallet)
         db.commit()
 
@@ -124,7 +124,7 @@ def _setup_family_and_users(init_wallet_balance=0.0):
 
 def test_concurrent_identical_idempotency_allowance():
     """10 simultaneous threads sending the exact same idempotency key: exactly 1 executes credit, no double credit."""
-    fam_id, parent_id, child_id, p_token, _ = _setup_family_and_users(init_wallet_balance=50.0)
+    fam_id, parent_id, child_id, p_token, _ = _setup_family_and_users(init_wallet_balance=Decimal("50.00"))
     headers = {"Authorization": f"Bearer {p_token}"}
     shared_key = f"idem-shared-{uuid.uuid4()}"
     payload = {
@@ -149,7 +149,7 @@ def test_concurrent_identical_idempotency_allowance():
     db = ConcurSessionLocal()
     try:
         w = db.query(Wallet).filter(Wallet.owner_id == child_id).first()
-        assert float(w.balance) == 75.0, f"Balance was double-credited! Expected 75.0, got {w.balance}"
+        assert w.balance == Decimal("75.00"), f"Balance was double-credited! Expected 75.00, got {w.balance}"
 
         # Only 1 allowance transaction recorded
         tx_count = db.query(Transaction).filter(
@@ -167,7 +167,7 @@ def test_concurrent_identical_idempotency_allowance():
 
 def test_idempotency_conflicting_payload_rejected_with_409():
     """Reusing the same idempotency key with a conflicting payload raises HTTP 409 Conflict."""
-    fam_id, parent_id, child_id, p_token, _ = _setup_family_and_users(init_wallet_balance=100.0)
+    fam_id, parent_id, child_id, p_token, _ = _setup_family_and_users(init_wallet_balance=Decimal("100.00"))
     headers = {"Authorization": f"Bearer {p_token}"}
     shared_key = f"idem-conflict-{uuid.uuid4()}"
 
@@ -185,7 +185,7 @@ def test_idempotency_conflicting_payload_rejected_with_409():
     # First request succeeds
     r1 = client.post(f"/api/wallet/child/{child_id}/allowance", json=payload1, headers=headers)
     assert r1.status_code == 200
-    assert float(r1.json()["balance"]) == 130.0
+    assert Decimal(str(r1.json()["balance"])) == Decimal("130.00")
 
     # Second request with different amount must be rejected with 409
     r2 = client.post(f"/api/wallet/child/{child_id}/allowance", json=payload2, headers=headers)
@@ -196,7 +196,7 @@ def test_idempotency_conflicting_payload_rejected_with_409():
     db = ConcurSessionLocal()
     try:
         w = db.query(Wallet).filter(Wallet.owner_id == child_id).first()
-        assert float(w.balance) == 130.0
+        assert w.balance == Decimal("130.00")
     finally:
         db.close()
 
@@ -228,14 +228,14 @@ def test_concurrent_distinct_transfers_no_lost_updates():
     db = ConcurSessionLocal()
     try:
         w = db.query(Wallet).filter(Wallet.owner_id == child_id).first()
-        assert float(w.balance) == 100.0, f"Lost update detected! Expected 100.0, got {w.balance}"
+        assert w.balance == Decimal("100.00"), f"Lost update detected! Expected 100.00, got {w.balance}"
     finally:
         db.close()
 
 
 def test_concurrent_debit_overdraft_prevention():
     """Simultaneous goal deposits competing for limited wallet funds: overdraft prevented, no negative balance."""
-    fam_id, parent_id, child_id, _, c_token = _setup_family_and_users(init_wallet_balance=35.0)
+    fam_id, parent_id, child_id, _, c_token = _setup_family_and_users(init_wallet_balance=Decimal("35.00"))
     c_headers = {"Authorization": f"Bearer {c_token}"}
 
     db = ConcurSessionLocal()
@@ -245,8 +245,8 @@ def test_concurrent_debit_overdraft_prevention():
             id=f"g-{uuid.uuid4()}",
             wallet_id=w.id,
             name="Lego Set",
-            target=100.0,
-            current=0.0
+            target=Decimal("100.00"),
+            current=Decimal("0.00")
         )
         db.add(goal)
         db.commit()
@@ -279,16 +279,16 @@ def test_concurrent_debit_overdraft_prevention():
         w = db.query(Wallet).filter(Wallet.owner_id == child_id).first()
         g = db.query(SavingsGoal).filter(SavingsGoal.id == goal_id).first()
         # In all scenarios, wallet balance must NEVER be negative
-        assert float(w.balance) >= 0.0, f"Wallet balance overdrafted! Balance: {w.balance}"
+        assert w.balance >= Decimal("0.00"), f"Wallet balance overdrafted! Balance: {w.balance}"
         # Sum of available balance and goal current must equal initial balance
-        assert float(w.balance) + float(g.current) == 35.0, f"Money leaked or created! balance={w.balance}, goal={g.current}"
+        assert w.balance + g.current == Decimal("35.00"), f"Money leaked or created! balance={w.balance}, goal={g.current}"
     finally:
         db.close()
 
 
 def test_concurrent_game_completion_daily_anti_cheat_and_atomicity():
     """10 simultaneous game completions with correct answers: daily bonus anti-cheat awarded at most ONCE."""
-    fam_id, parent_id, child_id, _, c_token = _setup_family_and_users(init_wallet_balance=0.0)
+    fam_id, parent_id, child_id, _, c_token = _setup_family_and_users(init_wallet_balance=Decimal("0.00"))
     c_headers = {"Authorization": f"Bearer {c_token}"}
 
     game_id = "gm1"
@@ -322,9 +322,9 @@ def test_concurrent_game_completion_daily_anti_cheat_and_atomicity():
     assert len(rewarded_responses) == 1, f"Expected exactly 1 rewarded response, got {len(rewarded_responses)}"
     assert len(already_responses) == thread_count - 1
 
-    expected_coins = rewarded_responses[0]["coins_awarded"]
+    expected_coins = Decimal(str(rewarded_responses[0]["coins_awarded"]))
     expected_xp = rewarded_responses[0]["xp_awarded"]
-    assert expected_coins > 0
+    assert expected_coins > Decimal("0.00")
     assert expected_xp > 0
 
     # Verify wallet and user in database: credited exactly ONCE
@@ -332,7 +332,7 @@ def test_concurrent_game_completion_daily_anti_cheat_and_atomicity():
     try:
         w = db.query(Wallet).filter(Wallet.owner_id == child_id).first()
         u = db.query(User).filter(User.id == child_id).first()
-        assert float(w.balance) == float(expected_coins), f"Wallet credited multiple times! Expected {expected_coins}, got {w.balance}"
+        assert w.balance == expected_coins, f"Wallet credited multiple times! Expected {expected_coins}, got {w.balance}"
         assert u.xp == expected_xp, f"XP awarded multiple times! Expected {expected_xp}, got {u.xp}"
 
         # Check rewarded game completions count in DB
@@ -481,7 +481,7 @@ def test_twenty_concurrent_debits_and_ledger_reconciliation():
     3. Ledger and balance strictly reconcile (balance + goal deposits == initial funds).
     4. Transaction atomicity: no partial state or phantom updates.
     """
-    initial_funds = 100.0
+    initial_funds = Decimal("100.00")
     debit_per_request = 10.0
     thread_count = 20
 
@@ -495,8 +495,8 @@ def test_twenty_concurrent_debits_and_ledger_reconciliation():
             id=f"g-20concur-{uuid.uuid4()}",
             wallet_id=w.id,
             name="PlayStation 5",
-            target=500.0,
-            current=0.0
+            target=Decimal("500.00"),
+            current=Decimal("0.00")
         )
         db.add(goal)
         db.commit()
@@ -529,9 +529,9 @@ def test_twenty_concurrent_debits_and_ledger_reconciliation():
         w = db.query(Wallet).filter(Wallet.owner_id == child_id).first()
         g = db.query(SavingsGoal).filter(SavingsGoal.id == goal_id).first()
 
-        assert float(w.balance) == 0.0, f"Expected wallet balance 0.0, got {w.balance}"
-        assert float(g.current) == 100.0, f"Expected goal balance 100.0, got {g.current}"
-        assert float(w.balance) + float(g.current) == initial_funds, "Ledger imbalance detected!"
+        assert w.balance == Decimal("0.00"), f"Expected wallet balance 0.00, got {w.balance}"
+        assert g.current == Decimal("100.00"), f"Expected goal balance 100.00, got {g.current}"
+        assert w.balance + g.current == initial_funds, "Ledger imbalance detected!"
     finally:
         db.close()
 
@@ -544,7 +544,7 @@ def test_inter_wallet_transfer_and_transaction_rollback():
     1. Transfer between wallet and goal updates both sides in the exact same transaction.
     2. Simulated failure mid-transaction triggers clean rollback with zero partial state or balance corruption.
     """
-    initial_balance = 50.0
+    initial_balance = Decimal("50.00")
     transfer_amount = 25.0
 
     fam_id, parent_id, child_id, _, c_token = _setup_family_and_users(init_wallet_balance=initial_balance)
@@ -557,8 +557,8 @@ def test_inter_wallet_transfer_and_transaction_rollback():
             id=f"g-atomic-{uuid.uuid4()}",
             wallet_id=w.id,
             name="Emergency Fund",
-            target=200.0,
-            current=0.0
+            target=Decimal("200.00"),
+            current=Decimal("0.00")
         )
         db.add(goal)
         db.commit()
@@ -578,9 +578,9 @@ def test_inter_wallet_transfer_and_transaction_rollback():
     try:
         w = db.query(Wallet).filter(Wallet.owner_id == child_id).first()
         g = db.query(SavingsGoal).filter(SavingsGoal.id == goal_id).first()
-        assert float(w.balance) == 25.0
-        assert float(g.current) == 25.0
-        assert float(w.balance) + float(g.current) == initial_balance
+        assert w.balance == Decimal("25.00")
+        assert g.current == Decimal("25.00")
+        assert w.balance + g.current == initial_balance
     finally:
         db.close()
 
@@ -597,8 +597,8 @@ def test_inter_wallet_transfer_and_transaction_rollback():
     try:
         w = db.query(Wallet).filter(Wallet.owner_id == child_id).first()
         g = db.query(SavingsGoal).filter(SavingsGoal.id == goal_id).first()
-        assert float(w.balance) == 25.0
-        assert float(g.current) == 25.0
+        assert w.balance == Decimal("25.00")
+        assert g.current == Decimal("25.00")
     finally:
         db.close()
 

@@ -1344,7 +1344,7 @@ def test_verify_database_readiness_multiple_heads_and_behind_revision():
         conn.commit()
     is_ready, msg = verify_database_readiness(test_engine, is_production_mode=False)
     assert is_ready is False
-    assert "Database schema is behind" in msg
+    assert "do not match expected" in msg or "Database schema is behind" in msg
     assert "0001_initial_schema" in msg
 
     # 3. Matching expected head -> succeeds
@@ -1355,6 +1355,25 @@ def test_verify_database_readiness_multiple_heads_and_behind_revision():
     is_ready, msg = verify_database_readiness(test_engine, is_production_mode=False)
     assert is_ready is True
     assert "verified" in msg
+
+    # 4. Extra/rogue revision beyond expected heads -> strictly rejected
+    with test_engine.connect() as conn:
+        conn.execute(text("INSERT INTO alembic_version (version_num) VALUES ('0003_untracked_rogue_revision')"))
+        conn.commit()
+    is_ready, msg = verify_database_readiness(test_engine, is_production_mode=False)
+    assert is_ready is False
+    assert "extra/unknown revision" in msg or "do not match expected" in msg
+    assert "0003_untracked_rogue_revision" in msg
+
+    # 5. Unknown completely different revision -> strictly rejected
+    with test_engine.connect() as conn:
+        conn.execute(text("DELETE FROM alembic_version"))
+        conn.execute(text("INSERT INTO alembic_version (version_num) VALUES ('foreign_system_rev')"))
+        conn.commit()
+    is_ready, msg = verify_database_readiness(test_engine, is_production_mode=False)
+    assert is_ready is False
+    assert "do not match" in msg
+    assert "foreign_system_rev" in msg
 
 
 

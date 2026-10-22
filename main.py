@@ -155,10 +155,14 @@ def verify_database_readiness(target_engine, is_production_mode: bool = False) -
                 if not expected_heads:
                     expected_heads = {"0002_idemp_mfa_atomic"}
 
-                if not applied_revs.issubset(expected_heads) and not expected_heads.issubset(applied_revs):
+                if applied_revs != expected_heads:
                     applied_str = "', '".join(sorted(applied_revs))
                     heads_str = "', '".join(sorted(expected_heads))
-                    return False, f"Database schema is behind: applied revision(s) '{applied_str}', expected head(s) '{heads_str}'."
+                    if applied_revs.issubset(expected_heads):
+                        return False, f"Database schema is behind: revision(s) '{applied_str}' applied, but head(s) '{heads_str}' required."
+                    if expected_heads.issubset(applied_revs):
+                        return False, f"Database contains extra/unknown revision(s) '{applied_str}' beyond expected codebase head(s) '{heads_str}'."
+                    return False, f"Alembic applied revision(s) '{applied_str}' do not match expected codebase head(s) '{heads_str}'."
             elif is_production_mode:
                 return False, "Production database is missing 'alembic_version' migration tracking table."
 
