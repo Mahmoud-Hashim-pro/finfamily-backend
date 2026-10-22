@@ -24,6 +24,16 @@ Base.metadata.create_all(bind=engine)
 app.state.limiter.enabled = False
 client = TestClient(app)
 
+import pytest
+
+@pytest.fixture(autouse=True)
+def _verify_postgres_when_configured():
+    if os.getenv("TEST_POSTGRES_URL"):
+        assert engine.dialect.name == "postgresql", (
+            f"CRITICAL: TEST_POSTGRES_URL is configured, but engine dialect is "
+            f"'{engine.dialect.name}' instead of 'postgresql'. Silent SQLite fallback is forbidden in CI."
+        )
+
 def test_p0_1_game_reward_server_side_verification():
     """Verify that mini-game rewards require authoritative answers and close all score/option bypass paths."""
     game_key = "gm1"

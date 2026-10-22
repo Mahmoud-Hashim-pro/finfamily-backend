@@ -68,6 +68,11 @@ def _concur_get_db():
 
 @pytest.fixture(autouse=True)
 def _scope_concur_db():
+    if os.getenv("TEST_POSTGRES_URL"):
+        assert concur_engine.dialect.name == "postgresql", (
+            f"CRITICAL: TEST_POSTGRES_URL is configured, but concur_engine dialect is "
+            f"'{concur_engine.dialect.name}' instead of 'postgresql'. Silent SQLite fallback is forbidden in CI."
+        )
     app.dependency_overrides[get_db] = _concur_get_db
     yield
     app.dependency_overrides.pop(get_db, None)
