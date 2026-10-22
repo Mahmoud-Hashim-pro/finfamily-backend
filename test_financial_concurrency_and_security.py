@@ -11,7 +11,9 @@ os.environ["APP_VERSION"] = "1.1.0"
 os.environ["APP_BUILD_NUMBER"] = "8"
 
 from fastapi.testclient import TestClient
-from db.database import engine, Base, SessionLocal, get_db
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from db.database import Base, get_db
 from db.models import (
     User, Family, Wallet, UserRole, IdempotencyRecord, 
     LessonCompletion, CardPurchase, Transaction, AuditLog
@@ -20,19 +22,41 @@ from core.security import hash_password, create_access_token
 from services.games import GAME_CATALOG, compute_reward, is_passing_game
 from main import app
 
-Base.metadata.create_all(bind=engine)
+test_pg_url = os.getenv("TEST_POSTGRES_URL")
+if test_pg_url:
+    fin_engine = create_engine(test_pg_url, pool_size=10, max_overflow=10)
+else:
+    from sqlalchemy.pool import StaticPool
+    fin_engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool
+    )
+
+FinSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=fin_engine)
+Base.metadata.create_all(bind=fin_engine)
 app.state.limiter.enabled = False
 client = TestClient(app)
 
 import pytest
 
+def _fin_get_db():
+    db = FinSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
 @pytest.fixture(autouse=True)
-def _verify_postgres_when_configured():
+def _scope_fin_db():
     if os.getenv("TEST_POSTGRES_URL"):
-        assert engine.dialect.name == "postgresql", (
-            f"CRITICAL: TEST_POSTGRES_URL is configured, but engine dialect is "
-            f"'{engine.dialect.name}' instead of 'postgresql'. Silent SQLite fallback is forbidden in CI."
+        assert fin_engine.dialect.name == "postgresql", (
+            f"CRITICAL: TEST_POSTGRES_URL is configured, but fin_engine dialect is "
+            f"'{fin_engine.dialect.name}' instead of 'postgresql'. Silent SQLite fallback is forbidden in CI."
         )
+    app.dependency_overrides[get_db] = _fin_get_db
+    yield
+    app.dependency_overrides.pop(get_db, None)
 
 def test_p0_1_game_reward_server_side_verification():
     """Verify that mini-game rewards require authoritative answers and close all score/option bypass paths."""
@@ -75,7 +99,7 @@ def test_p0_1_game_reward_server_side_verification():
 
 def test_p0_2_idempotency_record_unique_constraint():
     """Verify IdempotencyRecord model prevents duplicate operations at database level"""
-    db = SessionLocal()
+    db = FinSessionLocal()
     try:
         test_key = f"idem-key-{uuid.uuid4()}"
         rec1 = IdempotencyRecord(key=test_key, action="allowance_sent")
@@ -96,7 +120,7 @@ def test_p0_2_idempotency_record_unique_constraint():
 
 def test_p0_2_concurrency_allowance_idempotency():
     """Verify allowance transfer is atomic and handles concurrent or replayed idempotency keys"""
-    db = SessionLocal()
+    db = FinSessionLocal()
     try:
         fam = Family(id=f"fam-{uuid.uuid4()}", name="Concur Fam", family_code=f"CN{uuid.uuid4().hex[:4].upper()}")
         db.add(fam)
@@ -151,7 +175,7 @@ def test_p0_2_concurrency_allowance_idempotency():
     assert Decimal(str(data2["balance"])) == Decimal("150.00"), "Balance must not be double credited!"
 
     # Verify wallet balances directly in database: Child credited exactly 100, not 200
-    db = SessionLocal()
+    db = FinSessionLocal()
     try:
         cw = db.query(Wallet).filter(Wallet.owner_id == child.id).first()
         assert cw.balance == Decimal("150.00")
@@ -161,7 +185,7 @@ def test_p0_2_concurrency_allowance_idempotency():
 
 def test_p0_3_numeric_precision_in_models():
     """Verify Numeric(12, 2) balances preserve exact decimal representation"""
-    db = SessionLocal()
+    db = FinSessionLocal()
     try:
         fam = Family(id=f"fam-{uuid.uuid4()}", name="Decimal Fam", family_code=f"DC{uuid.uuid4().hex[:4].upper()}")
         db.add(fam)
@@ -201,7 +225,7 @@ def test_p1_6_version_defaults():
 
 def test_lesson_completion_sync_and_idempotency():
     """Verify lesson completion sync to backend, XP award, and idempotent completion"""
-    db = SessionLocal()
+    db = FinSessionLocal()
     try:
         fam = Family(id=f"fam-{uuid.uuid4()}", name="Learn Fam", family_code=f"LN{uuid.uuid4().hex[:4].upper()}")
         db.add(fam)
@@ -251,7 +275,7 @@ def test_lesson_completion_sync_and_idempotency():
 
 def test_p1_7_idempotency_key_conflict_rejections():
     """Verify that reusing an idempotency key with conflicting payload or across actors returns 409 Conflict."""
-    db = SessionLocal()
+    db = FinSessionLocal()
     try:
         fam1 = Family(id=f"fam1-{uuid.uuid4()}", name="Fam 1", family_code=f"F1{uuid.uuid4().hex[:4].upper()}")
         fam2 = Family(id=f"fam2-{uuid.uuid4()}", name="Fam 2", family_code=f"F2{uuid.uuid4().hex[:4].upper()}")
@@ -305,7 +329,7 @@ def test_p1_7_idempotency_key_conflict_rejections():
 
 def test_p1_8_game_completion_reward_and_daily_duplicate_guard():
     """Verify that completing a game awards rewards only once daily and prevents duplicate rewards."""
-    db = SessionLocal()
+    db = FinSessionLocal()
     try:
         fam = Family(id=f"fam-gm-{uuid.uuid4()}", name="Game Fam", family_code=f"GM{uuid.uuid4().hex[:4].upper()}")
         db.add(fam)
