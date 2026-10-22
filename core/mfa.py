@@ -25,14 +25,11 @@ from core.config import is_production
 # ---------- MFA Secrets Encryption at Rest (BUG-012 & FF-08) ----------
 
 def _get_fernet() -> Fernet:
-    if is_production():
-        raw_key = os.getenv("MFA_ENCRYPTION_KEY", "").strip()
-        if not raw_key or len(raw_key) < 16 or "default" in raw_key.lower():
-            raise RuntimeError("CRITICAL: Dedicated MFA_ENCRYPTION_KEY environment variable of at least 16 characters is required in production!")
-    else:
-        raw_key = os.getenv("MFA_ENCRYPTION_KEY") or os.getenv("JWT_SECRET")
-        if not raw_key:
-            raw_key = "finfamily-mfa-default-encryption-secret-key-2026"
+    raw_key = os.getenv("MFA_ENCRYPTION_KEY", "").strip() or os.getenv("JWT_SECRET", "").strip()
+    if not raw_key or len(raw_key) < 16 or "default" in raw_key.lower():
+        if is_production():
+            raise RuntimeError("CRITICAL: Dedicated MFA_ENCRYPTION_KEY or secure JWT_SECRET of at least 16 characters is required in production!")
+        raw_key = "finfamily-mfa-default-encryption-secret-key-2026"
     derived = base64.urlsafe_b64encode(hashlib.sha256(raw_key.encode("utf-8")).digest())
     return Fernet(derived)
 

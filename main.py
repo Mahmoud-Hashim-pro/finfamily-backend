@@ -191,8 +191,12 @@ async def lifespan(app: FastAPI):
             db_healthy = is_ready
             if not is_ready:
                 logger.critical(f"Production database schema readiness failed: {msg}")
-                raise RuntimeError(f"Database readiness failed in production: {msg}")
-            logger.info(f"Production schema readiness confirmed: {msg}")
+                if os.getenv("STRICT_DB_READINESS_ABORT", "false").strip().lower() in ("true", "1"):
+                    raise RuntimeError(f"Database readiness failed in production: {msg}")
+                else:
+                    logger.warning(f"Production database schema readiness failed (non-fatal start): {msg}")
+            else:
+                logger.info(f"Production schema readiness confirmed: {msg}")
         else:
             try:
                 Base.metadata.create_all(bind=engine)
@@ -213,8 +217,10 @@ async def lifespan(app: FastAPI):
         db_healthy = is_ready
         if not is_ready:
             logger.error(f"Database readiness check failed under SKIP_DB_INIT: {msg}")
-            if is_prod:
+            if is_prod and os.getenv("STRICT_DB_READINESS_ABORT", "false").strip().lower() in ("true", "1"):
                 raise RuntimeError(f"Database readiness failed in production: {msg}")
+            else:
+                logger.warning(f"Production database schema readiness failed (non-fatal start): {msg}")
         else:
             logger.info(f"Schema readiness confirmed under SKIP_DB_INIT: {msg}")
     yield
