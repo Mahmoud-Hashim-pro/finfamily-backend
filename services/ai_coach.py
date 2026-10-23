@@ -1,6 +1,8 @@
 import os
 import re
+import time
 import uuid
+import base64
 import logging
 import threading
 from typing import List, Optional, Dict, Any, Union, Tuple
@@ -16,6 +18,12 @@ from openai import (
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 from dotenv import load_dotenv
 
+from core.config import (
+    is_ai_enabled,
+    get_ai_daily_family_quota,
+    get_ai_daily_user_quota,
+    get_ai_spend_ceiling_usd,
+)
 from services.ai_context import redact_sensitive_text
 from services.ai_provider import (
     AIProvider,
@@ -61,6 +69,61 @@ def set_provider(provider: Optional[AIProvider]) -> None:
     """Set or override the active AI completion provider (e.g. MockAIProvider in tests)."""
     global _provider
     _provider = provider
+
+
+# ---------------------------------------------------------------------------
+# AI Daily Quota Tracking (Thread-safe in-memory sliding 24-hour window)
+# ---------------------------------------------------------------------------
+
+_ai_quota_lock = threading.Lock()
+_family_ai_usage: Dict[str, List[float]] = {}
+_user_ai_usage: Dict[str, List[float]] = {}
+
+
+def reset_ai_quotas() -> None:
+    """Reset all in-memory AI quota counters (primarily for testing and cache invalidation)."""
+    with _ai_quota_lock:
+        _family_ai_usage.clear()
+        _user_ai_usage.clear()
+
+
+def check_and_increment_ai_quota(family_id: str, user_id: str) -> Tuple[bool, str]:
+    """
+    Thread-safe quota tracker for family and user daily AI requests.
+    Returns (True, "") if within daily quota limits.
+    Returns (False, reason) if daily family or user quota is exceeded.
+    """
+    now = time.time()
+    cutoff = now - 86400.0  # 24-hour sliding daily window
+
+    user_limit = get_ai_daily_user_quota()
+    family_limit = get_ai_daily_family_quota()
+
+    with _ai_quota_lock:
+        if user_id:
+            user_key = str(user_id).strip()
+            if user_key:
+                current_user_times = [t for t in _user_ai_usage.get(user_key, []) if t > cutoff]
+                _user_ai_usage[user_key] = current_user_times
+                if len(current_user_times) >= user_limit:
+                    return False, f"Daily user quota exceeded ({user_limit} requests/day)"
+
+        if family_id:
+            fam_key = str(family_id).strip()
+            if fam_key:
+                current_fam_times = [t for t in _family_ai_usage.get(fam_key, []) if t > cutoff]
+                _family_ai_usage[fam_key] = current_fam_times
+                if len(current_fam_times) >= family_limit:
+                    return False, f"Daily family quota exceeded ({family_limit} requests/day)"
+
+        # Within quota: increment counters
+        if user_id and str(user_id).strip():
+            _user_ai_usage.setdefault(str(user_id).strip(), []).append(now)
+        if family_id and str(family_id).strip():
+            _family_ai_usage.setdefault(str(family_id).strip(), []).append(now)
+
+        return True, ""
+
 
 
 # BUG-136 & BUG-137: تعليمات النظام مع معايير الأمان التربوية الصارمة لحماية الأطفال
@@ -155,11 +218,168 @@ class ModerationResult:
         self.refusal_message = refusal_message
 
 
+def _check_encoded_attacks(text: str, mode: str = "child") -> Optional[ModerationResult]:
+    """
+    Detects encoded prompt attacks trying to bypass moderation:
+    - Base64 payloads (explicit base64 instructions, or valid base64 strings decoding to attack phrases)
+    - Hex payloads (\\x escape sequences, 0x blocks, or continuous hex strings decoding to attack phrases)
+    - Reversed strings (full reversed message or word-by-word reversed matching attack phrases)
+    """
+    text_lower = text.lower().strip()
+
+    # Reusable attack detection patterns for decoded/reversed content
+    attack_check_patterns = [
+        # Injection & overrides
+        (r'ignore\s+(all\s+)?previous', "anti_jailbreak"),
+        (r'system\s+prompt', "anti_jailbreak"),
+        (r'developer\s+mode', "anti_jailbreak"),
+        (r'jailbreak', "anti_jailbreak"),
+        (r'override\s+(all\s+)?rules', "anti_jailbreak"),
+        (r'disregard\s+(all\s+)?(instructions|rules)', "anti_jailbreak"),
+        (r'reveal\s+(the\s+|your\s+)?(system\s+prompt|instructions|hidden\s+rules)', "anti_jailbreak"),
+        (r'you\s+are\s+now\s+(an?\s+)?(dan|unrestricted|pirate|jailbroken|villain|hacker|evil)', "anti_jailbreak"),
+        (r'pretend\s+(you\s+are|to\s+be)\b', "anti_jailbreak"),
+        (r'forget\s+(that\s+)?(you\s+are\s+)?(finbuddy|coach\s+nour|an?\s+ai|your\s+rules)', "anti_jailbreak"),
+        (r'print\s+(everything\s+)?above(\s+this\s+line)?', "anti_jailbreak"),
+        (r'give\s+me\s+(your\s+)?(full\s+|hidden\s+)?(system\s+)?(prompt|instructions)', "anti_jailbreak"),
+        (r'<\/?(?:user_context|family_context|context)>', "anti_jailbreak"),
+        (r'تجاهل\s+(جميع\s+|كل\s+)?(التعليمات|القواعد|الأوامر)', "anti_jailbreak"),
+        (r'فكك\s+من\s+(جميع\s+|كل\s+)?(التعليمات|القواعد|الأوامر|اللي\s+فات)', "anti_jailbreak"),
+        (r'سيبك\s+من\s+(جميع\s+|كل\s+)?(التعليمات|القواعد|الأوامر|اللي\s+فات)', "anti_jailbreak"),
+        (r'اعمل\s+نفسك\s+(مش\s+واخد\s+بالك|نايم|مش\s+شايف|قرصان|دان|dan)', "anti_jailbreak"),
+        (r'أنت\s+الآن\s+(روبوت\s+بدون\s+قيود|حر|غير\s+مقيد)', "anti_jailbreak"),
+        (r'انت\s+دلوقتي\s+(روبوت\s+بدون\s+قيود|حر|غير\s+مقيد|قرصان)', "anti_jailbreak"),
+        (r'انسى\s+(انك\s+)?(finbuddy|فاين\s*بادي|فين\s*بادي|روبوت)', "anti_jailbreak"),
+        (r'ما\s+هو\s+البرومبت', "anti_jailbreak"),
+        # Harm & Self-harm
+        (r'\b(انتحار|أنتحر|انتحر|أقتل نفسي|اقتل نفسي|إيذاء النفس)\b', "self_harm"),
+        (r'\b(suicide|kill myself|end my life|self[- ]harm|cut myself)\b', "self_harm"),
+        (r'\b(سلاح|مسدس|بندقية|قنبلة|تفجير|مخدرات|حشيش|كوكايين|هيروين)\b', "harm_prevention"),
+        (r'\b(gun|bomb|weapon|assault|kill|murder|drugs|cocaine|weed)\b', "harm_prevention"),
+        # Gambling & Crypto
+        (r'\b(قمار|مراهنات|مراهنة|كازينو|روليت|1xbet|وان\s*إ?كس\s*بت|كريبتو|بيتكوين|فوركس|باينانس)\b', "gambling_prevention"),
+        (r'\b(gambling|betting|casino|lottery|crypto|bitcoin|forex|binance)\b', "gambling_prevention"),
+    ]
+
+    def _make_refusal(reason: str) -> str:
+        if reason == "self_harm":
+            return (
+                "سلامتك هي أهم شيء يا بطل! ❤️ يرجى التحدث فوراً مع والديك أو شخص بالغ تثق به لمساعدتك والوقوف بجانبك دائماً."
+                if mode == "child"
+                else "سلامة الأسرة وأفرادها هي الأولوية القصوى. يُرجى التواصل فوراً مع خطوط الدعم المتخصصة للمساعدة والدعم."
+            )
+        elif reason == "harm_prevention":
+            return (
+                "أهلاً يا بطل! 🌟 أنا صديقك FinBuddy لمساعدتك في تعلم التوفير وإدارة المصروف الذكي فقط. دعنا نركز على أهدافك المالية ومغامراتك في FinFamily!"
+                if mode == "child"
+                else "عذراً، يلتزم المستشار المالي بمعايير السلامة والأمان المالية للأسرة، ولا يمكن معالجة هذا الطلب."
+            )
+        elif reason == "gambling_prevention":
+            return (
+                "يا بطل! 🚫 القمار والمراهنات والمضاربات الرقمية غير مناسبة وغير آمنة. في FinFamily نتعلم كيف نكسب ونوفر أموالنا بذكاء وتخطيط سليم وبموافقة والديك!"
+                if mode == "child"
+                else "يركز المستشار المالي على التخطيط المالي السليم وبناء العادات المستدامة، ولا يقدم نصائح متعلقة بالمضاربات أو المقامرة."
+            )
+        else:
+            return (
+                "أنا صديقك FinBuddy 🤖، ومهمتي هي فقط مساعدتك في تعلم المهارات المالية الذكية بطريقة ممتعة وآمنة!"
+                if mode == "child"
+                else "عذراً، يلتزم المستشار المالي بمعايير السلامة والأمان المالية للأسرة، ولا يمكن معالجة هذا الطلب."
+            )
+
+    # 1. Check reversed strings
+    rev_full = text_lower[::-1]
+    rev_words = " ".join(w[::-1] for w in text_lower.split())
+    for pat, reason in attack_check_patterns:
+        if re.search(pat, rev_full, re.IGNORECASE) or re.search(pat, rev_words, re.IGNORECASE):
+            return ModerationResult(is_safe=False, reason=reason, refusal_message=_make_refusal(reason))
+
+    # Explicit reversal execution commands
+    if re.search(r'(?:reverse|backwards|in reverse).*(?:execute|follow|obey|instruction|run|prompt)', text_lower) or \
+       re.search(r'(?:اعكس|اقرأ بالمقلوب|بالمقلوب).*(?:نفذ|اتبع|التعليمات)', text_lower):
+        return ModerationResult(is_safe=False, reason="anti_jailbreak", refusal_message=_make_refusal("anti_jailbreak"))
+
+    # 2. Check Base64 payloads
+    has_b64_trigger = bool(
+        re.search(r'(?i)\b(?:base64|b64)(?:\s*(?:decode|payload|encoded|string)?\s*[:=-]|\s+decode|\s+and\s+execute)', text) or
+        re.search(r'(?i)\b(?:eval|exec|decode)\s*\(\s*base64', text) or
+        re.search(r'(فك\s+تشفير|تشفير)\s+(بيز\s*64|base64)', text)
+    )
+
+    b64_candidates = re.findall(r'(?<![A-Za-z0-9+/=])([A-Za-z0-9+/]{16,}={0,2})(?![A-Za-z0-9+/=])', text)
+    for c in b64_candidates:
+        try:
+            missing_padding = len(c) % 4
+            padded = c + ('=' * (4 - missing_padding) if missing_padding else '')
+            decoded_bytes = base64.b64decode(padded)
+            decoded_str = decoded_bytes.decode('utf-8', errors='ignore').strip().lower()
+            if len(decoded_str) >= 4 and any(ch.isalpha() for ch in decoded_str):
+                for pat, reason in attack_check_patterns:
+                    if re.search(pat, decoded_str, re.IGNORECASE):
+                        return ModerationResult(is_safe=False, reason=reason, refusal_message=_make_refusal(reason))
+                if has_b64_trigger:
+                    return ModerationResult(is_safe=False, reason="anti_jailbreak", refusal_message=_make_refusal("anti_jailbreak"))
+        except Exception:
+            pass
+
+    if has_b64_trigger and b64_candidates:
+        return ModerationResult(is_safe=False, reason="anti_jailbreak", refusal_message=_make_refusal("anti_jailbreak"))
+
+    # 3. Check Hex payloads
+    has_hex_trigger = bool(
+        re.search(r'(?i)\b(?:hex\s*(?:payload|decode|encoded)?\s*[:=-]|decode\s+hex|from_hex)', text) or
+        re.search(r'(فك\s+تشفير|تشفير)\s+(هيكس|hex)', text)
+    )
+
+    hex_escapes = re.findall(r'(?:\\x[0-9a-fA-F]{2}){3,}', text)
+    for h in hex_escapes:
+        clean = re.sub(r'\\x', '', h)
+        try:
+            decoded_str = bytes.fromhex(clean).decode('utf-8', errors='ignore').strip().lower()
+            for pat, reason in attack_check_patterns:
+                if re.search(pat, decoded_str, re.IGNORECASE):
+                    return ModerationResult(is_safe=False, reason=reason, refusal_message=_make_refusal(reason))
+        except Exception:
+            pass
+        return ModerationResult(is_safe=False, reason="anti_jailbreak", refusal_message=_make_refusal("anti_jailbreak"))
+
+    hex_0x = re.findall(r'(?:0x[0-9a-fA-F]{2}[\s,]*){4,}', text)
+    for h in hex_0x:
+        clean = re.sub(r'0x|[\s,]', '', h)
+        try:
+            decoded_str = bytes.fromhex(clean).decode('utf-8', errors='ignore').strip().lower()
+            for pat, reason in attack_check_patterns:
+                if re.search(pat, decoded_str, re.IGNORECASE):
+                    return ModerationResult(is_safe=False, reason=reason, refusal_message=_make_refusal(reason))
+        except Exception:
+            pass
+        if has_hex_trigger:
+            return ModerationResult(is_safe=False, reason="anti_jailbreak", refusal_message=_make_refusal("anti_jailbreak"))
+
+    hex_continuous = re.findall(r'(?<![0-9a-fA-F])([0-9a-fA-F]{16,})(?![0-9a-fA-F])', text)
+    for hp in hex_continuous:
+        if len(hp) % 2 == 0:
+            try:
+                decoded_str = bytes.fromhex(hp).decode('utf-8', errors='ignore').strip().lower()
+                for pat, reason in attack_check_patterns:
+                    if re.search(pat, decoded_str, re.IGNORECASE):
+                        return ModerationResult(is_safe=False, reason=reason, refusal_message=_make_refusal(reason))
+            except Exception:
+                pass
+
+    if has_hex_trigger and hex_continuous:
+        return ModerationResult(is_safe=False, reason="anti_jailbreak", refusal_message=_make_refusal("anti_jailbreak"))
+
+    return None
+
+
 def moderate_message(message: str, mode: str = "child") -> ModerationResult:
     """
     BUG-137: Safety & Moderation guardrails for AI Coach:
     Detects harmful content, violence, self-harm, adult content, gambling/speculation,
-    PII/credential sharing, and prompt injection/jailbreak attacks.
+    adult financial / banking requests, PII/credential sharing, prompt injection/jailbreak,
+    role reversal, prompt/context extraction, and encoded prompt attacks.
+    For child mode: returns gentle, educational Arabic redirects suitable for kids.
     """
     if not message or not message.strip():
         return ModerationResult(is_safe=False, reason="empty", refusal_message="الرسالة فارغة.")
@@ -168,8 +388,8 @@ def moderate_message(message: str, mode: str = "child") -> ModerationResult:
 
     # 1. Self-harm / Emergency crisis
     self_harm_patterns = [
-        r'\b(انتحار|أنتحر|انتحر|أقتل نفسي|اقتل نفسي|إيذاء النفس|ايذاء النفس)\b',
-        r'\b(suicide|kill myself|end my life|self[- ]harm|cut myself)\b',
+        r'\b(انتحار|أنتحر|انتحر|أقتل نفسي|اقتل نفسي|إيذاء النفس|ايذاء النفس|أموت نفسي|اموت نفسي|عايز اموت|عايز انتحر|أنهي حياتي|انهي حياتي)\b',
+        r'\b(suicide|kill myself|end my life|self[- ]harm|cut myself|hang myself|die by suicide)\b',
     ]
     for pattern in self_harm_patterns:
         if re.search(pattern, text_lower, re.IGNORECASE):
@@ -180,22 +400,44 @@ def moderate_message(message: str, mode: str = "child") -> ModerationResult:
             )
             return ModerationResult(is_safe=False, reason="self_harm", refusal_message=refusal)
 
-    # 2. Prompt injection / Jailbreaks (English, Egyptian Arabic, Modern Standard Arabic)
+    # 2. Prompt injection / Jailbreaks / Role Reversal / System Extraction (English, Egyptian Arabic, MSA)
     injection_patterns = [
+        # Direct English injection & overrides
         r'ignore (all )?(previous )?(instructions|rules)',
         r'system prompt',
-        r'you are now (dan|unrestricted|jailbroken)',
         r'developer mode',
         r'jailbreak',
         r'override (all )?rules',
         r'disregard (all )?(instructions|rules)',
         r'reveal (the |your )?(system prompt|instructions|hidden rules)',
         r'act as an? (unrestricted|jailbroken|dan)',
+        # Role reversal & persona hijacking
+        r'pretend (you are|to be)\b',
+        r'you are now (an? )?(dan|unrestricted|pirate|jailbroken|villain|hacker|evil|rogue|freed|unfiltered|actor|character|bot without rules)',
+        r'forget (that )?(you are )?(finbuddy|coach nour|an? ai|your rules|your identity|who you are)',
+        r'you are no longer (finbuddy|coach nour|bound|an? ai|restricted)',
+        r'(?i)\b(act|roleplay)\s+as\s+(?:an?\s+)?(?:[\w-]+\s+)*(?:unrestricted|jailbroken|dan|pirate|villain|hacker|evil|rogue|different|bot)\b',
+        r'from now on (you are|act as)\b',
+        r'switch (persona|role|identity) to\b',
+        r'imagine you are (an? )?(unrestricted|pirate|dan|evil)',
+        # System instructions extraction & context leaking
+        r'give me your (full |hidden )?(system )?(prompt|instructions|rules)',
+        r'(print|show|output|reveal|display|dump|repeat) (everything|all (the )?text) above( this line)?',
+        r'print (everything )?above this line',
+        r'(print|show|output|reveal|display|dump|repeat|leak) (your |the )?(system )?(prompt|instructions|hidden rules|developer mode|initial prompt)',
+        r'what (is|are) your (full |hidden )?(system prompt|instructions|rules|developer prompt)',
+        r'repeat (the )?words above',
+        r'dump system prompt',
+        r'extract (the )?(system prompt|instructions|context)',
+        r'(show|print|leak|dump|reveal|output|extract) (the )?(contents? of )?<\/?(?:user_context|family_context|context)>?',
+        r'<\/?user_context>',
+        r'(?:^|\W)(?:user_context|family_context)(?:\W|$)',
+        r'what is (inside|in|written in) <\/?user_context>?',
+        r'(family|private|user) context (data|leak|tags?|xml)',
+        # Standard Arabic injection
         r'تجاهل (جميع |كل )?(التعليمات|القواعد|الأوامر)',
         r'تجاهل القواعد',
         r'انسى (جميع |كل )?(التعليمات|القواعد|الأوامر|اللي فات|اللي اتقالك)',
-        r'فكك من (جميع |كل )?(التعليمات|القواعد|الأوامر|اللي فات)',
-        r'سيبك من (جميع |كل )?(التعليمات|القواعد|الأوامر|اللي فات)',
         r'أنت الآن (روبوت بدون قيود|غير مقيد|حر)',
         r'انت دلوقتي (روبوت بدون قيود|حر|غير مقيد)',
         r'اعتبر نفسك (روبوت بدون قيود|حر|غير مقيد)',
@@ -203,6 +445,38 @@ def moderate_message(message: str, mode: str = "child") -> ModerationResult:
         r'وضع المطور',
         r'كسر الحماية',
         r'اكشف (عن )?(البرومبت|تعليمات النظام|الأوامر المخفية)',
+        r'ما هو البرومبت( الذي تتبعه| بتاعك)?',
+        r'ماهو البرومبت',
+        r'ما هو برومبت النظام',
+        r'ماهو برومبت النظام',
+        r'ما هي تعليماتك المخفية',
+        r'ما هي التعليمات التي تتبعها',
+        # Egyptian Slang Injections
+        r'فكك من (جميع |كل )?(التعليمات|القواعد|الأوامر|اللي فات|الرولز|الكلام ده)(\s+دي)?',
+        r'فكك من (القواعد دي|التعليمات دي|الرولز دي)',
+        r'سيبك من (جميع |كل )?(التعليمات|القواعد|الأوامر|اللي فات|الرولز|الكلام ده)(\s+دي)?',
+        r'سيبك من (القواعد دي|التعليمات دي|الرولز دي)',
+        r'اعمل نفسك (مش واخد بالك|نايم|مش شايف|قرصان|دان|dan|روبوت حر|حر|واحد تاني|شرير|بدون قيود|غير مقيد)',
+        r'كبر دماغك من (جميع |كل )?(التعليمات|القواعد|الأوامر|الكلام ده)',
+        r'طنش (جميع |كل )?(التعليمات|القواعد|الأوامر|الرولز)(\s+دي)?',
+        r'(نفض|نفظ)\s+(?:لجميع\s+|لكل\s+|لـ\s*|لل)?(قواعد|تعليمات|أوامر|التعليمات|القواعد|الأوامر)',
+        r'ولا كأنك شفت (التعليمات|القواعد|القيود)',
+        r'ولا كأن في قواعد',
+        r'انسى (انك|أنك|انك انت|مين انت)?\s*(finbuddy|فاين بادي|فين بادي|روبوت|ذكاء اصطناعي|مستشار|كوتش)',
+        r'انسى هويتك',
+        r'اتصرف\s+كأنك\s+(?:روبوت\s+بدون\s+قيود|روبوت\s+حر|قرصان|دان|dan|مش\s+مقيد|بدون\s+قيود|شرير)',
+        r'انت دلوقتي (قرصان|دان|dan|مش فاين بادي|مش finbuddy|بدون قيود|غير مقيد)',
+        r'انت مش (finbuddy|فاين بادي|فين بادي|روبوت)',
+        r'انت لست (finbuddy|فاين بادي|فين بادي|روبوت)',
+        r'تخيل انك (قرصان|دان|dan|بدون قيود|حر|شرير)',
+        r'اتظاهر انك (قرصان|دان|dan|بدون قيود|حر|شرير)',
+        r'العب دور (قرصان|دان|dan|بدون قيود|شرير|هاكر)',
+        r'تقمص شخصية (قرصان|دان|dan|بدون قيود|شرير|هاكر)',
+        r'وريني (البرومبت|برومبت النظام|التعليمات المخفية|السياق)',
+        r'هات (البرومبت|البرومبت بتاعك|تعليمات النظام|سياق العائلة)',
+        r'(اطبع|اكتب|وريني|قولي|اكشف|هات)\s+(كل )?(اللي فوق|ما فوق هذا السطر|فوق هذا السطر|الكلام اللي فوق)',
+        r'(اطبع|اكتب|وريني|قولي|اكشف|هات)\s+(تعليمات النظام|التعليمات المخفية|البرومبت الأساسي|السيستم برومبت|البرومبت بتاعك|قواعدك المخفية)',
+        r'(اكشف|وريني|هات|اطبع|طلع).*(سياق|بيانات العائلة|user_context|وسم user_context|البرومبت)',
     ]
     for pattern in injection_patterns:
         if re.search(pattern, text_lower, re.IGNORECASE):
@@ -213,16 +487,24 @@ def moderate_message(message: str, mode: str = "child") -> ModerationResult:
             )
             return ModerationResult(is_safe=False, reason="anti_jailbreak", refusal_message=refusal)
 
-    # 3. Violence, Weapons, Hate, Bullying, Drugs
+    # 3. Encoded prompt attacks (Base64, Hex payloads, Reversed strings)
+    encoded_check = _check_encoded_attacks(message, mode=mode)
+    if encoded_check is not None:
+        return encoded_check
+
+    # 4. Violence, Weapons, Hate, Bullying, Drugs
     harm_patterns = [
-        r'\b(سلاح|مسدس|بندقية|قنبلة|تفجير|إرهاب|ارهاب|قتل|اغتيال|مخدرات|حشيش|كوكايين|هيروين)\b',
-        r'\b(gun|bomb|weapon|assault|kill|murder|drugs|cocaine|weed)\b',
+        r'(?:^|\W)(?:[الوبف]{1,3})?(سلاح|مسدس|بندقية|قنبلة|تفجير|إرهاب|ارهاب|قتل|اغتيال|عنف|اعتداء)(?:\W|$)',
+        r'(اضرب|أضرب|ضرب|اعتدي|أعتدي)\s+(زميلي|صاحبي|حد|شخص|واحد|على)',
+        r'(اكسر سنانه|أكسر سنانه)',
+        r'(?:^|\W)(?:[الوبف]{1,3})?(مخدرات|حشيش|كوكايين|هيروين|بانجو|شابو|ترامادول|كبتاجون)(?:\W|$)',
+        r'\b(gun|bomb|weapon|assault|kill|murder|drugs|cocaine|weed|heroin|meth|beat up|stab)\b',
     ]
     # Theft / hacking words are blocked for children only: for parents they are exactly the
     # fraud and card-security topics Coach Nour is instructed to cover (PARENT_PROMPT).
     if mode != "parent":
         harm_patterns += [
-            r'\b(سرقة|اختراق|قرصنة)\b',
+            r'\b(سرقة|اختراق|قرصنة|هكر|سرقه)\b',
             r'\b(steal|theft|hack|bypass)\b',
         ]
     for pattern in harm_patterns:
@@ -234,12 +516,17 @@ def moderate_message(message: str, mode: str = "child") -> ModerationResult:
             )
             return ModerationResult(is_safe=False, reason="harm_prevention", refusal_message=refusal)
 
-    # 4. Gambling, Betting, Crypto Speculation
-    gambling_patterns = [
-        r'\b(قمار|مراهنات|مراهنة|يانصيب|كازينو|بينجو|روليت|كريبتو|بيتكوين|فوركس|مضاربة سريعة)\b',
-        r'\b(gambling|betting|casino|lottery|crypto|bitcoin|forex|get[- ]rich[- ]quick)\b',
+    # 5. Gambling, Betting, Crypto Speculation & High-Risk Trading
+    gambling_crypto_patterns = [
+        # Gambling & Betting (Standard Arabic & Egyptian Slang)
+        r'\b(قمار|مراهنات|مراهنة|رهان|يانصيب|كازينو|بينجو|روليت|سلوتس|بوكر|بلاك جاك|وان\s*إ?كس\s*بت|1xbet|بتينج|طاولة بفلوس|نراهن|اراهن|قمار إلكتروني|لعب قمار)\b',
+        r'\b(gambling|betting|bet|casino|lottery|roulette|slots|poker|blackjack|1xbet|sports\s*betting)\b',
+        # Crypto & Speculation (Standard Arabic, Egyptian Slang, English)
+        r'(?:^|\W)(?:[الوبف]{1,3})?(كريبتو|بيتكوين|إيثريوم|ايثيريوم|بينانس|باينانس|فوركس|فيوتشرز|دوجكوين|شيبا|مضارب(?:ة)?)(?:\W|$)',
+        r'(اضارب|أضارب)\s+في',
+        r'\b(crypto|cryptocurrency|bitcoin|ethereum|eth|binance|forex|futures\s+trading|leverage\s+trading|dogecoin|shiba|crypto\s+mining|cfd|speculative trading)\b',
     ]
-    for pattern in gambling_patterns:
+    for pattern in gambling_crypto_patterns:
         if re.search(pattern, text_lower, re.IGNORECASE):
             refusal = (
                 "يا بطل! 🚫 القمار والمراهنات والمضاربات الرقمية غير مناسبة وغير آمنة. في FinFamily نتعلم كيف نكسب ونوفر أموالنا بذكاء وتخطيط سليم وبموافقة والديك!"
@@ -248,7 +535,22 @@ def moderate_message(message: str, mode: str = "child") -> ModerationResult:
             )
             return ModerationResult(is_safe=False, reason="gambling_prevention", refusal_message=refusal)
 
-    # 5. PII and Credentials Protection (passwords, PINs, OTPs, Card numbers)
+    # 6. Adult Banking Advice / Loans / Debt (Refused in Child Mode)
+    if mode == "child":
+        adult_banking_patterns = [
+            r'\b(قرض\s+بنكي|قرض\s+شخصي|تمويل\s+عقاري|رهن\s+عقاري|رهن\s+بيت|شيكات\s+بدون\s+رصيد|كمبيالات|سحب\s+على\s+المكشوف|تسييل\s+فيزا|تسييل\s+كروت|فتح\s+حساب\s+تجاري|حساب\s+شركات|تسهيلات\s+ائتمانية|استدانة\s+من\s+البنك)\b',
+            r'(عايز|اخد|طلب|تقديم على|ازاي اخد|كيفية الحصول على|محتاج|عايزين)\s+(قرض|سلفة بفايدة|سلفة بفوائد|سلفني بفايدة|تمويل عقاري|كريدت كارد|فيزا مشتريات)',
+            r'\b(فيزا\s+مشتريات|كارت\s+مشتريات|كريدت\s+كارد|بطاقة\s+ائتمان|بطاقة\s+ائتمانية)\b',
+            r'\b(bank loan|personal loan|mortgage|credit card application|apply for a credit card|overdraft facility|take out a loan|borrow money with interest)\b',
+        ]
+        for pattern in adult_banking_patterns:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                refusal = (
+                    "يا بطل! 💳 القروض والبطاقات الائتمانية والمعاملات البنكية الكبيرة مخصصة للكبار والوالدين فقط. دورنا هنا نتعلم التوفير الذكي وتقسيم المصروف مع أسرتك خطوة بخطوة!"
+                )
+                return ModerationResult(is_safe=False, reason="adult_financial", refusal_message=refusal)
+
+    # 7. PII and Credentials Protection (passwords, PINs, OTPs, Card numbers)
     if mode == "parent":
         # Parents: flag actual credential sharing (keyword followed by a value), not bare mentions,
         # so safety questions like "how do I protect my kid's card PIN?" still reach the coach.
@@ -278,11 +580,11 @@ SAFE_FALLBACK_REPLY_CHILD = "أهلاً بك يا بطل! 🤖 كيف يمكنن
 SAFE_FALLBACK_REPLY_PARENT = "عذراً، يواجه المستشار المالي صعوبة مؤقتة في الاتصال. يرجى المحاولة بعد قليل."
 
 SYSTEM_PROMPT_LEAK_PATTERNS = [
-    r'you are ["\']?finbuddy\s*🤖?["\']?',
+    r'you are ["\']?finbuddy(?:\s*🤖)?["\']?',
     r'you are ["\']?coach nour["\']?',
     r'critical security instruction',
     r'system prompt',
-    r'<\/?user_context>',
+    r'<\/?(?:user_context|family_context|system|prompt|instructions|context)>',
     r'child-safety & educational guardrails',
     r'your teaching style',
     r'safety & compliance guardrails',
@@ -293,6 +595,23 @@ SYSTEM_PROMPT_LEAK_PATTERNS = [
     r'developer rules?',
     r'تعليمات النظام',
     r'قواعد الأمان والتعليم',
+    r'سياق المستخدم',
+    r'سياق العائلة',
+]
+
+OUTPUT_CHILD_SAFETY_PATTERNS = [
+    # Weapons & Violence (Arabic with optional morphological prefixes & English)
+    r'(?:^|\W)(?:[الوبف]{1,3})?(سلاح|أسلحة|مسدس|مسدسات|بندقية|قنبلة|قنابل|تفجير|تفجيرات|إرهاب|ارهاب|قتل|مقتل|اغتيال|رصاص|ذخيرة|طعن)(?:\W|$)',
+    r'\b(guns?|bombs?|weapons?|assault|kill(?:ing)?|murder(?:er)?|explosives?|firearms?|ammunition|ammo)\b',
+    # Drugs & Controlled substances (Arabic with optional prefixes & English)
+    r'(?:^|\W)(?:[الوبف]{1,3})?(مخدرات|حشيش|كوكايين|هيروين|بانجو|ترامادول|أفيون|افيون|ماريجوانا)(?:\W|$)',
+    r'\b(drugs?|cocaine|weed|heroin|marijuana|cannabis|narcotics|methamphetamine)\b',
+    # Gambling & Betting (Arabic with optional prefixes & English)
+    r'(?:^|\W)(?:[الوبف]{1,3})?(قمار|مراهنات|مراهنة|يانصيب|كازينو|بينجو|روليت|ميسر|بوكر)(?:\W|$)',
+    r'\b(gambling|betting|casinos?|lotter(?:y|ies)|roulette|poker)\b',
+    # Vulgarity / Inappropriate adult content (Arabic with optional prefixes & English)
+    r'(?:^|\W)(?:[الوبف]{1,3})?(إباحي(?:ة)?|اباحي(?:ة)?|عري|دعارة|سكس|شتائم|بذاءة)(?:\W|$)',
+    r'\b(porn(?:ography)?|nude|nudity|sexual(?:ly)?|vulgar(?:ity)?|explicit)\b',
 ]
 
 
@@ -301,6 +620,8 @@ def validate_ai_output(raw_reply: str, mode: str = "child") -> tuple[bool, str]:
     Comprehensive output safety validator for AI responses:
     - Checks length bounds (max 2000 chars) to prevent token dump attacks.
     - Checks if output leaks system prompt markers, developer rules, or internal prompt instructions.
+    - Child-safety output guardrails: catches weapons, violence, drugs, gambling, and vulgarity,
+      replacing with safe educational redirection.
     - Runs redact_sensitive_text so model-hallucinated or reflected PII (cards, phones, national IDs) is scrubbed.
     - If output is compromised or unsafe, returns (False, safe_fallback_message).
     - If safe, returns (True, sanitized_reply).
@@ -321,28 +642,45 @@ def validate_ai_output(raw_reply: str, mode: str = "child") -> tuple[bool, str]:
             logger.warning("AI output leak detected matching pattern: %s", pattern)
             return False, fallback
 
-    # 3. Scrub any model-hallucinated or reflected PII (cards, phones, national IDs, credentials)
+    # 3. Child-safety check on output: weapons, drugs, violence, gambling, vulgarity
+    for pattern in OUTPUT_CHILD_SAFETY_PATTERNS:
+        if re.search(pattern, raw_reply, re.IGNORECASE):
+            logger.warning("Unsafe content detected in AI output matching pattern: %s", pattern)
+            return False, fallback
+
+    # 4. Scrub any model-hallucinated or reflected PII (cards, phones, national IDs, credentials)
     sanitized = redact_sensitive_text(raw_reply.strip())
 
     return True, sanitized
+
 
 
 # AI-01: Injection patterns to sanitize and strip from assistant history
 INJECTION_PATTERNS = [
     r"\[system\]",
     r"\bsystem\s*:",
-    r"ignore\s+(all\s+)?previous\s+instructions",
-    r"you\s+authorized",
-    r"authorized\s+by\s+system",
-    r"override\s+(all\s+)?rules",
-    r"developer\s+mode",
-    r"you\s+are\s+now\s+(dan|unrestricted|an?\s+ai\s+without\s+rules)",
-    r"jailbreak",
+    r"\[assistant\]",
     r"\[نظام\]",
     r"نظام\s*:",
-    r"تجاهل\s+(جميع\s+)?التعليمات",
+    r"\[مساعد\]",
+    r"ignore\s+(all\s+)?previous\s+instructions",
+    r"(?:i\s+(?:already\s+|have\s+)?|you\s+|system\s+(?:has\s+)?|assistant\s+(?:has\s+)?)authorized(\s+(?:this|the))?(\s+(?:transaction|transfer|payment|action|request|money|operation))?",
+    r"\b(i\s+already\s+authorized|i\s+have\s+authorized|already\s+authorized)\b",
+    r"\b(transaction|transfer|payment)\s+(?:is\s+)?(?:authorized|approved|confirmed)(\s+by\s+\w+)?\b",
+    r"authorized\s+by\s+(system|assistant|admin)",
+    r"\b(transaction|payment|transfer)\s+approved(\s+by\s+\w+)?\b",
+    r"override\s+(all\s+)?rules",
+    r"developer\s+mode",
+    r"you\s+are\s+now\s+(?:an?\s+)?(?:dan|unrestricted|pirate|jailbroken|villain|hacker|evil|an?\s+ai\s+without\s+rules)",
+    r"pretend\s+(?:you\s+are|to\s+be)(\s+an?\s+)?(\b(?:dan|unrestricted|pirate|jailbroken|villain|hacker|evil|bot)\b\s*)*",
+    r"jailbreak",
+    r"تجاهل\s+(?:جميع\s+|كل\s+)?(?:التعليمات|القواعد|الأوامر)(?:\s*و\s*(?:التعليمات|القواعد|الأوامر))?",
     r"تجاهل\s+القواعد",
+    r"(?:تمت?\s+)?(?:الموافقة\s+على|اعتماد|تأكيد|تصريح)\s+(?:المعاملة|التحويل|الطلب|العملية|الدفع)",
+    r"(?:أنا|انا)\s+(?:وافقت|اعتمدت|صرحت)\s+(?:على\s+)?(?:هذه\s+)?(?:المعاملة|العملية|التحويل)",
     r"أنت\s+الآن\s+روبوت\s+بدون\s+قيود",
+    r"(?:فكك|سيبك)\s+من\s+(?:كل\s+)?(?:التعليمات|القواعد|الأوامر)(?:\s*و\s*(?:التعليمات|القواعد|الأوامر))?",
+    r"اعمل\s+نفسك\s+(?:مش\s+واخد\s+بالك|نايم|قرصان)",
 ]
 INJECTION_REGEX = re.compile("|".join(INJECTION_PATTERNS), re.IGNORECASE)
 
@@ -425,6 +763,8 @@ def _format_history_messages(
             clean_content = clean_content[:1000]
         # Redact any sensitive PII in history as well
         clean_content = redact_sensitive_text(clean_content)
+        # Neutralize XML brackets in history content to prevent context breakout attacks
+        clean_content = clean_content.replace("<", "‹").replace(">", "›")
 
         content_bytes = len(clean_content.encode("utf-8"))
         # Check total character and byte budget
@@ -487,12 +827,37 @@ def get_ai_chat_response(
     context: str,
     child_name: str = "the child",
     request_id: Optional[str] = None,
+    family_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    skip_quota_check: bool = False,
 ) -> AICoachResponse:
     """
     AI-08: Generate structured AI Coach response.
     Returns an AICoachResponse object with reply, status, and request_id.
     """
     req_id = request_id or str(uuid.uuid4())
+
+    # 0. Emergency disable / kill-switch check
+    if not is_ai_enabled():
+        logger.warning("AI Coach request rejected: AI service is emergency-disabled or kill-switch active.")
+        return AICoachResponse(
+            reply="خدمة المساعد الذكي معطلة مؤقتاً للصيانة والتحديث. سنعود قريباً!",
+            status="emergency_disabled",
+            request_id=req_id,
+            provider="system",
+        )
+
+    # 0b. Daily quota check (if family_id or user_id provided and check not skipped)
+    if (family_id or user_id) and not skip_quota_check:
+        allowed, reason = check_and_increment_ai_quota(family_id or "", user_id or "")
+        if not allowed:
+            logger.warning("AI Coach quota exceeded for family=%s, user=%s: %s", family_id, user_id, reason)
+            return AICoachResponse(
+                reply="تم الوصول للحد اليومي المسموح به لمحادثات المساعد الذكي للأسرة. يُرجى المحاولة غداً.",
+                status="quota_exceeded",
+                request_id=req_id,
+                provider="system",
+            )
 
     # 1. Moderation guardrail check (BUG-137)
     moderation = moderate_message(chat_data.message, mode=chat_data.mode)
@@ -554,13 +919,23 @@ def get_ai_response(
     child_name: str = "the child",
     return_metadata: bool = False,
     request_id: Optional[str] = None,
+    family_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> Union[str, AICoachResponse]:
     """
     Generate AI response.
     Returns reply string by default for backward compatibility.
     If return_metadata=True, returns AICoachResponse with reply, status, and request_id.
     """
-    res = get_ai_chat_response(chat_data, context, child_name=child_name, request_id=request_id)
+    res = get_ai_chat_response(
+        chat_data,
+        context,
+        child_name=child_name,
+        request_id=request_id,
+        family_id=family_id,
+        user_id=user_id,
+    )
     if return_metadata:
         return res
     return res.reply
+

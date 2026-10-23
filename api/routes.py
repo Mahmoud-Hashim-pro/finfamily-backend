@@ -1,3 +1,4 @@
+import uuid
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
@@ -5,7 +6,14 @@ from db.database import get_db
 from db.models import User
 from core.deps import get_current_user
 from core.limiter import limiter
-from services.ai_coach import ChatMessage, get_ai_response, get_ai_chat_response, AICoachResponse
+from core.config import is_ai_enabled
+from services.ai_coach import (
+    ChatMessage,
+    get_ai_response,
+    get_ai_chat_response,
+    AICoachResponse,
+    check_and_increment_ai_quota,
+)
 import services.ai_coach as ai_coach
 from services.ai_context import build_child_context, build_family_context, redact_name
 
@@ -79,6 +87,29 @@ def chat_ai_coach(
     if len(chat.message) > 1000:
         raise HTTPException(status_code=400, detail="Message too long (max 1000 characters)")
 
+    req_id = str(uuid.uuid4())
+
+    # 1. Emergency disable / kill-switch check
+    if not is_ai_enabled():
+        res = AICoachResponse(
+            reply="خدمة المساعد الذكي معطلة مؤقتاً للصيانة والتحديث. سنعود قريباً!",
+            status="emergency_disabled",
+            request_id=req_id,
+            provider="system",
+        )
+        return {"reply": res.reply, "status": res.status, "request_id": res.request_id}
+
+    # 2. Daily family & user quota check
+    allowed, reason = check_and_increment_ai_quota(str(user.family_id or ""), str(user.id or ""))
+    if not allowed:
+        res = AICoachResponse(
+            reply="تم الوصول للحد اليومي المسموح به لمحادثات المساعد الذكي للأسرة. يُرجى المحاولة غداً.",
+            status="quota_exceeded",
+            request_id=req_id,
+            provider="system",
+        )
+        return {"reply": res.reply, "status": res.status, "request_id": res.request_id}
+
     # Enforce mode based on authenticated token role (children cannot impersonate parents)
     chat.mode = "parent" if user.role == "parent" else "child"
 
@@ -99,12 +130,20 @@ def chat_ai_coach(
             res = AICoachResponse(
                 reply=raw.get("reply", ""),
                 status=raw.get("status", "success"),
-                request_id=raw.get("request_id"),
+                request_id=raw.get("request_id") or req_id,
             )
         else:
-            res = AICoachResponse(reply=str(raw), status="success")
+            res = AICoachResponse(reply=str(raw), status="success", request_id=req_id)
     else:
-        res = get_ai_chat_response(chat, context, child_name=caller_name)
+        res = get_ai_chat_response(
+            chat,
+            context,
+            child_name=caller_name,
+            request_id=req_id,
+            family_id=str(user.family_id or ""),
+            user_id=str(user.id or ""),
+            skip_quota_check=True,
+        )
 
     return {"reply": res.reply, "status": res.status, "request_id": res.request_id}
 
