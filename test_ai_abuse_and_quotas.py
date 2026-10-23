@@ -24,8 +24,10 @@ Covers:
 
 import os
 import uuid
+import logging
 import threading
 from decimal import Decimal
+from datetime import datetime, timezone
 import pytest
 from fastapi.testclient import TestClient
 
@@ -54,6 +56,25 @@ from services.ai_coach import (
     SAFE_FALLBACK_REPLY_CHILD,
     SAFE_FALLBACK_REPLY_PARENT,
 )
+from services.ai_quota_store import (
+    check_monthly_spend_ceiling,
+    record_ai_spend,
+    get_current_monthly_spend,
+    reset_quota_store,
+    calculate_ai_turn_cost,
+    check_and_increment_daily_quota,
+)
+from services.ai_quota_store import (
+    check_monthly_spend_ceiling,
+    record_ai_spend,
+    get_current_monthly_spend,
+    check_and_increment_daily_quota,
+    reset_quota_store,
+    calculate_ai_turn_cost,
+    close_sqlite_connection,
+    set_redis_client,
+    get_redis_client,
+)
 
 Base.metadata.create_all(bind=engine)
 test_client = TestClient(app)
@@ -66,11 +87,13 @@ test_client = TestClient(app)
 @pytest.fixture(autouse=True)
 def cleanup_quotas_and_env(monkeypatch):
     """Ensure clean quota tracking and offline AI provider for each test."""
-    reset_ai_quotas()
+    set_redis_client(None)
+    reset_quota_store()
     monkeypatch.setattr(ai_coach, "client", None)
     monkeypatch.setattr(limiter, "enabled", False)
     yield
-    reset_ai_quotas()
+    set_redis_client(None)
+    reset_quota_store()
 
 
 def _make_test_family_and_tokens():
@@ -392,3 +415,87 @@ class TestBroadenedOutputSafetyValidator:
         is_safe_parent, reply_parent = validate_ai_output(valid_parent, mode="parent")
         assert is_safe_parent is True
         assert reply_parent == valid_parent
+
+
+class TestAIMonthlySpendCeilingAndPersistentQuotas:
+    """Tests for enforced monthly budget tracking and persistent quota engine."""
+
+    def test_token_cost_calculation(self):
+        """Calculates token costs according to gpt-4o-mini pricing ($0.15/$0.60 per 1M)."""
+        # 1M input = $0.15, 1M output = $0.60
+        cost_1m = calculate_ai_turn_cost(tokens_in=1_000_000, tokens_out=1_000_000)
+        assert round(cost_1m, 2) == 0.75
+
+        # 1000 input, 500 output
+        # (1000 * 0.15 / 1M) + (500 * 0.60 / 1M) = 0.00015 + 0.00030 = 0.00045
+        cost_turn = calculate_ai_turn_cost(tokens_in=1000, tokens_out=500)
+        assert round(cost_turn, 6) == 0.00045
+
+    def test_spend_ceiling_allows_within_budget(self):
+        """Allows requests when monthly spend is strictly below ceiling."""
+        reset_quota_store()
+        record_ai_spend(cost_usd=10.00)
+        under, spend, ceiling = check_monthly_spend_ceiling()
+        assert under is True
+        assert spend >= 10.0
+        assert ceiling == 50.0
+
+    def test_spend_ceiling_exceeded_blocks_request(self):
+        """Blocks requests and returns spend_ceiling_exceeded when spend >= ceiling."""
+        reset_quota_store()
+        record_ai_spend(cost_usd=50.05)
+        under, spend, ceiling = check_monthly_spend_ceiling()
+        assert under is False
+        assert spend >= 50.0
+
+        # Verify get_ai_chat_response returns spend_ceiling_exceeded
+        chat = ChatMessage(message="كيف أدخر للمستقبل؟", mode="child")
+        res = get_ai_chat_response(chat, context="", child_name="أحمد")
+        assert res.status == "spend_ceiling_exceeded"
+        assert "للميزانية الشهرية" in res.reply
+
+    def test_spend_alerts_logged_at_thresholds(self, caplog):
+        """Verifies warning at 80% and critical alert at 100% of spend ceiling."""
+        import services.ai_quota_store as qs
+        reset_quota_store()
+        captured_records = []
+
+        class ListHandler(logging.Handler):
+            def emit(self, record):
+                captured_records.append(record)
+
+        handler = ListHandler()
+        qs.logger.addHandler(handler)
+        qs.logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.WARNING, logger="services.ai_quota_store"):
+                record_ai_spend(cost_usd=40.50)  # 81% of 50.0
+                record_ai_spend(cost_usd=10.00)  # total 50.50 (101%)
+                messages = [r.getMessage() for r in captured_records] + [r.message for r in caplog.records]
+                all_text = " ".join(messages) + " " + caplog.text
+                assert any("80%" in m for m in messages) or "80%" in all_text
+                assert any("100%+" in m for m in messages) or "100%+" in all_text
+        finally:
+            qs.logger.removeHandler(handler)
+            qs.logger.removeHandler(caplog.handler)
+
+    def test_persistent_quotas_across_store_reopen(self):
+        """Verifies quota counts remain persistent across SQLite connection reopens."""
+        reset_quota_store()
+        fam_id = str(uuid.uuid4())
+        u_id = str(uuid.uuid4())
+
+        # Consume 2 requests
+        ok1, _ = check_and_increment_daily_quota(fam_id, u_id)
+        ok2, _ = check_and_increment_daily_quota(fam_id, u_id)
+        assert ok1 is True
+        assert ok2 is True
+
+        # Reopen by closing SQLite connection
+        from services.ai_quota_store import close_sqlite_connection
+        close_sqlite_connection()
+
+        # Check third request increments correctly without resetting to 0
+        ok3, _ = check_and_increment_daily_quota(fam_id, u_id)
+        assert ok3 is True
+

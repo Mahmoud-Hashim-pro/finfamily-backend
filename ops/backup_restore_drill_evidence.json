@@ -1,0 +1,118 @@
+{
+  "drill_id": "drill-1792782592-f66ded50",
+  "timestamp": "2026-10-23T19:09:52Z",
+  "drill_type": "isolated_disaster_recovery_restore_verification",
+  "environment": "isolated_staging_drill",
+  "timings": {
+    "schema_restoration_duration_seconds": 0.2929,
+    "data_restoration_duration_seconds": 0.0357,
+    "ledger_reconciliation_audit_duration_seconds": 0.0143,
+    "total_drill_duration_seconds": 0.3589
+  },
+  "rto_compliance": {
+    "target_minutes": 30,
+    "target_seconds": 1800,
+    "actual_drill_seconds": 0.3589,
+    "actual_drill_minutes": 0.006,
+    "compliant": true,
+    "status": "COMPLIANT",
+    "margin_minutes": 29.994,
+    "description": "Recovery Time Objective target (< 30 min) met with 29.994 min margin."
+  },
+  "rpo_compliance": {
+    "target_minutes": 15,
+    "target_seconds": 900,
+    "continuous_wal_cadence_minutes": 5.0,
+    "achieved_lag_minutes": 5.0,
+    "compliant": true,
+    "status": "COMPLIANT",
+    "margin_minutes": 10.0,
+    "description": "Recovery Point Objective target (< 15 min) satisfied via continuous 5.0-minute WAL replication."
+  },
+  "ledger_balance_reconciliation_audit": {
+    "status": "passed",
+    "checks": [
+      {
+        "check": "domain_entity_counts",
+        "families": 1,
+        "users": 2,
+        "wallets": 1,
+        "status": "passed"
+      },
+      {
+        "check": "negative_balances",
+        "status": "passed",
+        "violations_count": 0
+      },
+      {
+        "check": "orphaned_wallets",
+        "status": "passed",
+        "orphaned_count": 0
+      },
+      {
+        "check": "orphaned_transactions",
+        "status": "passed",
+        "orphaned_count": 0
+      },
+      {
+        "check": "orphaned_card_purchases",
+        "status": "passed",
+        "orphaned_count": 0
+      },
+      {
+        "check": "transaction_ledger_sums",
+        "status": "passed",
+        "total_credit_volume": "350.00",
+        "total_debit_volume": "95.25",
+        "net_ledger_volume": "254.75"
+      },
+      {
+        "check": "idempotency_and_proofs",
+        "idempotency_records": 1,
+        "missions_recorded": 1,
+        "status": "passed"
+      }
+    ],
+    "errors": [],
+    "ledger_summary": {
+      "wallets_audited": 1,
+      "total_transactions": 2,
+      "total_credit_volume": "350.00",
+      "total_debit_volume": "95.25",
+      "net_ledger_volume": "254.75",
+      "wallet_reconciliations": [
+        {
+          "wallet_id": "99132a6a-cbe5-4af8-8577-9ce5093a7b28",
+          "owner_id": "b3faf5aa-6140-4069-8eba-6b9b980d8d95",
+          "current_balance": "254.75",
+          "savings_balance": "50.00",
+          "total_credits": "350.00",
+          "total_debits": "95.25",
+          "net_transaction_flow": "254.75",
+          "transaction_count": 2
+        }
+      ]
+    }
+  },
+  "schema_integrity_audit": {
+    "status": "passed",
+    "total_tables_restored": 14,
+    "tables": [
+      "audit_logs",
+      "card_purchases",
+      "families",
+      "game_completions",
+      "idempotency_records",
+      "lesson_completions",
+      "mfa_recovery_codes",
+      "missions",
+      "password_reset_tokens",
+      "savings_goals",
+      "transactions",
+      "user_badges",
+      "users",
+      "wallets"
+    ]
+  },
+  "overall_status": "passed"
+}

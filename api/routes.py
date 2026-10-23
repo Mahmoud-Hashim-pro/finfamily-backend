@@ -14,6 +14,11 @@ from services.ai_coach import (
     AICoachResponse,
     check_and_increment_ai_quota,
 )
+from services.ai_quota_store import (
+    check_and_increment_daily_quota,
+    check_monthly_spend_ceiling,
+    record_ai_spend,
+)
 import services.ai_coach as ai_coach
 from services.ai_context import build_child_context, build_family_context, redact_name
 
@@ -99,8 +104,19 @@ def chat_ai_coach(
         )
         return {"reply": res.reply, "status": res.status, "request_id": res.request_id}
 
-    # 2. Daily family & user quota check
-    allowed, reason = check_and_increment_ai_quota(str(user.family_id or ""), str(user.id or ""))
+    # 2. Monthly spend ceiling check
+    under_ceiling, current_spend, ceiling = check_monthly_spend_ceiling()
+    if not under_ceiling:
+        res = AICoachResponse(
+            reply="تم الوصول للحد الأقصى للميزانية الشهرية المخصصة للمساعد الذكي. يرجى مراجعة إدارة النظام.",
+            status="spend_ceiling_exceeded",
+            request_id=req_id,
+            provider="system",
+        )
+        return {"reply": res.reply, "status": res.status, "request_id": res.request_id}
+
+    # 3. Daily family & user quota check
+    allowed, reason = check_and_increment_daily_quota(str(user.family_id or ""), str(user.id or ""))
     if not allowed:
         res = AICoachResponse(
             reply="تم الوصول للحد اليومي المسموح به لمحادثات المساعد الذكي للأسرة. يُرجى المحاولة غداً.",
@@ -134,6 +150,8 @@ def chat_ai_coach(
             )
         else:
             res = AICoachResponse(reply=str(raw), status="success", request_id=req_id)
+        if res.status not in ("emergency_disabled", "spend_ceiling_exceeded", "quota_exceeded", "refusal"):
+            record_ai_spend(0, 0)
     else:
         res = get_ai_chat_response(
             chat,

@@ -25,6 +25,12 @@ from core.config import (
     get_ai_spend_ceiling_usd,
 )
 from services.ai_context import redact_sensitive_text
+from services.ai_quota_store import (
+    check_and_increment_daily_quota,
+    check_monthly_spend_ceiling,
+    record_ai_spend,
+    reset_quota_store,
+)
 from services.ai_provider import (
     AIProvider,
     OpenAIProvider,
@@ -72,57 +78,21 @@ def set_provider(provider: Optional[AIProvider]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# AI Daily Quota Tracking (Thread-safe in-memory sliding 24-hour window)
+# AI Daily Quotas & Monthly Spend Tracking (Persistent Store Integration)
 # ---------------------------------------------------------------------------
 
-_ai_quota_lock = threading.Lock()
-_family_ai_usage: Dict[str, List[float]] = {}
-_user_ai_usage: Dict[str, List[float]] = {}
-
-
 def reset_ai_quotas() -> None:
-    """Reset all in-memory AI quota counters (primarily for testing and cache invalidation)."""
-    with _ai_quota_lock:
-        _family_ai_usage.clear()
-        _user_ai_usage.clear()
+    """Reset all AI quota counters and monthly spend data (primarily for testing)."""
+    reset_quota_store()
 
 
 def check_and_increment_ai_quota(family_id: str, user_id: str) -> Tuple[bool, str]:
     """
-    Thread-safe quota tracker for family and user daily AI requests.
+    Thread-safe and persistent quota tracker for family and user daily AI requests.
     Returns (True, "") if within daily quota limits.
     Returns (False, reason) if daily family or user quota is exceeded.
     """
-    now = time.time()
-    cutoff = now - 86400.0  # 24-hour sliding daily window
-
-    user_limit = get_ai_daily_user_quota()
-    family_limit = get_ai_daily_family_quota()
-
-    with _ai_quota_lock:
-        if user_id:
-            user_key = str(user_id).strip()
-            if user_key:
-                current_user_times = [t for t in _user_ai_usage.get(user_key, []) if t > cutoff]
-                _user_ai_usage[user_key] = current_user_times
-                if len(current_user_times) >= user_limit:
-                    return False, f"Daily user quota exceeded ({user_limit} requests/day)"
-
-        if family_id:
-            fam_key = str(family_id).strip()
-            if fam_key:
-                current_fam_times = [t for t in _family_ai_usage.get(fam_key, []) if t > cutoff]
-                _family_ai_usage[fam_key] = current_fam_times
-                if len(current_fam_times) >= family_limit:
-                    return False, f"Daily family quota exceeded ({family_limit} requests/day)"
-
-        # Within quota: increment counters
-        if user_id and str(user_id).strip():
-            _user_ai_usage.setdefault(str(user_id).strip(), []).append(now)
-        if family_id and str(family_id).strip():
-            _family_ai_usage.setdefault(str(family_id).strip(), []).append(now)
-
-        return True, ""
+    return check_and_increment_daily_quota(family_id, user_id)
 
 
 
@@ -847,9 +817,24 @@ def get_ai_chat_response(
             provider="system",
         )
 
-    # 0b. Daily quota check (if family_id or user_id provided and check not skipped)
+    # 0b. Monthly spend ceiling check
+    under_ceiling, current_spend, ceiling = check_monthly_spend_ceiling()
+    if not under_ceiling:
+        logger.warning(
+            "AI Coach request rejected: monthly spend ceiling exceeded ($%.4f >= $%.4f)",
+            current_spend,
+            ceiling,
+        )
+        return AICoachResponse(
+            reply="تم الوصول للحد الأقصى للميزانية الشهرية المخصصة للمساعد الذكي. يرجى مراجعة إدارة النظام.",
+            status="spend_ceiling_exceeded",
+            request_id=req_id,
+            provider="system",
+        )
+
+    # 0c. Daily quota check (if family_id or user_id provided and check not skipped)
     if (family_id or user_id) and not skip_quota_check:
-        allowed, reason = check_and_increment_ai_quota(family_id or "", user_id or "")
+        allowed, reason = check_and_increment_daily_quota(family_id or "", user_id or "")
         if not allowed:
             logger.warning("AI Coach quota exceeded for family=%s, user=%s: %s", family_id, user_id, reason)
             return AICoachResponse(
@@ -895,6 +880,11 @@ def get_ai_chat_response(
     raw_reply = completion.get("reply", "")
     status = completion.get("status", "error")
     provider_name = completion.get("provider", "unknown")
+
+    # Persist AI spend after completion
+    tokens_in = completion.get("tokens_in", 0) if isinstance(completion, dict) else 0
+    tokens_out = completion.get("tokens_out", 0) if isinstance(completion, dict) else 0
+    record_ai_spend(tokens_in=tokens_in, tokens_out=tokens_out)
 
     # Post-generation output safety validation (AI-02 & Output Validator)
     if status == "success" or raw_reply:

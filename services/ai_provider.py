@@ -130,6 +130,9 @@ class OpenAIProvider(AIProvider):
                 timeout=self.timeout,
             )
             raw_reply = response.choices[0].message.content or ""
+            usage = getattr(response, "usage", None)
+            tokens_in = getattr(usage, "prompt_tokens", 0) if usage else 0
+            tokens_out = getattr(usage, "completion_tokens", 0) if usage else 0
 
             # Post-generation safety check
             if 'You are "FinBuddy 🤖"' in raw_reply or "system prompt" in raw_reply.lower():
@@ -137,12 +140,16 @@ class OpenAIProvider(AIProvider):
                     "reply": get_arabic_fallback("safety_guardrail", mode=mode),
                     "status": "fallback",
                     "provider": "openai",
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
                 }
 
             return {
                 "reply": raw_reply,
                 "status": "success",
                 "provider": "openai",
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
             }
 
         except (APITimeoutError, httpx.TimeoutException) as e:
