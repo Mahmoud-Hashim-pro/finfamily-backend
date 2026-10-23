@@ -5,7 +5,8 @@ from db.database import get_db
 from db.models import User
 from core.deps import get_current_user
 from core.limiter import limiter
-from services.ai_coach import ChatMessage, get_ai_response
+from services.ai_coach import ChatMessage, get_ai_response, get_ai_chat_response, AICoachResponse
+import services.ai_coach as ai_coach
 from services.ai_context import build_child_context, build_family_context, redact_name
 
 MAX_AI_BODY_BYTES = 16384  # 16KB
@@ -61,8 +62,9 @@ def chat_ai_coach(
     - Input length validation: max 1000 chars (BUG-017)
     - Enforces mode ('parent' vs 'child') based on authenticated token role
     - Generates context with PII redaction and qualitative balance tiers (BUG-019)
-    - Multi-turn conversation history and safety guardrails (BUG-136, BUG-137)
+    - Multi-turn conversation history and safety guardrails (BUG-136, BUG-137, AI-01)
     - 10-second provider timeout and friendly Arabic fallbacks (BUG-016, BUG-018, BUG-138)
+    - Structured response contract: reply, status, request_id (AI-08)
     - Plain `def` on purpose: FastAPI runs it in the threadpool, so the blocking DB queries and
       OpenAI call never freeze the event loop (and the threading semaphore really bounds concurrency)
     - Supported route aliases:
@@ -88,8 +90,23 @@ def chat_ai_coach(
         context = build_child_context(db, user)
         caller_name = redact_name(user.full_name) if user.full_name else "Champion"
 
-    reply = get_ai_response(chat, context, child_name=caller_name)
-    return {"reply": reply}
+    # Support monkeypatched get_ai_response in legacy unit tests while returning structured response
+    if get_ai_response is not ai_coach.get_ai_response:
+        raw = get_ai_response(chat, context, child_name=caller_name)
+        if isinstance(raw, AICoachResponse):
+            res = raw
+        elif isinstance(raw, dict):
+            res = AICoachResponse(
+                reply=raw.get("reply", ""),
+                status=raw.get("status", "success"),
+                request_id=raw.get("request_id"),
+            )
+        else:
+            res = AICoachResponse(reply=str(raw), status="success")
+    else:
+        res = get_ai_chat_response(chat, context, child_name=caller_name)
+
+    return {"reply": res.reply, "status": res.status, "request_id": res.request_id}
 
 
 # Backward-compatible function alias

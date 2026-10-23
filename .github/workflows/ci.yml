@@ -53,7 +53,7 @@ jobs:
           TEST_POSTGRES_URL: "postgresql://postgres:postgrespassword@localhost:5432/finfamily_test"
           JWT_SECRET: "test-ci-secret-key-at-least-32-bytes-secure"
           GOOGLE_CLIENT_ID: "100000000000-dummyclientidforci.apps.googleusercontent.com"
-          APP_VERSION: "1.1.2"
-          APP_BUILD_NUMBER: "10"
+          APP_VERSION: "1.1.8"
+          APP_BUILD_NUMBER: "16"
         run: |
           pytest -v

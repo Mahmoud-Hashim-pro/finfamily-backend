@@ -180,7 +180,9 @@ def test_coach_endpoint_is_sync_and_runs_off_event_loop(offline_ai, monkeypatch)
         headers={"Authorization": f"Bearer {ids['child_token']}"},
     )
     assert res.status_code == 200, res.text
-    assert res.json() == {"reply": "ok"}
+    assert res.json()["reply"] == "ok"
+    assert res.json().get("status") == "success"
+    assert "request_id" in res.json()
     # Blocking provider/DB work must run in a worker thread, not on the event loop
     assert seen["on_event_loop"] is False
 

@@ -416,7 +416,7 @@ def read_root():
         "status": status_str,
         "service": "FinFamily API",
         "docs": None if is_prod else "/docs",
-        "version": os.getenv("APP_VERSION", "1.1.4")
+        "version": os.getenv("APP_VERSION", "1.1.8")
     }
     return JSONResponse(
         status_code=200 if status_str == "healthy" else 503,
@@ -427,6 +427,9 @@ def read_root():
 RELEASE_APK_SHA256 = {
     "1.1.4": "21408d8dcde46b0a372b0b974324e990cf252815aa6716d572168ebaf288187c",
     "1.1.5": "41d195fb3feacc2cc00a834a41f9ac05817d128a7b0bbef5304b62e56fa8cfcc",
+    "1.1.6": "41d195fb3feacc2cc00a834a41f9ac05817d128a7b0bbef5304b62e56fa8cfcc",
+    "1.1.7": "9922e96d197607a9779df5282b8ab263c965b11eb5eb3d0526e0339d2c5ae0fa",
+    "1.1.8": "1cd5f2fc7302137a5264021cc4b4f11242e422f9ffcfabc1f78136b34d3b9bb4",
 }
 
 
@@ -434,9 +437,9 @@ RELEASE_APK_SHA256 = {
 @app.get("/api/app/version")
 @app.get("/app/version")
 def get_app_version():
-    # FF-05 & FF-31: Default version matching current production release (1.1.4 build 12)
-    version = os.getenv("APP_VERSION", "1.1.4")
-    build_num = int(os.getenv("APP_BUILD_NUMBER", "12"))
+    # FF-05 & FF-31: Default version matching current production release (1.1.8 build 16)
+    version = os.getenv("APP_VERSION", "1.1.8")
+    build_num = int(os.getenv("APP_BUILD_NUMBER", "16"))
     min_version = os.getenv("MIN_SUPPORTED_VERSION", "1.0.0")
     download_url = os.getenv(
         "APP_DOWNLOAD_URL",
