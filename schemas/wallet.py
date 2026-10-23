@@ -81,6 +81,7 @@ class SavingsGoalCreate(BaseModel):
 
 class SavingsGoalDeposit(BaseModel):
     amount: float = Field(gt=0, le=1_000_000)
+    idempotency_key: Optional[str] = Field(default=None, max_length=128)
 
     @field_validator("amount")
     @classmethod
@@ -90,6 +91,7 @@ class SavingsGoalDeposit(BaseModel):
 
 class SavingsGoalWithdraw(BaseModel):
     amount: float = Field(gt=0, le=1_000_000)
+    idempotency_key: Optional[str] = Field(default=None, max_length=128)
 
     @field_validator("amount")
     @classmethod
@@ -180,8 +182,9 @@ class CardThemeUpdate(BaseModel):
 
 class AllowanceSend(BaseModel):
     amount: float = Field(gt=0, le=1_000_000)
+    idempotency_key: Optional[str] = Field(default=None, max_length=128)
     label: str = Field(default="Allowance", max_length=200)
-    idempotency_key: Optional[str] = Field(default=None, max_length=100)
+
 
     @field_validator("amount")
     @classmethod
@@ -320,7 +323,8 @@ class CardPurchaseCreate(BaseModel):
     category: str = Field(default="Other", max_length=50)
     location: Optional[str] = Field(default=None, max_length=100)
     amount: float = Field(gt=0, le=1_000_000)
-    idempotency_key: Optional[str] = Field(default=None, max_length=100)
+    idempotency_key: Optional[str] = Field(default=None, max_length=128)
+
 
     @field_validator("amount")
     @classmethod

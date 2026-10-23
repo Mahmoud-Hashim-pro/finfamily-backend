@@ -18,6 +18,7 @@ from services.ai_quota_store import (
     check_and_increment_daily_quota,
     check_monthly_spend_ceiling,
     record_ai_spend,
+    refund_daily_quota,
 )
 import services.ai_coach as ai_coach
 from services.ai_context import build_child_context, build_family_context, redact_name
@@ -162,6 +163,10 @@ def chat_ai_coach(
             user_id=str(user.id or ""),
             skip_quota_check=True,
         )
+
+    # Item 27: Refund daily quota if request was refused by moderation or suffered provider timeout/error
+    if res.status in ("refusal", "timeout", "error"):
+        refund_daily_quota(str(user.family_id or ""), str(user.id or ""))
 
     return {"reply": res.reply, "status": res.status, "request_id": res.request_id}
 

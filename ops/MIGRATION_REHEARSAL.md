@@ -19,7 +19,7 @@ export TEST_DATABASE_URL="postgresql://test_user:test_pass@staging-db.finfamily.
 ### Step 2: Run Automated Rehearsal Tool
 Execute the automated rehearsal script:
 ```bash
-python ops/rehearse_migrations.py "$TEST_DATABASE_URL"
+python ops/rehearse_migrations.py "$TEST_DATABASE_URL" --allow-isolated-rehearsal
 ```
 
 ### Step 3: Validate Output Criteria

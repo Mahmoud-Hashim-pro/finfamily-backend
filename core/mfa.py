@@ -8,7 +8,7 @@ from typing import Optional, Any
 
 import pyotp
 import qrcode
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, MultiFernet
 from passlib.context import CryptContext
 
 ISSUER_NAME = "FinFamily"
@@ -24,14 +24,45 @@ from core.config import is_production
 
 # ---------- MFA Secrets Encryption at Rest (BUG-012 & FF-08) ----------
 
-def _get_fernet() -> Fernet:
+def _derive_fernet_key(secret_str: str) -> bytes:
+    return base64.urlsafe_b64encode(hashlib.sha256(secret_str.encode("utf-8")).digest())
+
+
+def _get_fernet() -> MultiFernet:
+    """
+    Returns MultiFernet supporting fallback decryption keys so key rotation
+    (e.g. rotating JWT_SECRET or MFA_ENCRYPTION_KEY) never locks out users.
+    """
     raw_key = os.getenv("MFA_ENCRYPTION_KEY", "").strip() or os.getenv("JWT_SECRET", "").strip()
     if not raw_key or len(raw_key) < 16 or "default" in raw_key.lower():
         if is_production():
-            raise RuntimeError("CRITICAL: Dedicated MFA_ENCRYPTION_KEY or secure JWT_SECRET of at least 16 characters is required in production!")
+            raise RuntimeError("CRITICAL: Dedicated MFA_ENCRYPTION_KEY of at least 16 characters is required in production!")
         raw_key = "finfamily-mfa-default-encryption-secret-key-2026"
-    derived = base64.urlsafe_b64encode(hashlib.sha256(raw_key.encode("utf-8")).digest())
-    return Fernet(derived)
+
+    primary_fern = Fernet(_derive_fernet_key(raw_key))
+    fernets = [primary_fern]
+    seen_keys = {raw_key}
+
+    # Fallback keys: previous keys, fallback env var, or JWT_SECRET if different from MFA_ENCRYPTION_KEY
+    candidates = []
+    prev_keys = os.getenv("MFA_PREVIOUS_ENCRYPTION_KEYS", "")
+    if prev_keys:
+        candidates.extend([k.strip() for k in prev_keys.split(",") if k.strip()])
+    jwt_secret = os.getenv("JWT_SECRET", "").strip()
+    if jwt_secret and len(jwt_secret) >= 16:
+        candidates.append(jwt_secret)
+    if not is_production():
+        candidates.append("finfamily-mfa-default-encryption-secret-key-2026")
+
+    for cand in candidates:
+        if cand and cand not in seen_keys:
+            seen_keys.add(cand)
+            try:
+                fernets.append(Fernet(_derive_fernet_key(cand)))
+            except Exception:
+                pass
+
+    return MultiFernet(fernets)
 
 
 def encrypt_mfa_secret(secret: Optional[str]) -> Optional[str]:

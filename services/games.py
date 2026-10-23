@@ -140,7 +140,7 @@ def compute_reward(
     # Path B: Single-question interactive mobile scenario via selected_option
     if selected_option:
         opt = selected_option.strip().lower()
-        if opt == expected_option or (expected_option == "opta" and opt in ("opta", "a")):
+        if opt == expected_option or (expected_option == "opta" and opt in ("opta", "a")) or (expected_option == "optb" and opt in ("optb", "b")):
             xp_awarded = game["base_xp"]
             coins_awarded = round(xp_awarded * 0.5, 2)
             return game["title"], xp_awarded, coins_awarded

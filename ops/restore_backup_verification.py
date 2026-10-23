@@ -395,7 +395,7 @@ def run_isolated_restore_drill(
             wallet_id=wallet_1.id,
             merchant="Drill Bookstore",
             amount=Decimal("95.25"),
-            status="approved",
+            status="completed",
             idempotency_key=idem_key_1,
         )
         idem_rec_1 = IdempotencyRecord(

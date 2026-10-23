@@ -32,7 +32,7 @@ def test_programmatic_alembic_migration_rehearsal_success():
         )
         assert report["status"] == "success"
         assert report["target_type"] == "sqlite"
-        assert len(report["revisions_applied"]) == 4
+        assert len(report["revisions_applied"]) == 5
 
         rev_names = [r["revision"] for r in report["revisions_applied"]]
         assert rev_names == [
@@ -40,6 +40,7 @@ def test_programmatic_alembic_migration_rehearsal_success():
             "0001_numeric_and_isolation",
             "0002_idemp_mfa_atomic",
             "0003_mission_proof",
+            "0004_safety_constraints",
         ]
 
         assert report["readiness_verification"]["status"] == "passed"

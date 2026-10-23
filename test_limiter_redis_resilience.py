@@ -316,6 +316,13 @@ def test_critical_route_login_rate_limiting_under_memory_fallback():
     assert resp_limit.status_code == 429, f"Expected 429 on attempt 6, got {resp_limit.status_code}: {resp_limit.text}"
     assert "rate limit exceeded" in resp_limit.text.lower()
 
+    # Reset limiter to in-memory mode for clean state
+    limiter._storage_uri = "memory://"
+    limiter._storage = MemoryStorage()
+    limiter._limiter = STRATEGIES["fixed-window"](limiter._storage)
+    limiter._storage_dead = False
+    limiter._swallow_errors = True
+
 
 def test_critical_route_mfa_verify_rate_limiting_under_memory_fallback():
     """
@@ -346,3 +353,10 @@ def test_critical_route_mfa_verify_rate_limiting_under_memory_fallback():
     )
     assert resp_limit.status_code == 429, f"Expected 429 on attempt 11, got {resp_limit.status_code}: {resp_limit.text}"
     assert "rate limit exceeded" in resp_limit.text.lower()
+
+    # Reset limiter to in-memory mode for clean state
+    limiter._storage_uri = "memory://"
+    limiter._storage = MemoryStorage()
+    limiter._limiter = STRATEGIES["fixed-window"](limiter._storage)
+    limiter._storage_dead = False
+    limiter._swallow_errors = True

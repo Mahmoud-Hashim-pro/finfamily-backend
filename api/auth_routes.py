@@ -128,6 +128,42 @@ _RESET_TOKEN_IN_LINK = re.compile(r"(?:^|[?&#])token=([A-Za-z0-9_\-]+)")
 from core.config import is_admin_email, get_admin_allowlist
 
 
+PARENT_LOGIN_LOCKOUT_MINUTES = 15
+PARENT_LOGIN_MAX_FAILURES = 5
+_FAILED_PARENT_LOGIN_ATTEMPTS: dict[str, list[datetime]] = {}
+
+
+def _check_parent_login_lockout(user_id: str, db: Session) -> None:
+    now = datetime.utcnow()
+    window_start = now - timedelta(minutes=PARENT_LOGIN_LOCKOUT_MINUTES)
+    recent_fails = (
+        db.query(AuditLog)
+        .filter(
+            AuditLog.actor_id == user_id,
+            AuditLog.action == "login_failed",
+            AuditLog.created_date >= window_start,
+        )
+        .count()
+    )
+    mem_fails = [t for t in _FAILED_PARENT_LOGIN_ATTEMPTS.get(user_id, []) if (now - t).total_seconds() < PARENT_LOGIN_LOCKOUT_MINUTES * 60]
+    _FAILED_PARENT_LOGIN_ATTEMPTS[user_id] = mem_fails
+    if recent_fails >= PARENT_LOGIN_MAX_FAILURES or len(mem_fails) >= PARENT_LOGIN_MAX_FAILURES:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed login attempts. Account temporarily locked for 15 minutes.",
+        )
+
+
+def _record_parent_login_failure(user_id: str) -> None:
+    now = datetime.utcnow()
+    attempts = _FAILED_PARENT_LOGIN_ATTEMPTS.get(user_id, [])
+    attempts.append(now)
+    _FAILED_PARENT_LOGIN_ATTEMPTS[user_id] = attempts
+
+
+def _clear_parent_login_failures(user_id: str) -> None:
+    _FAILED_PARENT_LOGIN_ATTEMPTS.pop(user_id, None)
+
 def _check_recovery_code_lockout(user_id: str, db: Optional[Session] = None) -> None:
     now = datetime.utcnow()
     # FF-04: Check database-backed audit log if db session provided (shared across all serverless workers)
@@ -315,6 +351,8 @@ def register_parent(request: Request, payload: ParentRegister, db: Session = Dep
 def login_parent(request: Request, payload: ParentLogin, db: Session = Depends(get_db)):
     clean_email = payload.email.strip().lower()
     user = db.query(User).filter(func.lower(User.email) == clean_email, User.role == UserRole.parent).first()
+    if user:
+        _check_parent_login_lockout(user.id, db)
 
     # BUG-113 (P2): Constant-time dummy hash verification if user not found to prevent timing enumeration
     if not user:
@@ -327,6 +365,7 @@ def login_parent(request: Request, payload: ParentLogin, db: Session = Depends(g
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     if not user.password_hash or not verify_password(payload.password, user.password_hash):
+        _record_parent_login_failure(user.id)
         # BUG-131 (P2): Attribute failed login attempt to the family when account exists
         log_action(
             db, request=request, action="login_failed",
@@ -351,6 +390,7 @@ def login_parent(request: Request, payload: ParentLogin, db: Session = Depends(g
 
     used_recovery_code = False
 
+    _clear_parent_login_failures(user.id)
     # الباسورد صح. لو الأب مفعّل MFA، الخطوة دي مش كفاية لوحدها.
     if user.mfa_enabled:
         if payload.recovery_code:
@@ -571,6 +611,7 @@ def _google_login_existing_user(
         token_type="bearer",
         user=UserResponse.model_validate(user),
         mfa_required=False,
+        security_notice="google_linked_credentials_updated" if claimed_unverified else None,
     )
 
 
@@ -796,7 +837,7 @@ def child_login(request: Request, payload: ChildLogin, db: Session = Depends(get
         if child.pin_locked_until <= datetime.utcnow():
             child.failed_pin_attempts = 0
             child.pin_locked_until = None
-            db.commit()
+            db.flush()
         else:
             remaining = int((child.pin_locked_until - datetime.utcnow()).total_seconds() / 60) + 1
             raise HTTPException(status_code=429, detail=f"Too many attempts. Try again in {remaining} minute(s).")
@@ -1698,3 +1739,20 @@ def verify_mfa_login(request: Request, payload: MfaVerifyRequest, db: Session = 
 @router.get("/me", response_model=UserResponse)
 def me(user: User = Depends(get_current_user)):
     return user
+
+@router.post("/logout")
+@router.post("/api/auth/logout")
+def logout_user(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Server-side token invalidation: bumps user.token_version to invalidate all issued JWTs (FF-29)."""
+    current_user.token_version = (getattr(current_user, "token_version", 1) or 1) + 1
+    log_action(
+        db, request=request, action="user_logged_out",
+        actor_id=current_user.id, actor_role=str(current_user.role), family_id=current_user.family_id,
+        target_type="user", target_id=current_user.id,
+    )
+    db.commit()
+    return {"status": "success", "detail": "Logged out successfully. All sessions revoked."}

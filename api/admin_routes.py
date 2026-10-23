@@ -420,10 +420,14 @@ def get_admin_overview(admin: User = Depends(require_admin), db: Session = Depen
     rejected_purchases = db.query(CardPurchase).filter(CardPurchase.status == PurchaseStatus.rejected).count()
     pending_purchases = db.query(CardPurchase).filter(CardPurchase.status == PurchaseStatus.pending).count()
 
-    # Security alerts in last 24 hours (auth / second-factor failures actually emitted + client tampering beacons)
+    # Security alerts in last 24 hours (auth / second-factor failures actually emitted)
     since_24h = datetime.utcnow() - timedelta(hours=24)
     security_alerts_24h = db.query(AuditLog).filter(
-        (AuditLog.action.in_(SECURITY_ALERT_ACTIONS)) | (AuditLog.action.like("untrusted_tampering_%")),
+        AuditLog.action.in_(SECURITY_ALERT_ACTIONS),
+        AuditLog.created_date >= since_24h
+    ).count()
+    client_beacons_24h = db.query(AuditLog).filter(
+        AuditLog.action.like("untrusted_tampering_%"),
         AuditLog.created_date >= since_24h
     ).count()
 
@@ -464,6 +468,7 @@ def get_admin_overview(admin: User = Depends(require_admin), db: Session = Depen
         },
         "security": {
             "alerts_24h": security_alerts_24h,
+            "client_beacons_24h": client_beacons_24h,
             "allowlist_size": len(get_admin_allowlist()),
         }
     }
@@ -851,3 +856,52 @@ def record_security_beacon(request: Request, payload: SecurityBeaconRequest, db:
     db.commit()
 
     return {"status": "recorded", "acknowledged": True}
+
+
+class AdminUserStatusUpdate(BaseModel):
+    is_active: bool
+
+
+@router.patch("/users/{user_id}/status")
+def update_user_status(
+    user_id: str,
+    payload: AdminUserStatusUpdate,
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Admin endpoint to deactivate or restore access to a user account (FF-28)."""
+    target_user = db.query(User).filter(User.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if target_user.id == admin.id:
+        raise HTTPException(status_code=400, detail="Cannot change status of currently authenticated admin user")
+
+    if target_user.role == UserRole.admin or is_admin_email(target_user.email):
+        raise HTTPException(status_code=403, detail="Cannot deactivate administrative accounts via this endpoint")
+
+    target_user.is_active = payload.is_active
+    if not payload.is_active:
+        # Bump token version to immediately invalidate active tokens
+        target_user.token_version = (getattr(target_user, "token_version", 1) or 1) + 1
+
+    audit = AuditLog(
+        family_id=target_user.family_id,
+        actor_id=admin.id,
+        actor_role="admin",
+        action="user_status_updated",
+        target_type="user",
+        target_id=target_user.id,
+        ip_address=_client_ip(request),
+        detail={"is_active": payload.is_active, "target_email": target_user.email, "role": str(target_user.role)},
+    )
+    db.add(audit)
+    db.commit()
+    db.refresh(target_user)
+    return {
+        "status": "success",
+        "user_id": target_user.id,
+        "is_active": target_user.is_active,
+        "token_version": target_user.token_version,
+    }

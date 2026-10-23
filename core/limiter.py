@@ -78,18 +78,28 @@ def get_client_ip(request: Request) -> str:
         trust_proxy = env_trust.strip().lower() in ("true", "1", "yes")
 
     if trust_proxy:
-        # Check Cloudflare edge header if present
-        for edge_header in ("cf-connecting-ip", "true-client-ip"):
-            val = request.headers.get(edge_header)
-            if val:
-                sanitized = sanitize_ip(val)
-                if sanitized:
-                    try:
-                        ip_obj = ipaddress.ip_address(sanitized)
-                        if not is_private_or_loopback(ip_obj):
-                            return sanitized
-                    except ValueError:
-                        pass
+        # Vercel-specific trusted client IP header (edge-appended, tamper-proof on Vercel)
+        vercel_forwarded = request.headers.get("x-vercel-forwarded-for")
+        if vercel_forwarded:
+            sanitized = sanitize_ip(vercel_forwarded.split(",")[-1].strip())
+            if sanitized:
+                return sanitized
+
+        # Cloudflare edge headers: trusted when proxy headers are trusted, unless explicitly disabled
+        trust_cf_env = os.getenv("TRUST_CLOUDFLARE_HEADERS")
+        trust_cf = trust_cf_env.strip().lower() in ("true", "1", "yes") if trust_cf_env is not None else True
+        if trust_cf:
+            for edge_header in ("cf-connecting-ip", "true-client-ip"):
+                val = request.headers.get(edge_header)
+                if val:
+                    sanitized = sanitize_ip(val)
+                    if sanitized:
+                        try:
+                            ip_obj = ipaddress.ip_address(sanitized)
+                            if not is_private_or_loopback(ip_obj):
+                                return sanitized
+                        except ValueError:
+                            pass
 
         forwarded = request.headers.get("x-forwarded-for")
         if forwarded:

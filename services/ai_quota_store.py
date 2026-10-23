@@ -13,7 +13,7 @@ import logging
 import sqlite3
 import threading
 from datetime import datetime, timezone
-from typing import Optional, Tuple, Any
+from typing import Optional, Tuple, Any, Dict
 
 import redis
 
@@ -116,25 +116,30 @@ def calculate_ai_turn_cost(
 
 
 # ---------------------------------------------------------------------------
-# Tier A: Redis Client Management
+# Tier A: Redis Client Management & Circuit Breaker (BUG-FIX)
 # ---------------------------------------------------------------------------
 _custom_redis_client: Optional[Any] = None
 _redis_client_cache: Optional[Any] = None
 _redis_cached_url: Optional[str] = None
+_redis_last_failure_time: float = 0.0
+REDIS_FAILURE_COOLDOWN_SECONDS: float = 30.0
 
 
 def set_redis_client(client: Optional[Any]) -> None:
     """Explicitly inject a Redis client (used for testing or custom configs)."""
-    global _custom_redis_client
+    global _custom_redis_client, _redis_last_failure_time
     _custom_redis_client = client
+    _redis_last_failure_time = 0.0
 
 
 def get_redis_client() -> Optional[Any]:
     """
     Returns an active Redis client if REDIS_URL or RATELIMIT_STORAGE_URL is configured
-    and reachable, or if an explicit client has been set. Returns None otherwise.
+    and reachable, or if an explicit client has been set.
+    Includes a 30s circuit breaker to avoid 3-second reconnection delays on every request
+    when Redis is temporarily down.
     """
-    global _custom_redis_client, _redis_client_cache, _redis_cached_url
+    global _custom_redis_client, _redis_client_cache, _redis_cached_url, _redis_last_failure_time
     if _custom_redis_client is not None:
         return _custom_redis_client
 
@@ -147,39 +152,66 @@ def get_redis_client() -> Optional[Any]:
     if _redis_client_cache is not None and _redis_cached_url == redis_url:
         return _redis_client_cache
 
+    # Circuit breaker: if recent connection failure, skip reconnect during cooldown
+    now = time.time()
+    if (now - _redis_last_failure_time) < REDIS_FAILURE_COOLDOWN_SECONDS:
+        return None
+
     try:
         r = redis.Redis.from_url(
             redis_url,
             decode_responses=True,
-            socket_timeout=1.0,
-            socket_connect_timeout=1.0,
+            socket_timeout=0.8,
+            socket_connect_timeout=0.8,
         )
         r.ping()
         _redis_client_cache = r
         _redis_cached_url = redis_url
+        _redis_last_failure_time = 0.0
         logger.info("Connected to Redis quota store at %s", redis_url.split("@")[-1])
         return r
     except Exception as exc:
-        logger.debug("Redis quota store not reachable (%s); falling back to persistent DB tier", exc)
+        _redis_last_failure_time = time.time()
+        _redis_client_cache = None
+        logger.debug("Redis quota store not reachable (%s); entering 30s cooldown and falling back to DB tier", exc)
         return None
 
 
 # ---------------------------------------------------------------------------
-# Tier B: Persistent SQLite Storage Engine
+# Tier B: Persistent SQLite Storage Engine (Serverless & Read-Only Safe)
 # ---------------------------------------------------------------------------
 _sqlite_lock = threading.Lock()
 _sqlite_conn: Optional[sqlite3.Connection] = None
 _current_db_path: Optional[str] = None
+_sqlite_disabled: bool = False
+_memory_usage_store: Dict[str, Any] = {"quotas": {}, "spend": {}}
 
 
 def get_db_path() -> str:
-    """Returns the resolved absolute path to the local SQLite quota store."""
-    return os.path.abspath(
-        os.getenv(
-            "AI_USAGE_DB_PATH",
-            os.path.join(os.path.dirname(os.path.dirname(__file__)), "ai_usage_store.db"),
-        )
-    )
+    """
+    Returns the resolved absolute path to the local SQLite quota store.
+    On Vercel / serverless / read-only filesystems, defaults to /tmp.
+    """
+    explicit = os.getenv("AI_USAGE_DB_PATH")
+    if explicit:
+        return os.path.abspath(explicit)
+
+    # Detect Vercel / AWS Lambda / Read-Only container
+    is_serverless = bool(os.getenv("VERCEL") or os.getenv("VERCEL_ENV") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
+    if is_serverless:
+        return os.path.join(tempfile.gettempdir(), "ai_usage_store.db")
+
+    default_dir = os.path.dirname(os.path.dirname(__file__))
+    try:
+        # Check if project directory is writable
+        test_file = os.path.join(default_dir, ".write_test.tmp")
+        with open(test_file, "w") as f:
+            f.write("test")
+        os.remove(test_file)
+        return os.path.abspath(os.path.join(default_dir, "ai_usage_store.db"))
+    except Exception:
+        # Directory is read-only (e.g. Vercel deployment root)
+        return os.path.join(tempfile.gettempdir(), "ai_usage_store.db")
 
 
 def _init_sqlite_tables(conn: sqlite3.Connection) -> None:
@@ -206,9 +238,12 @@ def _init_sqlite_tables(conn: sqlite3.Connection) -> None:
         )
 
 
-def _get_sqlite_connection() -> sqlite3.Connection:
+def _get_sqlite_connection() -> Optional[sqlite3.Connection]:
     """Retrieve or initialize the active thread-safe SQLite connection."""
-    global _sqlite_conn, _current_db_path
+    global _sqlite_conn, _current_db_path, _sqlite_disabled
+    if _sqlite_disabled:
+        return None
+
     db_path = get_db_path()
     if _sqlite_conn is None or _current_db_path != db_path:
         if _sqlite_conn is not None:
@@ -216,18 +251,27 @@ def _get_sqlite_connection() -> sqlite3.Connection:
                 _sqlite_conn.close()
             except Exception:
                 pass
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        _sqlite_conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False)
-        _sqlite_conn.execute("PRAGMA journal_mode=WAL")
-        _sqlite_conn.execute("PRAGMA synchronous=NORMAL")
-        _init_sqlite_tables(_sqlite_conn)
-        _current_db_path = db_path
+        try:
+            os.makedirs(os.path.dirname(db_path), exist_ok=True)
+            conn = sqlite3.connect(db_path, timeout=10.0, check_same_thread=False)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+            except Exception:
+                pass
+            _init_sqlite_tables(conn)
+            _sqlite_conn = conn
+            _current_db_path = db_path
+        except Exception as exc:
+            logger.warning("Could not initialize SQLite quota store at %s (%s); falling back to in-memory store", db_path, exc)
+            _sqlite_disabled = True
+            return None
     return _sqlite_conn
 
 
 def close_sqlite_connection() -> None:
     """Close active SQLite connection (useful for simulating process restart)."""
-    global _sqlite_conn, _current_db_path
+    global _sqlite_conn, _current_db_path, _sqlite_disabled
     with _sqlite_lock:
         if _sqlite_conn is not None:
             try:
@@ -236,6 +280,7 @@ def close_sqlite_connection() -> None:
                 pass
             _sqlite_conn = None
             _current_db_path = None
+        _sqlite_disabled = False
 
 
 # ---------------------------------------------------------------------------
@@ -323,53 +368,120 @@ def check_and_increment_daily_quota(
             logger.warning("Redis daily quota tracking failed (%s); falling back to SQLite tier", exc)
 
     # Tier B: Persistent SQLite Store
-    with _sqlite_lock:
-        conn = _get_sqlite_connection()
-        with conn:
-            cursor = conn.cursor()
-            now_ts = time.time()
-
-            # 1. Check user quota limit
-            if user_key and user_limit > 0:
-                cursor.execute("SELECT count FROM ai_daily_quotas WHERE quota_key = ?", (user_key,))
-                row = cursor.fetchone()
-                cur_u = row[0] if row else 0
-                if cur_u >= user_limit:
+    try:
+        with _sqlite_lock:
+            conn = _get_sqlite_connection()
+            if conn is None:
+                # Fallback to thread-safe memory store
+                cur_u = _memory_usage_store["quotas"].get(user_key, 0)
+                cur_f = _memory_usage_store["quotas"].get(family_key, 0)
+                if user_key and user_limit > 0 and cur_u >= user_limit:
                     return False, f"Daily user quota exceeded ({user_limit} requests/day)"
-
-            # 2. Check family quota limit
-            if family_key and family_limit > 0:
-                cursor.execute("SELECT count FROM ai_daily_quotas WHERE quota_key = ?", (family_key,))
-                row = cursor.fetchone()
-                cur_f = row[0] if row else 0
-                if cur_f >= family_limit:
+                if family_key and family_limit > 0 and cur_f >= family_limit:
                     return False, f"Daily family quota exceeded ({family_limit} requests/day)"
+                if user_key:
+                    _memory_usage_store["quotas"][user_key] = cur_u + 1
+                if family_key:
+                    _memory_usage_store["quotas"][family_key] = cur_f + 1
+                return True, ""
 
-            # 3. Within limits: persist increment for both keys
+            with conn:
+                cursor = conn.cursor()
+                now_ts = time.time()
+
+                # 1. Check user quota limit
+                if user_key and user_limit > 0:
+                    cursor.execute("SELECT count FROM ai_daily_quotas WHERE quota_key = ?", (user_key,))
+                    row = cursor.fetchone()
+                    cur_u = row[0] if row else 0
+                    if cur_u >= user_limit:
+                        return False, f"Daily user quota exceeded ({user_limit} requests/day)"
+
+                # 2. Check family quota limit
+                if family_key and family_limit > 0:
+                    cursor.execute("SELECT count FROM ai_daily_quotas WHERE quota_key = ?", (family_key,))
+                    row = cursor.fetchone()
+                    cur_f = row[0] if row else 0
+                    if cur_f >= family_limit:
+                        return False, f"Daily family quota exceeded ({family_limit} requests/day)"
+
+                # 3. Within limits: persist increment for both keys
+                if user_key:
+                    cursor.execute(
+                        """
+                        INSERT INTO ai_daily_quotas (quota_key, count, date_str, updated_at)
+                        VALUES (?, 1, ?, ?)
+                        ON CONFLICT(quota_key) DO UPDATE SET
+                            count = count + 1,
+                            updated_at = excluded.updated_at
+                        """,
+                        (user_key, d_str, now_ts),
+                    )
+                if family_key:
+                    cursor.execute(
+                        """
+                        INSERT INTO ai_daily_quotas (quota_key, count, date_str, updated_at)
+                        VALUES (?, 1, ?, ?)
+                        ON CONFLICT(quota_key) DO UPDATE SET
+                            count = count + 1,
+                            updated_at = excluded.updated_at
+                        """,
+                        (family_key, d_str, now_ts),
+                    )
+
+                return True, ""
+    except Exception as exc:
+        logger.warning("SQLite quota check/increment failed (%s); failing open safely", exc)
+        return True, ""
+
+
+def refund_daily_quota(
+    family_id: str,
+    user_id: str,
+    date_str: Optional[str] = None,
+) -> None:
+    """
+    Refund / decrement daily quota counter if a request is rejected by moderation
+    or times out before generating a reply (Item 27).
+    """
+    d_str = date_str or _get_utc_date_str()
+    clean_user = str(user_id).strip() if user_id else ""
+    clean_family = str(family_id).strip() if family_id else ""
+    user_key = f"ai:quota:user:{clean_user}:{d_str}" if clean_user else ""
+    family_key = f"ai:quota:family:{clean_family}:{d_str}" if clean_family else ""
+
+    # Tier A: Redis decrement
+    redis_client = get_redis_client()
+    if redis_client is not None:
+        try:
             if user_key:
-                cursor.execute(
-                    """
-                    INSERT INTO ai_daily_quotas (quota_key, count, date_str, updated_at)
-                    VALUES (?, 1, ?, ?)
-                    ON CONFLICT(quota_key) DO UPDATE SET
-                        count = count + 1,
-                        updated_at = excluded.updated_at
-                    """,
-                    (user_key, d_str, now_ts),
-                )
+                val = redis_client.decr(user_key)
+                if val < 0:
+                    redis_client.set(user_key, 0)
             if family_key:
-                cursor.execute(
-                    """
-                    INSERT INTO ai_daily_quotas (quota_key, count, date_str, updated_at)
-                    VALUES (?, 1, ?, ?)
-                    ON CONFLICT(quota_key) DO UPDATE SET
-                        count = count + 1,
-                        updated_at = excluded.updated_at
-                    """,
-                    (family_key, d_str, now_ts),
-                )
+                val = redis_client.decr(family_key)
+                if val < 0:
+                    redis_client.set(family_key, 0)
+        except Exception as exc:
+            logger.debug("Redis quota refund failed: %s", exc)
 
-            return True, ""
+    # Tier B: SQLite decrement
+    try:
+        with _sqlite_lock:
+            conn = _get_sqlite_connection()
+            if conn is not None:
+                with conn:
+                    if user_key:
+                        conn.execute("UPDATE ai_daily_quotas SET count = MAX(0, count - 1) WHERE quota_key = ?", (user_key,))
+                    if family_key:
+                        conn.execute("UPDATE ai_daily_quotas SET count = MAX(0, count - 1) WHERE quota_key = ?", (family_key,))
+            else:
+                if user_key in _memory_usage_store["quotas"]:
+                    _memory_usage_store["quotas"][user_key] = max(0, _memory_usage_store["quotas"][user_key] - 1)
+                if family_key in _memory_usage_store["quotas"]:
+                    _memory_usage_store["quotas"][family_key] = max(0, _memory_usage_store["quotas"][family_key] - 1)
+    except Exception as exc:
+        logger.debug("SQLite quota refund failed: %s", exc)
 
 
 # Backward-compatible alias
@@ -394,12 +506,19 @@ def get_current_monthly_spend(year_month: Optional[str] = None) -> float:
             logger.warning("Redis spend read failed (%s); checking SQLite tier", exc)
 
     # Tier B: Persistent SQLite
-    with _sqlite_lock:
-        conn = _get_sqlite_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT total_spend FROM ai_monthly_spend WHERE year_month = ?", (ym,))
-        row = cursor.fetchone()
-        return float(row[0]) if row else 0.0
+    try:
+        with _sqlite_lock:
+            conn = _get_sqlite_connection()
+            if conn is not None:
+                cursor = conn.cursor()
+                cursor.execute("SELECT total_spend FROM ai_monthly_spend WHERE year_month = ?", (ym,))
+                row = cursor.fetchone()
+                return float(row[0]) if row else 0.0
+            else:
+                return float(_memory_usage_store["spend"].get(ym, 0.0))
+    except Exception as exc:
+        logger.warning("SQLite spend read failed (%s); using in-memory fallback", exc)
+        return float(_memory_usage_store["spend"].get(ym, 0.0))
 
 
 def check_monthly_spend_ceiling(year_month: Optional[str] = None) -> Tuple[bool, float, float]:
@@ -446,26 +565,40 @@ def record_ai_spend(
             logger.warning("Redis spend increment failed (%s); falling back to SQLite tier", exc)
 
     # Tier B: Persistent SQLite (always maintained as persistent backup / primary when no Redis)
-    with _sqlite_lock:
-        conn = _get_sqlite_connection()
-        with conn:
-            cursor = conn.cursor()
-            now_ts = time.time()
-            cursor.execute(
-                """
-                INSERT INTO ai_monthly_spend (year_month, total_spend, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(year_month) DO UPDATE SET
-                    total_spend = total_spend + excluded.total_spend,
-                    updated_at = excluded.updated_at
-                """,
-                (ym, cost, now_ts),
-            )
-            cursor.execute("SELECT total_spend FROM ai_monthly_spend WHERE year_month = ?", (ym,))
-            row = cursor.fetchone()
-            sqlite_total = float(row[0]) if row else cost
-            if not recorded_in_redis:
-                new_total = sqlite_total
+    try:
+        with _sqlite_lock:
+            conn = _get_sqlite_connection()
+            if conn is not None:
+                with conn:
+                    cursor = conn.cursor()
+                    now_ts = time.time()
+                    cursor.execute(
+                        """
+                        INSERT INTO ai_monthly_spend (year_month, total_spend, updated_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(year_month) DO UPDATE SET
+                            total_spend = total_spend + excluded.total_spend,
+                            updated_at = excluded.updated_at
+                        """,
+                        (ym, cost, now_ts),
+                    )
+                    cursor.execute("SELECT total_spend FROM ai_monthly_spend WHERE year_month = ?", (ym,))
+                    row = cursor.fetchone()
+                    sqlite_total = float(row[0]) if row else cost
+                    if not recorded_in_redis:
+                        new_total = sqlite_total
+            else:
+                current_mem = _memory_usage_store["spend"].get(ym, 0.0)
+                new_mem = current_mem + cost
+                _memory_usage_store["spend"][ym] = new_mem
+                if not recorded_in_redis:
+                    new_total = new_mem
+    except Exception as exc:
+        logger.warning("SQLite spend recording failed (%s); continuing without crashing", exc)
+        current_mem = _memory_usage_store["spend"].get(ym, 0.0)
+        _memory_usage_store["spend"][ym] = current_mem + cost
+        if not recorded_in_redis:
+            new_total = _memory_usage_store["spend"][ym]
 
     _check_and_log_spend_alerts(new_total, ceiling_usd)
     return cost
@@ -489,15 +622,18 @@ def reset_quota_store() -> None:
         except Exception as exc:
             logger.warning("Failed to reset Redis quota keys: %s", exc)
 
-    # 2. Reset SQLite
+    # 2. Reset SQLite & memory
+    _memory_usage_store["quotas"].clear()
+    _memory_usage_store["spend"].clear()
     with _sqlite_lock:
         conn = _get_sqlite_connection()
-        try:
-            with conn:
-                conn.execute("DELETE FROM ai_daily_quotas")
-                conn.execute("DELETE FROM ai_monthly_spend")
-        except Exception as exc:
-            logger.warning("Failed to reset SQLite quota tables: %s", exc)
+        if conn is not None:
+            try:
+                with conn:
+                    conn.execute("DELETE FROM ai_daily_quotas")
+                    conn.execute("DELETE FROM ai_monthly_spend")
+            except Exception as exc:
+                logger.warning("Failed to reset SQLite quota tables: %s", exc)
 
 
 # Backward-compatible alias

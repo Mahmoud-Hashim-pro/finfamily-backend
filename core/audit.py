@@ -27,29 +27,14 @@ def sanitize_ip(raw: Optional[str]) -> Optional[str]:
         return None
 
 
+from core.limiter import get_client_ip
+
+
 def _client_ip(request: Optional[Request]) -> Optional[str]:
     if request is None:
         return None
-
-    # BUG-066 (P2): Do not trust client-supplied forwarded headers unless behind trusted proxies
-    if TRUST_PROXY_HEADERS:
-        forwarded = request.headers.get("x-forwarded-for")
-        if forwarded:
-            first_ip = forwarded.split(",")[0].strip()
-            sanitized = sanitize_ip(first_ip)
-            if sanitized:
-                return sanitized
-
-        real_ip = request.headers.get("x-real-ip")
-        if real_ip:
-            sanitized = sanitize_ip(real_ip)
-            if sanitized:
-                return sanitized
-
-    if request.client and request.client.host:
-        return sanitize_ip(request.client.host)
-
-    return None
+    # Use unified secure client IP resolution matching the rate limiter (Item 26)
+    return get_client_ip(request)
 
 
 

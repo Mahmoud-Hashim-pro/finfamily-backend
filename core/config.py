@@ -17,8 +17,8 @@ def get_environment() -> str:
 
 
 def is_production() -> bool:
-    """Returns True if running in production or staging."""
-    return get_environment() in ("production", "prod")
+    """Returns True if running in production, prod, staging, or preview."""
+    return get_environment() in ("production", "prod", "staging", "preview")
 
 
 def is_test() -> bool:
@@ -43,9 +43,9 @@ def validate_production_configuration() -> None:
     if not jwt_secret or len(jwt_secret) < 32 or "dev-secret" in jwt_secret:
         raise RuntimeError("CRITICAL: Production deployment requires a secure JWT_SECRET of at least 32 characters!")
 
-    mfa_key = os.getenv("MFA_ENCRYPTION_KEY", "").strip() or os.getenv("JWT_SECRET", "").strip()
+    mfa_key = os.getenv("MFA_ENCRYPTION_KEY", "").strip()
     if not mfa_key or len(mfa_key) < 16 or "default" in mfa_key.lower():
-        raise RuntimeError("CRITICAL: Production deployment requires an explicit dedicated MFA_ENCRYPTION_KEY or secure JWT_SECRET of at least 16 characters!")
+        raise RuntimeError("CRITICAL: Production deployment requires an explicit dedicated MFA_ENCRYPTION_KEY of at least 16 characters!")
 
     admin_emails = get_admin_allowlist()
     if not admin_emails:
@@ -65,7 +65,6 @@ def get_admin_allowlist() -> set[str]:
         return {
             "admin@finfamily.com",
             "supervisor@finfamily.com",
-            "modyhashim2006@gmail.com",
         }
     if not raw_admins.strip():
         return set()

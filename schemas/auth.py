@@ -106,6 +106,7 @@ class ParentLoginResult(BaseModel):
     temp_token: Optional[str] = None
     user: Optional[UserResponse] = None
     used_recovery_code: bool = False  # لو دخل بكود استرجاع — الفرونت لازم ينبهه يولّد أكواد جديدة
+    security_notice: Optional[str] = None
 
 
 class GoogleLoginRequest(BaseModel):

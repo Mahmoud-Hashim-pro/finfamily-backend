@@ -30,8 +30,8 @@ app.state.limiter.enabled = False
 client = TestClient(app)
 
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
-HEAD = "0003_mission_proof"
-PREVIOUS = "0002_idemp_mfa_atomic"
+HEAD = "0004_safety_constraints"
+PREVIOUS = "0003_mission_proof"
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +173,7 @@ def test_0003_backfills_null_is_simulated_from_earlier_baseline(tmp_path):
     eng.dispose()
 
     cfg = _alembic_cfg(db_url)
-    command.upgrade(cfg, PREVIOUS)
+    command.upgrade(cfg, "0002_idemp_mfa_atomic")
     eng = sa.create_engine(db_url)
     try:
         with eng.connect() as conn:

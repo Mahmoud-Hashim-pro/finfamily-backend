@@ -270,6 +270,36 @@ def update_card_status(
     child = require_family_child(db, parent.family_id, child_id)
     wallet = _get_wallet_for(db, child, for_update=True)
     require_family_wallet(db, parent.family_id, wallet.id, for_update=True)
+    # Item 3: Cannot change status of a permanently deactivated card without replacement
+    if wallet.card_status == CardStatus.deactivated:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot change status of a permanently deactivated card. Please issue a replacement card.",
+        )
+
+    # Item 3: Check if the card was frozen by an administrator
+    last_admin_override = (
+        db.query(AuditLog)
+        .filter(
+            AuditLog.target_type == "wallet",
+            AuditLog.target_id == wallet.id,
+            AuditLog.action == "admin_card_status_override",
+        )
+        .order_by(AuditLog.created_date.desc())
+        .first()
+    )
+    if (
+        last_admin_override
+        and last_admin_override.detail
+        and last_admin_override.detail.get("new_status") == CardStatus.frozen.value
+        and wallet.card_status == CardStatus.frozen
+        and payload.card_status != CardStatus.frozen
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This card was frozen by an administrator and cannot be unfrozen by a parent. Please contact support.",
+        )
+
     old_status = wallet.card_status.value
     wallet.card_status = payload.card_status
 
@@ -457,15 +487,73 @@ def create_my_goal(payload: SavingsGoalCreate, child: User = Depends(require_chi
 def deposit_to_goal(
     goal_id: str,
     payload: SavingsGoalDeposit,
+    request: Request,
     child: User = Depends(require_child),
     db: Session = Depends(get_db),
 ):
     validate_money(payload.amount)
+    idempotency_key = _resolve_idempotency_key(request, getattr(payload, "idempotency_key", None))
     wallet = _get_wallet_for(db, child, for_update=True)
     require_family_wallet(db, child.family_id, wallet.id, for_update=True)
     goal = require_family_goal(db, child.family_id, goal_id, for_update=True)
     if goal.wallet_id != wallet.id:
         raise HTTPException(status_code=403, detail="Savings goal does not belong to your wallet")
+
+    if idempotency_key:
+        clean_key = idempotency_key
+        import hashlib, json
+        payload_data = {"goal_id": goal_id, "amount": float(payload.amount)}
+        payload_hash = hashlib.sha256(json.dumps(payload_data, sort_keys=True).encode()).hexdigest()
+
+        existing_rec = db.query(IdempotencyRecord).filter(IdempotencyRecord.key == clean_key).first()
+        if existing_rec:
+            if existing_rec.family_id != child.family_id or existing_rec.user_id != child.id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Idempotency key collision across different actors or families",
+                )
+            if existing_rec.action != "goal_deposit":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Idempotency key already used for a different operation",
+                )
+            if existing_rec.payload_hash and existing_rec.payload_hash != payload_hash:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Idempotency key reused with conflicting request payload parameters",
+                )
+            return goal
+
+        try:
+            db.add(IdempotencyRecord(
+                key=clean_key,
+                family_id=child.family_id,
+                user_id=child.id,
+                action="goal_deposit",
+                payload_hash=payload_hash,
+            ))
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            winning_rec = db.query(IdempotencyRecord).filter(IdempotencyRecord.key == clean_key).first()
+            if winning_rec:
+                if winning_rec.family_id != child.family_id or winning_rec.user_id != child.id:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="Idempotency key collision across different actors or families",
+                    )
+                if winning_rec.action != "goal_deposit":
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="Idempotency key already used for a different operation",
+                    )
+                if winning_rec.payload_hash and winning_rec.payload_hash != payload_hash:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="Idempotency key reused with conflicting request payload parameters",
+                    )
+            return goal
+
     # كل اللي بيفتح شارات (هنا + الدروس + تسليم المهام + الألعاب + المراجعة) لازم يقفل صف الطفل،
     # وإلا طلبين في نفس اللحظة يضيفوا نفس UserBadge ويوقعوا على uq_user_badge. بعد الـ wallet (نفس الترتيب).
     child = _lock_child_row(db, child)
@@ -520,6 +608,7 @@ def deposit_to_goal(
 def withdraw_from_goal(
     goal_id: str,
     payload: SavingsGoalWithdraw,
+    request: Request,
     child: User = Depends(require_child),
     db: Session = Depends(get_db),
 ):
@@ -527,11 +616,67 @@ def withdraw_from_goal(
     BUG-031: Withdraw savings from goal back to available wallet balance.
     """
     validate_money(payload.amount)
+    idempotency_key = _resolve_idempotency_key(request, getattr(payload, "idempotency_key", None))
     wallet = _get_wallet_for(db, child, for_update=True)
     require_family_wallet(db, child.family_id, wallet.id, for_update=True)
     goal = require_family_goal(db, child.family_id, goal_id, for_update=True)
     if goal.wallet_id != wallet.id:
         raise HTTPException(status_code=403, detail="Savings goal does not belong to your wallet")
+
+    if idempotency_key:
+        clean_key = idempotency_key
+        import hashlib, json
+        payload_data = {"goal_id": goal_id, "amount": float(payload.amount)}
+        payload_hash = hashlib.sha256(json.dumps(payload_data, sort_keys=True).encode()).hexdigest()
+
+        existing_rec = db.query(IdempotencyRecord).filter(IdempotencyRecord.key == clean_key).first()
+        if existing_rec:
+            if existing_rec.family_id != child.family_id or existing_rec.user_id != child.id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Idempotency key collision across different actors or families",
+                )
+            if existing_rec.action != "goal_withdraw":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Idempotency key already used for a different operation",
+                )
+            if existing_rec.payload_hash and existing_rec.payload_hash != payload_hash:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Idempotency key reused with conflicting request payload parameters",
+                )
+            return goal
+
+        try:
+            db.add(IdempotencyRecord(
+                key=clean_key,
+                family_id=child.family_id,
+                user_id=child.id,
+                action="goal_withdraw",
+                payload_hash=payload_hash,
+            ))
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            winning_rec = db.query(IdempotencyRecord).filter(IdempotencyRecord.key == clean_key).first()
+            if winning_rec:
+                if winning_rec.family_id != child.family_id or winning_rec.user_id != child.id:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="Idempotency key collision across different actors or families",
+                    )
+                if winning_rec.action != "goal_withdraw":
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="Idempotency key already used for a different operation",
+                    )
+                if winning_rec.payload_hash and winning_rec.payload_hash != payload_hash:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="Idempotency key reused with conflicting request payload parameters",
+                    )
+            return goal
 
     if to_decimal(goal.current) < to_decimal(payload.amount):
         raise HTTPException(status_code=400, detail="Not enough savings in this goal")

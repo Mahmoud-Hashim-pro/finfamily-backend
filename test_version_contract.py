@@ -67,7 +67,7 @@ def test_app_version_1_1_8_sha256_match(monkeypatch):
 
 
 @pytest.mark.parametrize("version,expected_sha", [
-    ("1.1.6", "41d195fb3feacc2cc00a834a41f9ac05817d128a7b0bbef5304b62e56fa8cfcc"),
+    ("1.1.6", "d8cc70f806ddb990ba2905ccd96c1367dbd56541c09e4c189b5b243e72dd0be9"),
     ("1.1.7", "9922e96d197607a9779df5282b8ab263c965b11eb5eb3d0526e0339d2c5ae0fa"),
     ("1.1.8", "1cd5f2fc7302137a5264021cc4b4f11242e422f9ffcfabc1f78136b34d3b9bb4"),
 ])

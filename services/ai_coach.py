@@ -612,11 +612,13 @@ def validate_ai_output(raw_reply: str, mode: str = "child") -> tuple[bool, str]:
             logger.warning("AI output leak detected matching pattern: %s", pattern)
             return False, fallback
 
-    # 3. Child-safety check on output: weapons, drugs, violence, gambling, vulgarity
-    for pattern in OUTPUT_CHILD_SAFETY_PATTERNS:
-        if re.search(pattern, raw_reply, re.IGNORECASE):
-            logger.warning("Unsafe content detected in AI output matching pattern: %s", pattern)
-            return False, fallback
+    # 3. Child-safety check on output (weapons, drugs, violence, gambling, vulgarity)
+    # Strictly enforced in child mode; parents are adults who may discuss lottery scams, gambling risks, etc.
+    if mode == "child":
+        for pattern in OUTPUT_CHILD_SAFETY_PATTERNS:
+            if re.search(pattern, raw_reply, re.IGNORECASE):
+                logger.warning("Unsafe content detected in child AI output matching pattern: %s", pattern)
+                return False, fallback
 
     # 4. Scrub any model-hallucinated or reflected PII (cards, phones, national IDs, credentials)
     sanitized = redact_sensitive_text(raw_reply.strip())

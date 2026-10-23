@@ -74,10 +74,10 @@ def verify_google_id_token(id_token: str, client_id: Optional[str] = None) -> Di
     # 2. Validate expiration
     try:
         exp = int(claims.get("exp", 0))
-        if exp < time.time():
-            raise ValueError("Google ID token has expired")
     except (TypeError, ValueError):
         raise ValueError("Invalid expiration claim in token")
+    if exp < time.time():
+        raise ValueError("Google ID token has expired")
 
     # 3. Validate audience (Fail Closed: mandatory configuration and match; supports multiple client IDs)
     allowed_audiences = [cid.strip() for cid in expected_client_id.split(",") if cid.strip()]

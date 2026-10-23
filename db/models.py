@@ -198,6 +198,9 @@ class Mission(Base):
     - kind=redemption: الطفل بيطلبها (عايز يصرف كوينز على حاجة)، الأب يوافق -> debit
     """
     __tablename__ = "missions"
+    __table_args__ = (
+        CheckConstraint("reward >= 0", name="chk_mission_non_negative_reward"),
+    )
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
     family_id = Column(String, ForeignKey("families.id"), nullable=False, index=True)
@@ -251,6 +254,9 @@ class CardPurchase(Base):
     بيحطها مستنية موافقة الأب (pending) لو تخطت حد الصرف.
     """
     __tablename__ = "card_purchases"
+    __table_args__ = (
+        CheckConstraint("amount >= 0", name="chk_purchase_non_negative_amount"),
+    )
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
     family_id = Column(String, ForeignKey("families.id"), nullable=False, index=True)

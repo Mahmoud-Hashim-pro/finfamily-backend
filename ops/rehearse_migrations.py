@@ -175,7 +175,9 @@ def get_alembic_config(db_url: str) -> Config:
     ini_path = os.path.join(backend_root, "alembic.ini")
     alembic_cfg = Config(ini_path)
     alembic_cfg.attributes["configure_logger"] = False
-    alembic_cfg.set_main_option("sqlalchemy.url", db_url)
+    # ConfigParser treats '%' as an interpolation character; escape '%' to '%%' for alembic.ini config
+    escaped_url = db_url.replace("%", "%%")
+    alembic_cfg.set_main_option("sqlalchemy.url", escaped_url)
     alembic_cfg.set_main_option("script_location", os.path.join(backend_root, "alembic"))
     return alembic_cfg
 
@@ -293,14 +295,18 @@ def run_migration_rehearsal(
         rb_record["policy_message"] = str(e)
         logger.info(f"Alembic downgrade -1 returned safe policy block: {e}")
 
-    try:
-        command.upgrade(alembic_cfg, "head")
-        rb_record["reupgrade_to_head"] = "success"
-    except Exception as e:
-        err = f"Re-upgrade to head following rollback test failed: {e}"
-        report["errors"].append(err)
-        report["status"] = "failed"
-        return report
+    if rb_record.get("supported", False):
+        try:
+            command.upgrade(alembic_cfg, "head")
+            rb_record["reupgrade_to_head"] = "success"
+        except Exception as e:
+            err = f"Re-upgrade to head following rollback test failed: {e}"
+            report["errors"].append(err)
+            report["status"] = "failed"
+            return report
+    else:
+        rb_record["reupgrade_to_head"] = "not_applicable_downgrade_blocked"
+
 
     rb_record["duration_seconds"] = round(time.time() - t_rb_start, 4)
     report["rollback_test"] = rb_record
