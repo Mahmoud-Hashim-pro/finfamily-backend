@@ -75,10 +75,10 @@ def redact_sensitive_text(text: str) -> str:
     text = re.sub(r'\b\d{14}\b', '[REDACTED_ID]', text)
 
     # Redact 12 to 19 digit card/account numbers
-    text = re.sub(r'\b(?:\d[ -]*?){12,19}\b', lambda m: f"•••• {re.sub(r'\D', '', m.group(0))[-4:]}", text)
+    text = re.sub(r'\b\d(?:[ -]?\d){11,18}\b', lambda m: f"•••• {re.sub(r'\D', '', m.group(0))[-4:]}", text)
 
     # Redact phone numbers (Egyptian local formats 010/011/012/015... or international +20...)
-    text = re.sub(r'(\+?20|0)?1[0125][0-9]{8}\b', '[REDACTED_PHONE]', text)
+    text = re.sub(r'(?:\+?20[\s.-]?)?(?:0)?1[0125](?:[\s.-]?\d){8}\b', '[REDACTED_PHONE]', text)
 
     # Generic phone patterns (isolated 10 to 12 digit phone numbers)
     text = re.sub(
@@ -88,7 +88,8 @@ def redact_sensitive_text(text: str) -> str:
     )
 
     # Redact credentials/passwords if exposed in text
-    text = re.sub(r'(?i)\b(password|pin|otp|cvv)\s*[:=]\s*\S+', r'\1: [REDACTED]', text)
+    text = re.sub(r'(?i)\b(password|pin|otp|cvv|secret)\s*[:=\s]\s*\S+', r'\1: [REDACTED]', text)
+    text = re.sub(r'(كلمة\s+(?:السر|المرور)|الرقم\s+السري|رمز\s+التحقق)\s*[:=\s-]\s*\S+', r'\1: [REDACTED]', text)
 
     return text
 

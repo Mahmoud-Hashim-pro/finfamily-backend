@@ -1,8 +1,11 @@
 import os
+import logging
 import ipaddress
 from typing import Optional
 from slowapi import Limiter
 from starlette.requests import Request
+
+logger = logging.getLogger(__name__)
 
 TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "false").strip().lower() in ("true", "1", "yes")
 STORAGE_URI = os.getenv("REDIS_URL") or os.getenv("RATELIMIT_STORAGE_URL")
@@ -54,8 +57,24 @@ def get_client_ip(request: Request) -> str:
     return "127.0.0.1"
 
 
-# BUG-056 (P1): Support shared Redis storage URI when configured
+# BUG-056 (P1) & A1: Support shared Redis storage URI when configured, with safe in-memory fallback
+limiter = None
 if STORAGE_URI:
-    limiter = Limiter(key_func=get_client_ip, storage_uri=STORAGE_URI)
-else:
+    try:
+        limiter = Limiter(
+            key_func=get_client_ip,
+            storage_uri=STORAGE_URI,
+            in_memory_fallback_enabled=True,
+            swallow_errors=True,
+        )
+        logger.info("Initialized shared rate limiter storage from STORAGE_URI")
+    except Exception as exc:
+        logger.warning(
+            "Failed to initialize rate limit storage from '%s' (%s). Falling back to in-memory storage.",
+            STORAGE_URI,
+            exc,
+        )
+        limiter = None
+
+if limiter is None:
     limiter = Limiter(key_func=get_client_ip)

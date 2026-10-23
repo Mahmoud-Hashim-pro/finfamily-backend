@@ -619,6 +619,9 @@ def update_card_status_as_admin(
     if not wallet or wallet.owner is None or wallet.owner.role != UserRole.child:
         raise HTTPException(status_code=404, detail="Wallet/Card not found")
 
+    if wallet.card_status == CardStatus.deactivated:
+        raise HTTPException(status_code=400, detail="Cannot change status of a permanently deactivated card.")
+
     old_status = wallet.card_status.value
     wallet.card_status = payload.card_status
     wallet.updated_date = datetime.utcnow()

@@ -741,7 +741,7 @@ def review_mission(
 def my_missions(
     status: Optional[MissionStatus] = Query(None),
     skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=100),
+    limit: int = Query(100, ge=1, le=500),
     child: User = Depends(require_child),
     db: Session = Depends(get_db),
 ):
@@ -756,7 +756,7 @@ def family_missions(
     child_id: Optional[str] = Query(None),
     status: Optional[MissionStatus] = Query(None),
     skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=100),
+    limit: int = Query(100, ge=1, le=500),
     parent: User = Depends(require_parent),
     db: Session = Depends(get_db),
 ):
@@ -989,7 +989,7 @@ def family_purchases(
 @router.get("/transactions/mine", response_model=List[TransactionOut])
 def my_transactions(
     skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=100),
+    limit: int = Query(100, ge=1, le=500),
     child: User = Depends(require_child),
     db: Session = Depends(get_db),
 ):
@@ -1009,7 +1009,7 @@ def my_transactions(
 def child_transactions(
     child_id: str,
     skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=100),
+    limit: int = Query(100, ge=1, le=500),
     parent: User = Depends(require_parent),
     db: Session = Depends(get_db),
 ):

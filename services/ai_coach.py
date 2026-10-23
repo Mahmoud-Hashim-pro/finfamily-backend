@@ -107,20 +107,24 @@ class ChatMessage(BaseModel):
     @field_validator("history")
     @classmethod
     def validate_history_size(cls, v):
-        """FF-28 & FF-47: Enforce aggregate character limit across conversation history, counting all message fields."""
+        """FF-28 & FF-47: Enforce aggregate character and byte limit across conversation history, counting all message fields."""
         if not v:
             return v
         total_len = 0
+        total_bytes = 0
         for item in v:
             if isinstance(item, HistoryItem):
-                total_len += len(item.get_text())
+                txt = item.get_text()
             elif isinstance(item, dict):
                 txt = str(item.get("content") or item.get("text") or item.get("message") or "")
-                total_len += len(txt)
             else:
-                total_len += len(str(item))
+                txt = str(item)
+            total_len += len(txt)
+            total_bytes += len(txt.encode("utf-8"))
         if total_len > 4000:
             raise ValueError("Total conversation history exceeds maximum permitted size (4000 characters)")
+        if total_bytes > 16000:
+            raise ValueError("Total conversation history exceeds maximum permitted size (16000 bytes)")
         return v
 
 
@@ -243,9 +247,11 @@ def _format_history_messages(history: Optional[List[Any]]) -> List[Dict[str, str
     if not history:
         return formatted
 
-    # BUG-136 & FF-47: Keep last 10 messages and bound total aggregate characters
+    # BUG-136 & FF-47: Keep last 10 messages and bound total aggregate characters and UTF-8 bytes
     total_chars = 0
+    total_bytes = 0
     MAX_TOTAL_HISTORY_CHARS = 8000
+    MAX_TOTAL_HISTORY_BYTES = 24000
 
     for item in history[-10:]:
         role = "user"
@@ -277,14 +283,23 @@ def _format_history_messages(history: Optional[List[Any]]) -> List[Dict[str, str
             # Redact any sensitive PII in history as well
             clean_content = redact_sensitive_text(clean_content)
             
-            # Check total character budget
-            if total_chars + len(clean_content) > MAX_TOTAL_HISTORY_CHARS:
-                remaining_budget = MAX_TOTAL_HISTORY_CHARS - total_chars
-                if remaining_budget > 50:
-                    clean_content = clean_content[:remaining_budget]
+            content_bytes = len(clean_content.encode("utf-8"))
+            # Check total character and byte budget
+            if (
+                total_chars + len(clean_content) > MAX_TOTAL_HISTORY_CHARS
+                or total_bytes + content_bytes > MAX_TOTAL_HISTORY_BYTES
+            ):
+                remaining_chars = MAX_TOTAL_HISTORY_CHARS - total_chars
+                remaining_bytes = MAX_TOTAL_HISTORY_BYTES - total_bytes
+                if remaining_chars > 50 and remaining_bytes > 150:
+                    clean_content = clean_content[:remaining_chars]
+                    encoded = clean_content.encode("utf-8")
+                    if len(encoded) > remaining_bytes:
+                        clean_content = encoded[:remaining_bytes].decode("utf-8", errors="ignore")
                 else:
                     break
             total_chars += len(clean_content)
+            total_bytes += len(clean_content.encode("utf-8"))
             formatted.append({"role": role, "content": clean_content})
     return formatted
 
