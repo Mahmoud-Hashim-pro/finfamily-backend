@@ -251,26 +251,28 @@ def test_lesson_completion_sync_and_idempotency():
     assert res.status_code == 200
     assert res.json() == []
 
-    # 2. Complete lesson 1
-    res = client.post("/api/lessons/complete", json={"lesson_id": "lesson_saving_1"}, headers=headers)
+    # 2. Complete a real catalog lesson (les_2); XP comes from the server catalog
+    from api.family_routes import LESSON_CATALOG
+    expected_xp = LESSON_CATALOG["les_2"]["xp"]
+    res = client.post("/api/lessons/complete", json={"lesson_id": "les_2"}, headers=headers)
     assert res.status_code == 200
     data = res.json()
     assert data["already_completed"] is False
-    assert data["xp_awarded"] == 20
-    assert data["current_xp"] == 20
+    assert data["xp_awarded"] == expected_xp
+    assert data["current_xp"] == expected_xp
 
-    # 3. Complete lesson 1 again -> Idempotent, no extra XP
-    res = client.post("/api/lessons/complete", json={"lesson_id": "lesson_saving_1"}, headers=headers)
+    # 3. Complete les_2 again -> Idempotent, no extra XP
+    res = client.post("/api/lessons/complete", json={"lesson_id": "les_2"}, headers=headers)
     assert res.status_code == 200
     data2 = res.json()
     assert data2["already_completed"] is True
     assert data2["xp_awarded"] == 0
-    assert data2["current_xp"] == 20
+    assert data2["current_xp"] == expected_xp
 
-    # 4. GET completed lessons list now contains lesson_saving_1
+    # 4. GET completed lessons list now contains les_2
     res = client.get("/api/lessons/completed", headers=headers)
     assert res.status_code == 200
-    assert "lesson_saving_1" in res.json()
+    assert "les_2" in res.json()
 
 
 def test_p1_7_idempotency_key_conflict_rejections():

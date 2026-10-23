@@ -1,13 +1,15 @@
 from datetime import datetime, timedelta, timezone
 import logging
 import os
+import re
 import secrets
 import string
 from typing import Optional
+from urllib.parse import unquote
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status, Body
 from pydantic import BaseModel
-from sqlalchemy import func
+from sqlalchemy import func, null
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -38,6 +40,7 @@ from core.security import (
     decode_access_token,
     generate_reset_token,
     hash_reset_token,
+    DUMMY_PASSWORD_HASH,
 )
 from core.deps import get_current_user, require_parent
 from core.limiter import limiter
@@ -98,13 +101,28 @@ router = APIRouter(prefix="/api/auth", tags=["Auth"])
 auth_compat_router = APIRouter(prefix="/auth", tags=["Auth"])
 
 RESET_TOKEN_EXPIRE_MINUTES = 15  # BUG-069: Bound token lifetime
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+# C12 / #34: No localhost default — the reset link is only built when a real web frontend is configured.
+# The email always carries the raw code, which the mobile app accepts directly.
+FRONTEND_URL = (os.getenv("FRONTEND_URL") or "").strip().rstrip("/")
 
 # BUG-113 (P2): Constant-time dummy hash for unknown email login attempts
-DUMMY_PASSWORD_HASH = hash_password("dummy_password_for_constant_timing_check_123")
+# (now defined in core.security so admin login can share it — #271; re-exported here for compatibility)
 
 # In-memory tracking for recovery code brute-force lockout per account (BUG-118)
 _FAILED_RECOVERY_ATTEMPTS: dict[str, list[datetime]] = {}
+
+# #36: Every second-factor failure written to audit_logs (parent, Google and admin paths)
+MFA_FAILURE_ACTIONS = ("mfa_failed", "google_login_mfa_failed", "admin_mfa_failed", "admin_mfa_enrollment_failed")
+MFA_LOCKOUT_MAX_FAILURES = 10
+MFA_LOCKOUT_WINDOW_MINUTES = 15
+
+# #264: Audit actions that prove the real owner of the email controls this account
+# (account created from a verified Google token, a password-reset link opened from the inbox,
+# or a previous Google claim of an unverified password account).
+EMAIL_OWNERSHIP_PROOF_ACTIONS = ("google_register_success", "google_claimed_unverified_account", "password_reset_completed")
+
+# C12: a pasted reset link (even wrapped by a mail-client redirect) → extract the token= value
+_RESET_TOKEN_IN_LINK = re.compile(r"(?:^|[?&#])token=([A-Za-z0-9_\-]+)")
 
 
 from core.config import is_admin_email, get_admin_allowlist
@@ -151,6 +169,76 @@ def _clear_failed_recovery_attempts(user_id: str) -> None:
     _FAILED_RECOVERY_ATTEMPTS.pop(user_id, None)
 
 
+def _check_mfa_lockout(user_id: str, db: Session) -> None:
+    """
+    #36: Per-account lockout for TOTP / second-factor guesses, counted from audit_logs so it is shared
+    across all serverless instances (the slowapi limits are per IP and in-memory).
+    Call it only after the first factor / temp token is validated so anonymous callers cannot lock an account.
+    """
+    # Serialize second-factor attempts per account (row lock held until the caller commits its failure
+    # row or rolls back), so concurrent guesses see each other's failures instead of all passing the count.
+    # FOR NO KEY UPDATE (like _lock_child_row) so FK inserts referencing the account aren't blocked
+    db.query(User.id).filter(User.id == user_id).with_for_update(key_share=True).first()
+    window_start = datetime.utcnow() - timedelta(minutes=MFA_LOCKOUT_WINDOW_MINUTES)
+    recent_fails = (
+        db.query(AuditLog)
+        .filter(
+            AuditLog.actor_id == user_id,
+            AuditLog.action.in_(MFA_FAILURE_ACTIONS),
+            AuditLog.created_date >= window_start,
+        )
+        .count()
+    )
+    if recent_fails >= MFA_LOCKOUT_MAX_FAILURES:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed authentication code attempts. Try again in 15 minutes.",
+        )
+
+
+def _email_ownership_proven(db: Session, user_id: str) -> bool:
+    """#264: True لو صاحب الإيميل الحقيقي أثبت قبل كده إنه بيتحكم في الحساب ده (Google أو لينك reset)."""
+    return (
+        db.query(AuditLog.id)
+        .filter(AuditLog.actor_id == user_id, AuditLog.action.in_(EMAIL_OWNERSHIP_PROOF_ACTIONS))
+        .first()
+        is not None
+    )
+
+
+def _verify_parent_identity(
+    parent: User,
+    password: Optional[str],
+    google_id_token: Optional[str],
+    wrong_password_detail: str = "Incorrect password",
+) -> None:
+    """
+    #33 / C13: Fresh identity proof for sensitive settings. Password accounts must send their password
+    (unchanged behaviour); accounts without a password (Google-only) send a fresh Google ID token instead.
+    """
+    if parent.password_hash:
+        if not password or not verify_password(password, parent.password_hash):
+            raise HTTPException(status_code=401, detail=wrong_password_detail)
+        return
+    if not google_id_token:
+        raise HTTPException(status_code=401, detail="Google re-authentication is required for accounts without a password")
+    try:
+        claims = verify_google_id_token(google_id_token)
+    except Exception as ex:
+        raise HTTPException(status_code=401, detail=f"Invalid Google ID token: {ex}")
+    if not claims or (claims.get("email") or "").strip().lower() != (parent.email or "").strip().lower():
+        raise HTTPException(status_code=401, detail="Google authentication does not match account identity")
+
+
+def _extract_reset_token(raw: str) -> str:
+    """C12: الأب ممكن يلصق الكود نفسه أو اللينك كله — بنطلع قيمة token= لو موجودة."""
+    value = (raw or "").strip()
+    if "token" not in value:
+        return value
+    match = _RESET_TOKEN_IN_LINK.search(unquote(value))
+    return match.group(1) if match else value
+
+
 def generate_unique_family_code(db: Session, length: int = 6, max_attempts: int = 10) -> str:
     """Generate a unique uppercase alphanumeric family code with collision retry loop (BUG-112)."""
     alphabet = string.ascii_uppercase + string.digits
@@ -172,8 +260,9 @@ def register_parent(request: Request, payload: ParentRegister, db: Session = Dep
     clean_email = payload.email.strip().lower()
 
     # BUG-002 (P0) & BUG-006 (P0): Block public registration of allowlisted admin emails
+    # #271: Same response as any already-registered address so the admin allowlist cannot be enumerated
     if is_admin_email(clean_email):
-        raise HTTPException(status_code=400, detail="Admin email reserved")
+        raise HTTPException(status_code=400, detail="Email already registered")
 
     # BUG-052 (P1): Enforce lowercase email uniqueness check
     existing = db.query(User).filter(func.lower(User.email) == clean_email).first()
@@ -304,27 +393,31 @@ def login_parent(request: Request, payload: ParentLogin, db: Session = Depends(g
                 role="mfa_pending",
                 token_type="mfa_challenge",
                 mfa_pending=True,
+                token_version=getattr(user, "token_version", 1) or 1,
                 expires_delta=timedelta(minutes=5),
             )
             return ParentLoginResult(mfa_required=True, temp_token=temp_token)
 
-        # FF-06: Decrypt encrypted mfa_secret before verifying TOTP
-        elif not (
-            mfa.verify_totp(
-                mfa.decrypt_mfa_secret(user.mfa_secret) if user.mfa_secret else "",
-                payload.otp_code,
-                user_id=user.id,
-                db=db,
-            )
-            or mfa.verify_and_consume_recovery_code(db, user.id, payload.otp_code)
-        ):
-            # BUG-117 (P2): Verify TOTP code with replay prevention
-            log_action(
-                db, request=request, action="mfa_failed",
-                actor_id=user.id, actor_role="parent", family_id=user.family_id,
-            )
-            db.commit()
-            raise HTTPException(status_code=401, detail="Invalid authentication code")
+        else:
+            # #36: Per-account lockout on second-factor guesses (password already verified above)
+            _check_mfa_lockout(user.id, db)
+            # FF-06: Decrypt encrypted mfa_secret before verifying TOTP
+            if not (
+                mfa.verify_totp(
+                    mfa.decrypt_mfa_secret(user.mfa_secret) if user.mfa_secret else "",
+                    payload.otp_code,
+                    user_id=user.id,
+                    db=db,
+                )
+                or mfa.verify_and_consume_recovery_code(db, user.id, payload.otp_code)
+            ):
+                # BUG-117 (P2): Verify TOTP code with replay prevention
+                log_action(
+                    db, request=request, action="mfa_failed",
+                    actor_id=user.id, actor_role="parent", family_id=user.family_id,
+                )
+                db.commit()
+                raise HTTPException(status_code=401, detail="Invalid authentication code")
 
     log_action(
         db, request=request, action="login_success",
@@ -345,6 +438,139 @@ def login_parent(request: Request, payload: ParentLogin, db: Session = Depends(g
         token_type="bearer",
         user=UserResponse.model_validate(user),
         used_recovery_code=used_recovery_code,
+    )
+
+
+def _google_login_existing_user(
+    request: Request,
+    db: Session,
+    user: User,
+    payload: GoogleLoginRequest,
+    clean_email: str,
+    verified_avatar: Optional[str],
+) -> ParentLoginResult:
+    """
+    Google login for an account that already exists. Shared by the normal path and the IntegrityError
+    race fallback so is_active, role, the #264 ownership claim and FF-01 MFA are always enforced.
+    """
+    # P0 Security Check: Never reactivate disabled accounts upon Google sign in!
+    if hasattr(user, "is_active") and not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is deactivated. Contact administration to restore access.",
+        )
+    if user.role != UserRole.parent:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only parent accounts can sign in via Google login",
+        )
+
+    # #264: Pre-account takeover guard. /register never verifies the email, so a password set on an
+    # account whose owner never proved the address may belong to someone else. Google has just proved
+    # ownership: drop that password and revoke every existing session (token_version bump).
+    # MFA is deliberately left untouched (controlling the Gmail account must not bypass it).
+    # Allowlisted admin emails can't be self-registered (register / Google-create reject them), so their
+    # password was provisioned by the operator; never drop it (the admin portal is password-only).
+    claimed_unverified = False
+    if user.password_hash and not is_admin_email(user.email) and not _email_ownership_proven(db, user.id):
+        user.password_hash = None
+        user.token_version = (getattr(user, "token_version", 1) or 1) + 1
+        # The pre-registrant could read the family code and plant children with known PINs:
+        # rotate the code and revoke every pre-claim child session as well
+        family = db.query(Family).filter(Family.id == user.family_id).first()
+        if family:
+            family.family_code = generate_unique_family_code(db)
+        family_children = db.query(User).filter(
+            User.family_id == user.family_id, User.role == UserRole.child
+        ).all()
+        for child in family_children:
+            child.token_version = (getattr(child, "token_version", 1) or 1) + 1
+        log_action(
+            db, request=request, action="google_claimed_unverified_account",
+            actor_id=user.id, actor_role="parent", family_id=user.family_id,
+            target_type="user", target_id=user.id,
+            detail={"family_code_rotated": bool(family), "child_sessions_revoked": len(family_children)},
+        )
+        claimed_unverified = True
+
+    if verified_avatar and not user.avatar_url:
+        user.avatar_url = verified_avatar
+    if not user.wallet:
+        wallet = Wallet(owner_id=user.id)
+        db.add(wallet)
+    db.commit()
+    db.refresh(user)
+
+    if claimed_unverified:
+        try:
+            send_password_changed_notification(user.email)
+        except Exception as email_err:
+            logger.error(f"Failed to dispatch password changed notification email: {email_err}", exc_info=True)
+
+    # FF-01: Apply TOTP MFA enforcement to Google login if parent enabled MFA
+    if user.mfa_enabled:
+        if payload.otp_code:
+            # #36: Per-account lockout on second-factor guesses
+            _check_mfa_lockout(user.id, db)
+            if not (
+                mfa.verify_totp(
+                    mfa.decrypt_mfa_secret(user.mfa_secret) if user.mfa_secret else "",
+                    payload.otp_code,
+                    user_id=user.id,
+                    db=db,
+                )
+                or mfa.verify_and_consume_recovery_code(db, user.id, payload.otp_code)
+            ):
+                log_action(
+                    db, request=request, action="google_login_mfa_failed",
+                    actor_id=user.id, actor_role="parent", family_id=user.family_id,
+                )
+                db.commit()
+                raise HTTPException(status_code=401, detail="Invalid authentication code")
+        else:
+            temp_token = create_access_token(
+                user_id=user.id,
+                family_id=user.family_id,
+                role="mfa_pending",
+                token_type="mfa_challenge",
+                mfa_pending=True,
+                token_version=getattr(user, "token_version", 1) or 1,
+                expires_delta=timedelta(minutes=5),
+            )
+            log_action(
+                db, request=request, action="google_login_mfa_challenge",
+                actor_id=user.id, actor_role="parent", family_id=user.family_id,
+                detail={"email": clean_email},
+            )
+            db.commit()
+            return ParentLoginResult(
+                mfa_required=True,
+                temp_token=temp_token,
+                user=UserResponse.model_validate(user),
+            )
+
+    log_action(
+        db, request=request, action="google_login_success",
+        actor_id=user.id, actor_role="parent",
+        family_id=user.family_id,
+        target_type="user", target_id=user.id,
+        detail={"email": clean_email},
+    )
+    # #29: Persist the success audit row together with the TOTP replay timestep (FF-07)
+    # and any consumed recovery code flushed by the MFA check above.
+    db.commit()
+    token = create_access_token(
+        user_id=user.id,
+        family_id=user.family_id,
+        role="parent",
+        email=user.email,
+        token_version=getattr(user, "token_version", 1) or 1,
+    )
+    return ParentLoginResult(
+        access_token=token,
+        token_type="bearer",
+        user=UserResponse.model_validate(user),
+        mfa_required=False,
     )
 
 
@@ -378,84 +604,7 @@ def google_auth(request: Request, payload: GoogleLoginRequest, db: Session = Dep
     # Look for existing user
     user = db.query(User).filter(func.lower(User.email) == clean_email).first()
     if user:
-        # P0 Security Check: Never reactivate disabled accounts upon Google sign in!
-        if hasattr(user, "is_active") and not user.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Account is deactivated. Contact administration to restore access.",
-            )
-        if user.role != UserRole.parent:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Only parent accounts can sign in via Google login",
-            )
-        if verified_avatar and not user.avatar_url:
-            user.avatar_url = verified_avatar
-        if not user.wallet:
-            wallet = Wallet(owner_id=user.id)
-            db.add(wallet)
-        db.commit()
-        db.refresh(user)
-
-        # FF-01: Apply TOTP MFA enforcement to Google login if parent enabled MFA
-        if user.mfa_enabled:
-            if payload.otp_code:
-                if not (
-                    mfa.verify_totp(
-                        mfa.decrypt_mfa_secret(user.mfa_secret) if user.mfa_secret else "",
-                        payload.otp_code,
-                        user_id=user.id,
-                        db=db,
-                    )
-                    or mfa.verify_and_consume_recovery_code(db, user.id, payload.otp_code)
-                ):
-                    log_action(
-                        db, request=request, action="google_login_mfa_failed",
-                        actor_id=user.id, actor_role="parent", family_id=user.family_id,
-                    )
-                    db.commit()
-                    raise HTTPException(status_code=401, detail="Invalid authentication code")
-            else:
-                temp_token = create_access_token(
-                    user_id=user.id,
-                    family_id=user.family_id,
-                    role="mfa_pending",
-                    token_type="mfa_challenge",
-                    mfa_pending=True,
-                    expires_delta=timedelta(minutes=5),
-                )
-                log_action(
-                    db, request=request, action="google_login_mfa_challenge",
-                    actor_id=user.id, actor_role="parent", family_id=user.family_id,
-                    detail={"email": clean_email},
-                )
-                db.commit()
-                return ParentLoginResult(
-                    mfa_required=True,
-                    temp_token=temp_token,
-                    user=UserResponse.model_validate(user),
-                )
-
-        log_action(
-            db, request=request, action="google_login_success",
-            actor_id=user.id, actor_role="parent",
-            family_id=user.family_id,
-            target_type="user", target_id=user.id,
-            detail={"email": clean_email},
-        )
-        token = create_access_token(
-            user_id=user.id,
-            family_id=user.family_id,
-            role="parent",
-            email=user.email,
-            token_version=getattr(user, "token_version", 1) or 1,
-        )
-        return ParentLoginResult(
-            access_token=token,
-            token_type="bearer",
-            user=UserResponse.model_validate(user),
-            mfa_required=False,
-        )
+        return _google_login_existing_user(request, db, user, payload, clean_email, verified_avatar)
 
     # Account not found and auto-creation disabled (login-only flow)
     if not payload.create_if_missing:
@@ -504,21 +653,9 @@ def google_auth(request: Request, payload: GoogleLoginRequest, db: Session = Dep
         db.rollback()
         user = db.query(User).filter(func.lower(User.email) == clean_email).first()
         if user:
-            if hasattr(user, "is_active") and not user.is_active:
-                raise HTTPException(status_code=403, detail="Account is deactivated")
-            token = create_access_token(
-                user_id=user.id,
-                family_id=user.family_id,
-                role="parent",
-                email=user.email,
-                token_version=getattr(user, "token_version", 1) or 1,
-            )
-            return ParentLoginResult(
-                access_token=token,
-                token_type="bearer",
-                user=UserResponse.model_validate(user),
-                mfa_required=False,
-            )
+            # #264: Concurrently created account — run the full existing-user checks (role, is_active,
+            # ownership claim, MFA, audit) instead of minting a token directly.
+            return _google_login_existing_user(request, db, user, payload, clean_email, verified_avatar)
         raise HTTPException(status_code=400, detail="Google authentication failed")
 
     token = create_access_token(
@@ -554,6 +691,7 @@ def create_child(
         role=UserRole.child,
         full_name=payload.full_name.strip(),
         pin_hash=hash_pin(payload.pin),
+        avatar_url=((payload.avatar or "").strip() or None),  # C9 / #39: الإيموجي اللي الأب اختاره للطفل
         token_version=1,
     )
     db.add(child)
@@ -759,10 +897,12 @@ def forgot_password(request: Request, payload: ForgotPasswordRequest, db: Sessio
     )
     db.commit()
 
-    reset_url = f"{FRONTEND_URL}/reset-password?token={raw_token}"
+    # C12 / #34: The link is only added when a real web frontend is configured (never a localhost default);
+    # the raw code is always in the email so the parent can paste it into the mobile app.
+    reset_url = f"{FRONTEND_URL}/reset-password?token={raw_token}" if FRONTEND_URL else None
     # BUG-068 (P2): Observability on password-reset email delivery failures
     try:
-        send_password_reset_email(user.email, reset_url)
+        send_password_reset_email(user.email, reset_url, raw_token)
     except Exception as e:
         logger.error(f"Failed to dispatch password reset email to {user.email}: {e}", exc_info=True)
 
@@ -772,7 +912,8 @@ def forgot_password(request: Request, payload: ForgotPasswordRequest, db: Sessio
 @router.post("/reset-password", response_model=ForgotPasswordResponse)
 @limiter.limit("10/hour")
 def reset_password(request: Request, payload: ResetPasswordRequest, db: Session = Depends(get_db)):
-    token_hash = hash_reset_token(payload.token.strip())
+    # C12: Accept the raw code or a pasted reset link containing token=
+    token_hash = hash_reset_token(_extract_reset_token(payload.token))
 
     # BUG-119 (P2): Atomically consume reset token with atomic UPDATE ... WHERE used=false
     updated = (
@@ -829,8 +970,8 @@ def change_password(
     db: Session = Depends(get_db),
 ):
     """BUG-057 (P1) & BUG-140 (P2): Authenticated parent password change with session invalidation."""
-    if not verify_password(payload.current_password, parent.password_hash):
-        raise HTTPException(status_code=401, detail="Incorrect current password")
+    # #33 / C13: Google-only parents (no password yet) confirm with a fresh Google ID token to set a first password
+    _verify_parent_identity(parent, payload.current_password, payload.google_id_token, "Incorrect current password")
 
     parent.password_hash = hash_password(payload.new_password)
     # BUG-009 (P1): Revoke existing tokens by incrementing token_version
@@ -943,6 +1084,12 @@ def delete_child(
 
     # 6. Child wallet, savings goals, card purchases, transactions
     child_wallet = db.query(Wallet).filter(Wallet.owner_id == child.id).first()
+    child_wallet_id = child_wallet.id if child_wallet else None
+    purchase_filter = CardPurchase.child_id == child.id
+    if child_wallet_id:
+        purchase_filter = purchase_filter | (CardPurchase.wallet_id == child_wallet_id)
+    # Kept for step 7: family audit rows reference the child's data through these ids
+    child_purchase_ids = [p[0] for p in db.query(CardPurchase.id).filter(purchase_filter).all()]
     if child_wallet:
         db.query(SavingsGoal).filter(SavingsGoal.wallet_id == child_wallet.id).delete(synchronize_session=False)
         db.query(CardPurchase).filter(
@@ -953,18 +1100,44 @@ def delete_child(
     else:
         db.query(CardPurchase).filter(CardPurchase.child_id == child.id).delete(synchronize_session=False)
 
-    # 7. Nullify child references in AuditLog
-    db.query(AuditLog).filter(AuditLog.actor_id == child.id).update({"actor_id": None}, synchronize_session=False)
+    # 7. Nullify child references in AuditLog and scrub the child's PII from retained rows (#11):
+    #    rows the child performed lose actor/detail/IP; rows about the child (e.g. child_created) lose their detail.
+    db.query(AuditLog).filter(AuditLog.actor_id == child.id).update(
+        {AuditLog.actor_id: None, AuditLog.detail: null(), AuditLog.ip_address: None},
+        synchronize_session=False,
+    )
+    db.query(AuditLog).filter(AuditLog.target_id == child.id).update(
+        {AuditLog.detail: null()},
+        synchronize_session=False,
+    )
+    #    rows about the child's wallet / missions / purchases (allowance labels, mission titles, merchants, limits)
+    related_ids = set(child_mission_ids) | set(child_purchase_ids) | ({child_wallet_id} if child_wallet_id else set())
+    if related_ids:
+        db.query(AuditLog).filter(
+            AuditLog.family_id == parent.family_id, AuditLog.target_id.in_(related_ids)
+        ).update({AuditLog.detail: null(), AuditLog.ip_address: None}, synchronize_session=False)
+    #    child PIN-login rows carry the child only in detail.child_id (matched in Python: JSON works on SQLite and PostgreSQL)
+    pin_row_ids = [
+        r.id for r in db.query(AuditLog).filter(
+            AuditLog.family_id == parent.family_id,
+            AuditLog.action.in_(("login_failed", "login_deactivated_rejected")),
+            AuditLog.actor_id.is_(None),
+        ).all()
+        if isinstance(r.detail, dict) and r.detail.get("child_id") == child.id
+    ]
+    if pin_row_ids:
+        db.query(AuditLog).filter(AuditLog.id.in_(pin_row_ids)).update(
+            {AuditLog.detail: null(), AuditLog.ip_address: None}, synchronize_session=False
+        )
 
     # 8. Delete the child user
     db.delete(child)
 
-    # 9. Atomic audit logging
+    # 9. Atomic audit logging (no child name — #11)
     log_action(
         db, request=request, action="child_deleted",
         actor_id=parent.id, actor_role="parent", family_id=parent.family_id,
         target_type="user", target_id=child_id,
-        detail={"child_name": child.full_name},
     )
     db.commit()
 
@@ -973,7 +1146,9 @@ def delete_child(
 
 @router.post("/reauth")
 @auth_compat_router.post("/reauth")
+@limiter.limit("5/minute")  # #37: password / MFA guessing with a session token is throttled like change-password
 def request_reauth(
+    request: Request,
     payload: ReauthRequest,
     parent: User = Depends(require_parent),
     db: Session = Depends(get_db),
@@ -996,15 +1171,32 @@ def request_reauth(
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid Google ID token: {e}")
         if not google_user or google_user.get("email", "").strip().lower() != (parent.email or "").strip().lower():
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Google authentication does not match account identity")
+    mfa_verified = False
     if parent.mfa_enabled:
         if not payload.mfa_code:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="MFA verification is required for re-authentication")
+        # #36: Per-account lockout on second-factor guesses
+        _check_mfa_lockout(parent.id, db)
         secret = mfa.decrypt_mfa_secret(parent.mfa_secret)
         totp_ok = secret and mfa.verify_totp(secret, payload.mfa_code, user_id=parent.id, db=db)
         if not totp_ok:
             rec_ok = mfa.verify_and_consume_recovery_code(db, parent.id, payload.mfa_code)
             if not rec_ok:
+                log_action(
+                    db, request=request, action="mfa_failed",
+                    actor_id=parent.id, actor_role="parent", family_id=parent.family_id,
+                )
+                db.commit()
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid MFA code or recovery code")
+        mfa_verified = True
+
+    log_action(
+        db, request=request, action="reauth_issued",
+        actor_id=parent.id, actor_role="parent", family_id=parent.family_id,
+        target_type="user", target_id=parent.id,
+    )
+    # #28: Persist recovery-code consumption / last_totp_timestep (FF-07) before issuing the proof
+    db.commit()
 
     reauth_token = create_access_token(
         user_id=parent.id,
@@ -1016,6 +1208,8 @@ def request_reauth(
             "purpose": "reauth",
             "action": "account_deletion",
             "jti": secrets.token_hex(16),
+            # #35: This proof already includes the MFA step, so account deletion does not ask for a second code
+            "mfa_verified": mfa_verified,
         }
     )
     return {"reauth_token": reauth_token, "expires_in": 300}
@@ -1023,6 +1217,7 @@ def request_reauth(
 
 @router.delete("/account")
 @router.delete("/parent/account")
+@limiter.limit("5/minute")  # #37: password / MFA guessing with a session token is throttled like change-password
 def delete_account(
     request: Request,
     payload: Optional[AccountDeletePayload] = Body(None),
@@ -1034,29 +1229,6 @@ def delete_account(
     Parent deletes account and family with reauthentication, MFA verification,
     and complete atomic cascade deletion with audit preservation.
     """
-    # 1. Require MFA verification if parent has MFA enabled (FF-03 & FF-05)
-    if getattr(parent, "mfa_enabled", False):
-        mfa_code = (
-            request.headers.get("X-MFA-Code")
-            or (payload.mfa_code if payload else None)
-        )
-        if not mfa_code or not str(mfa_code).strip():
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="MFA verification is required to delete this account.",
-            )
-        clean_mfa_code = str(mfa_code).strip()
-        secret = mfa.decrypt_mfa_secret(parent.mfa_secret)
-        totp_ok = secret and mfa.verify_totp(secret, clean_mfa_code, db=db, user_id=parent.id)
-        if not totp_ok:
-            rec_ok = mfa.verify_and_consume_recovery_code(db, parent.id, clean_mfa_code)
-            if not rec_ok:
-                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid MFA code or recovery code")
-
-    # 2. Fresh re-authentication proof (FF-03 & FF-05):
-    # A standard bearer session token is NEVER sufficient on its own, regardless of iat!
-    # Caller must provide valid password confirmation OR a dedicated reauth challenge token.
-    reauth_verified = False
     auth_header = request.headers.get("Authorization", "")
 
     confirm_pwd = (
@@ -1067,13 +1239,48 @@ def delete_account(
         request.headers.get("X-Google-Id-Token")
         or (payload.google_id_token if payload else None)
     )
+    uses_password_proof = bool(confirm_pwd and parent.password_hash)
+    uses_google_proof = bool(google_id_token and not parent.password_hash)
 
-    if confirm_pwd and parent.password_hash:
+    # The reauth-token branch below is taken only when no password / Google proof is supplied
+    reauth_candidate = None
+    if not uses_password_proof and not uses_google_proof:
+        reauth_candidate = (
+            request.headers.get("X-Reauth-Token")
+            or (payload.reauth_token if payload else None)
+        )
+        if not reauth_candidate and auth_header.startswith("Bearer "):
+            reauth_candidate = auth_header.split(" ", 1)[1].strip()
+
+    # #35: A reauth token that /reauth minted after verifying MFA already counts as the MFA step
+    # (decode only here — the jti is still consumed exactly once in the reauth branch below).
+    mfa_via_reauth = False
+    reauth_claims_ok = False
+    if reauth_candidate:
+        try:
+            pre_claims = decode_access_token(reauth_candidate)
+            reauth_claims_ok = (
+                pre_claims.get("purpose") == "reauth"
+                and pre_claims.get("action") == "account_deletion"
+                and pre_claims.get("sub") == str(parent.id)
+            )
+            mfa_via_reauth = reauth_claims_ok and pre_claims.get("mfa_verified") is True
+        except Exception:
+            mfa_via_reauth = False
+            reauth_claims_ok = False
+
+    # 1. Fresh re-authentication proof (FF-03 & FF-05), checked BEFORE the second factor (like /reauth):
+    # A standard bearer session token is NEVER sufficient on its own, regardless of iat!
+    # Caller must provide valid password confirmation OR a dedicated reauth challenge token.
+    # Password / Google proofs are verified here; a reauth token's jti is consumed only after MFA passes.
+    reauth_verified = False
+
+    if uses_password_proof:
         if verify_password(confirm_pwd, parent.password_hash):
             reauth_verified = True
         else:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid password confirmation")
-    elif google_id_token and not parent.password_hash:
+    elif uses_google_proof:
         from core.google_auth import verify_google_id_token
         try:
             google_user = verify_google_id_token(google_id_token)
@@ -1083,14 +1290,41 @@ def delete_account(
             reauth_verified = True
         else:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Google re-authentication token: identity mismatch")
-    else:
-        reauth_candidate = (
-            request.headers.get("X-Reauth-Token")
-            or (payload.reauth_token if payload else None)
-        )
-        if not reauth_candidate and auth_header.startswith("Bearer "):
-            reauth_candidate = auth_header.split(" ", 1)[1].strip()
 
+    # 2. Require MFA verification if parent has MFA enabled (FF-03 & FF-05)
+    if getattr(parent, "mfa_enabled", False) and not mfa_via_reauth:
+        mfa_code = (
+            request.headers.get("X-MFA-Code")
+            or (payload.mfa_code if payload else None)
+        )
+        if not mfa_code or not str(mfa_code).strip():
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="MFA verification is required to delete this account.",
+            )
+        # A bare session token must not be able to guess codes against the shared lockout (or burn a TOTP)
+        if not (reauth_verified or reauth_claims_ok):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Recent re-authentication required to delete account. Please confirm your password or complete a re-authentication challenge.",
+            )
+        # #36: Per-account lockout on second-factor guesses
+        _check_mfa_lockout(parent.id, db)
+        clean_mfa_code = str(mfa_code).strip()
+        secret = mfa.decrypt_mfa_secret(parent.mfa_secret)
+        totp_ok = secret and mfa.verify_totp(secret, clean_mfa_code, db=db, user_id=parent.id)
+        if not totp_ok:
+            rec_ok = mfa.verify_and_consume_recovery_code(db, parent.id, clean_mfa_code)
+            if not rec_ok:
+                log_action(
+                    db, request=request, action="mfa_failed",
+                    actor_id=parent.id, actor_role="parent", family_id=parent.family_id,
+                )
+                db.commit()
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid MFA code or recovery code")
+
+    # 3. Dedicated reauth challenge token (single-use jti), when no password / Google proof was supplied
+    if not reauth_verified:
         if reauth_candidate:
             try:
                 claims = decode_access_token(reauth_candidate)
@@ -1124,17 +1358,17 @@ def delete_account(
         )
 
     family_id = parent.family_id
-    parent_email = parent.email
     family_users = db.query(User).filter(User.family_id == family_id).all()
     user_ids = [u.id for u in family_users]
 
     # Pre-deletion compliance audit logging in the SAME database transaction
     # Store family_id and actor_id as NULL to avoid FK constraint issues upon deleting family/users
+    # #11: No email / names / IP in the retained row — only non-identifying compliance metadata
     log_action(
-        db, request=request, action="family_account_deleted",
+        db, request=None, action="family_account_deleted",
         actor_id=None, actor_role="parent", family_id=None,
         target_type="family", target_id=family_id,
-        detail={"parent_email": parent_email, "family_id": family_id, "member_count": len(user_ids)},
+        detail={"family_id": family_id, "member_count": len(user_ids)},
     )
 
     if user_ids:
@@ -1172,12 +1406,13 @@ def delete_account(
     # 7. Missions
     db.query(Mission).filter(Mission.family_id == family_id).delete(synchronize_session=False)
 
-    # 8. Nullify existing AuditLog foreign keys for the family/users so compliance trail is retained
+    # 8. Nullify existing AuditLog foreign keys for the family/users so compliance trail is retained,
+    #    and scrub PII (emails / names in detail, IP addresses) from the retained rows (#11)
     filter_cond = AuditLog.family_id == family_id
     if user_ids:
         filter_cond = filter_cond | AuditLog.actor_id.in_(user_ids)
     db.query(AuditLog).filter(filter_cond).update(
-        {AuditLog.family_id: None, AuditLog.actor_id: None},
+        {AuditLog.family_id: None, AuditLog.actor_id: None, AuditLog.detail: null(), AuditLog.ip_address: None},
         synchronize_session=False,
     )
 
@@ -1225,8 +1460,8 @@ def mfa_setup(
     if parent.mfa_enabled:
         raise HTTPException(status_code=400, detail="MFA is already enabled. Disable it first to re-setup.")
 
-    if not verify_password(payload.password, parent.password_hash):
-        raise HTTPException(status_code=401, detail="Incorrect password")
+    # #33 / C13: password, or a fresh Google ID token for Google-only parents
+    _verify_parent_identity(parent, payload.password, payload.google_id_token)
 
     secret = mfa.generate_secret()
     parent.mfa_pending_secret = mfa.encrypt_mfa_secret(secret)
@@ -1281,10 +1516,13 @@ def mfa_disable(
     """
     BUG-116 (P2): Require password AND a second factor (valid OTP or recovery code) to disable MFA.
     """
-    if not verify_password(payload.password, parent.password_hash):
-        raise HTTPException(status_code=401, detail="Incorrect password")
+    # #33 / C13: password, or a fresh Google ID token for Google-only parents
+    _verify_parent_identity(parent, payload.password, payload.google_id_token)
 
     mfa_verified = False
+    if payload.code or payload.recovery_code:
+        # #36: Per-account lockout on second-factor guesses
+        _check_mfa_lockout(parent.id, db)
     if payload.code:
         plain_secret = mfa.decrypt_mfa_secret(parent.mfa_secret)
         if mfa.verify_totp(plain_secret, payload.code, user_id=parent.id, db=db):
@@ -1294,6 +1532,12 @@ def mfa_disable(
             mfa_verified = True
 
     if not mfa_verified:
+        if payload.code or payload.recovery_code:
+            log_action(
+                db, request=request, action="mfa_failed",
+                actor_id=parent.id, actor_role="parent", family_id=parent.family_id,
+            )
+            db.commit()
         raise HTTPException(
             status_code=401,
             detail="Valid second factor (OTP code or recovery code) is required to disable MFA",
@@ -1335,10 +1579,13 @@ def regenerate_recovery_codes(
     """
     if not parent.mfa_enabled:
         raise HTTPException(status_code=400, detail="MFA is not enabled")
-    if not verify_password(payload.password, parent.password_hash):
-        raise HTTPException(status_code=401, detail="Incorrect password")
+    # #33 / C13: password, or a fresh Google ID token for Google-only parents
+    _verify_parent_identity(parent, payload.password, payload.google_id_token)
 
     mfa_verified = False
+    if payload.code or payload.recovery_code:
+        # #36: Per-account lockout on second-factor guesses
+        _check_mfa_lockout(parent.id, db)
     if payload.code:
         plain_secret = mfa.decrypt_mfa_secret(parent.mfa_secret)
         if mfa.verify_totp(plain_secret, payload.code, user_id=parent.id, db=db):
@@ -1348,6 +1595,12 @@ def regenerate_recovery_codes(
             mfa_verified = True
 
     if not mfa_verified:
+        if payload.code or payload.recovery_code:
+            log_action(
+                db, request=request, action="mfa_failed",
+                actor_id=parent.id, actor_role="parent", family_id=parent.family_id,
+            )
+            db.commit()
         raise HTTPException(
             status_code=401,
             detail="Valid second factor (OTP code or recovery code) is required to regenerate recovery codes",
@@ -1375,25 +1628,36 @@ def verify_mfa_login(request: Request, payload: MfaVerifyRequest, db: Session = 
     user_id = data.get("sub")
     role = data.get("role")
     token_type = data.get("type")
-    if not user_id or (role != "mfa_pending" and token_type != "mfa_challenge"):
+    # Parent password / Google challenges always carry both claims (this also keeps admin enrollment tokens out)
+    if not user_id or role != "mfa_pending" or token_type != "mfa_challenge":
         raise HTTPException(status_code=401, detail="Invalid MFA token")
+
+    # #4 / #38: Admin challenges must be completed at /api/admin/auth/mfa/verify (24h admin session +
+    # admin_login_success audit). Rejected BEFORE any TOTP / recovery-code check so nothing is consumed.
+    if data.get("target_role") not in (None, "parent"):
+        raise HTTPException(status_code=401, detail="Invalid MFA token")
+    issued_role = "parent"
 
     user = db.query(User).filter(User.id == user_id).first()
     if not user or not user.mfa_enabled:
         raise HTTPException(status_code=401, detail="User not found or MFA not enabled")
 
-    # BUG-117 (P2), FF-06 & FF-07: Verify TOTP code with replay prevention and role preservation
-    target_role = data.get("target_role") or "parent"
-    if target_role == "admin":
-        from api.admin_routes import get_admin_allowlist
-        if not user.email or user.email.lower() not in get_admin_allowlist():
-            raise HTTPException(status_code=403, detail="Access denied: Admin privileges required")
-        issued_role = "admin"
-        is_admin_flag = True
-    else:
-        issued_role = "parent"
-        is_admin_flag = False
+    # A challenge minted before a session revocation (password change / reset, Google claim of a
+    # pre-registered account) is dead too — checked before anything is consumed
+    if data.get("token_version") != (getattr(user, "token_version", 1) or 1):
+        raise HTTPException(status_code=401, detail="Invalid or expired temporary session")
 
+    # FF-02 & FF-10: Account deactivated while the 5-minute challenge was pending
+    if hasattr(user, "is_active") and not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is deactivated. Contact administration to restore access.",
+        )
+
+    # #36: Per-account lockout on second-factor guesses
+    _check_mfa_lockout(user.id, db)
+
+    # BUG-117 (P2), FF-06 & FF-07: Verify TOTP code with replay prevention
     plain_secret = mfa.decrypt_mfa_secret(user.mfa_secret)
     totp_ok = bool(plain_secret and mfa.verify_totp(plain_secret, payload.code, user_id=user.id, db=db))
     recovery_ok = False
@@ -1408,11 +1672,12 @@ def verify_mfa_login(request: Request, payload: MfaVerifyRequest, db: Session = 
         db.commit()
         raise HTTPException(status_code=401, detail="Invalid authentication code")
 
-    used_tc = mfa._LAST_USED_TIMESTEPS.get(user.id)
+    # Timestep only when TOTP succeeded in this request (a recovery-code login has none)
+    used_tc = mfa._LAST_USED_TIMESTEPS.get(user.id) if totp_ok else None
     log_action(
         db, request=request, action="login_success",
         actor_id=user.id, actor_role=issued_role, family_id=user.family_id,
-        detail={"mfa_used": True, "totp_timestep": used_tc},
+        detail={"mfa_used": True, "mfa_method": "totp" if totp_ok else "recovery_code", "totp_timestep": used_tc},
     )
     db.commit()
 
@@ -1422,7 +1687,6 @@ def verify_mfa_login(request: Request, payload: MfaVerifyRequest, db: Session = 
         role=issued_role,
         email=user.email,
         token_version=getattr(user, "token_version", 1),
-        is_admin=is_admin_flag,
     )
     return TokenResponse(access_token=token, token_type="bearer", user=UserResponse.model_validate(user))
 

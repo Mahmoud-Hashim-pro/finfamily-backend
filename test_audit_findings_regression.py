@@ -8,8 +8,6 @@ os.environ["ENVIRONMENT"] = "test"
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 os.environ["JWT_SECRET"] = "test-ci-secret-key-at-least-32-bytes-secure"
 os.environ["ADMIN_EMAILS"] = "admin@finfamily.com,supervisor@finfamily.com"
-os.environ["APP_VERSION"] = "1.1.2"
-os.environ["APP_BUILD_NUMBER"] = "10"
 
 from fastapi.testclient import TestClient
 from db.database import engine, Base, SessionLocal
@@ -245,34 +243,38 @@ def test_ff06_direct_totp_password_login_with_encrypted_secret():
     assert "access_token" in data and data["access_token"] is not None
 
 
-def test_ff07_parent_token_blocked_from_admin_portal():
+def test_ff07_parent_token_blocked_from_admin_portal(monkeypatch):
     """FF-07: An allowlisted user with a parent session token cannot access admin routes."""
-    # Ensure allowlist contains admin@finfamily.com
-    os.environ["ADMIN_EMAILS"] = "admin@finfamily.com,supervisor@finfamily.com"
-    parent_token = create_access_token(
-        user_id="allowlisted-parent-uuid",
-        family_id="any-family-uuid",
-        role="parent",
-        email="admin@finfamily.com",
-        token_version=1,
-    )
+    # Unique allowlisted identity so the shared in-memory DB never collides with other tests' rows
+    email = f"ff07-{uuid.uuid4().hex[:8]}@finfamily.com"
+    user_id = str(uuid.uuid4())
+    monkeypatch.setenv("ADMIN_EMAILS", f"admin@finfamily.com,supervisor@finfamily.com,{email}")
 
     db = SessionLocal()
-    fam = Family(name="Allowlist Fam", family_code="ALOW01")
+    fam = Family(name="Allowlist Fam", family_code=f"AL{uuid.uuid4().hex[:4].upper()}")
     db.add(fam)
     db.flush()
+    fam_id = fam.id
     user = User(
-        id="allowlisted-parent-uuid",
+        id=user_id,
         family_id=fam.id,
         role=UserRole.parent,
         full_name="Allowlisted Admin/Parent",
-        email="admin@finfamily.com",
+        email=email,
         is_active=True,
         token_version=1,
     )
     db.add(user)
     db.commit()
     db.close()
+
+    parent_token = create_access_token(
+        user_id=user_id,
+        family_id=fam_id,
+        role="parent",
+        email=email,
+        token_version=1,
+    )
 
     # Calling admin endpoint with role=parent token must be 403 Forbidden
     res = client.get("/api/admin/overview", headers={"Authorization": f"Bearer {parent_token}"})
@@ -758,12 +760,21 @@ def test_audit_ff03_and_ff05_account_deletion_reauth_and_mfa_enforcement():
     assert res_no_mfa.status_code == 403
     assert "MFA verification is required" in res_no_mfa.json()["detail"]
 
-    # 2. Attempt delete with invalid MFA code -> 401 Unauthorized
+    # 2. Invalid MFA code with only the session token -> 403 before any code is checked or counted
     res_bad_mfa = client.delete(
         "/api/auth/account",
         headers={**headers, "X-MFA-Code": "000000"},
     )
-    assert res_bad_mfa.status_code == 401
+    assert res_bad_mfa.status_code == 403
+    assert "Recent re-authentication required" in res_bad_mfa.json()["detail"]
+
+    # 2b. Invalid MFA code after a valid password confirmation -> 401 Unauthorized
+    res_bad_mfa_pwd = client.delete(
+        "/api/auth/account",
+        headers={**headers, "X-MFA-Code": "000000", "X-Confirm-Password": "DeletePass123!"},
+    )
+    assert res_bad_mfa_pwd.status_code == 401
+    assert res_bad_mfa_pwd.json()["detail"] == "Invalid MFA code or recovery code"
 
     # 3. Attempt delete with valid TOTP code but WITHOUT fresh password confirmation -> 403 Forbidden
     import pyotp
@@ -777,28 +788,30 @@ def test_audit_ff03_and_ff05_account_deletion_reauth_and_mfa_enforcement():
     assert res_no_pwd.status_code == 403
     assert "Recent re-authentication required" in res_no_pwd.json()["detail"]
 
-    # 4. Attempt delete with wrong password confirmation -> 401 Unauthorized
-    res_bad_pwd = client.delete(
-        "/api/auth/account",
-        headers={**headers, "X-MFA-Code": valid_code, "X-Confirm-Password": "WrongPassword123!"},
-    )
-    assert res_bad_pwd.status_code == 401
-
-    # 5. Attempt delete with valid recovery code AND valid password confirmation -> 200 OK
-    raw_rec_code = mfa.generate_recovery_codes(1)[0]
+    # Fresh, unused second factors for steps 4 and 5 (independent of whether the step-3 TOTP was consumed)
+    raw_rec_code_bad_pwd, raw_rec_code_ok = mfa.generate_recovery_codes(2)
     rec_db = SessionLocal()
-    rec_obj = MfaRecoveryCode(
-        user_id=parent_id,
-        code_hash=mfa.pwd_context.hash(mfa.normalize_recovery_code(raw_rec_code)),
-        used=False,
-    )
-    rec_db.add(rec_obj)
+    for raw_code in (raw_rec_code_bad_pwd, raw_rec_code_ok):
+        rec_db.add(MfaRecoveryCode(
+            user_id=parent_id,
+            code_hash=mfa.pwd_context.hash(mfa.normalize_recovery_code(raw_code)),
+            used=False,
+        ))
     rec_db.commit()
     rec_db.close()
 
+    # 4. Attempt delete with a valid second factor but wrong password confirmation -> 401 Unauthorized
+    res_bad_pwd = client.delete(
+        "/api/auth/account",
+        headers={**headers, "X-MFA-Code": raw_rec_code_bad_pwd, "X-Confirm-Password": "WrongPassword123!"},
+    )
+    assert res_bad_pwd.status_code == 401
+    assert res_bad_pwd.json()["detail"] == "Invalid password confirmation"
+
+    # 5. Attempt delete with valid recovery code AND valid password confirmation -> 200 OK
     res_ok = client.delete(
         "/api/auth/account",
-        headers={**headers, "X-MFA-Code": raw_rec_code, "X-Confirm-Password": "DeletePass123!"},
+        headers={**headers, "X-MFA-Code": raw_rec_code_ok, "X-Confirm-Password": "DeletePass123!"},
     )
     assert res_ok.status_code == 200
     assert res_ok.json()["message"] == "Account deleted successfully"
@@ -833,8 +846,11 @@ def test_a2_undecryptable_mfa_secret_fails_closed_without_ciphertext_fallback():
         mfa.provisioning_uri(corrupt_encrypted_secret, "user@test.com")
 
 
-def test_a5_reauth_token_single_use_atomic_consumption():
+def test_a5_reauth_token_single_use_atomic_consumption(monkeypatch):
     """A5: A re-authentication token can only be consumed once for account deletion."""
+    import api.auth_routes as auth_routes
+    from fastapi import HTTPException
+
     db = SessionLocal()
     fam = Family(name="SingleUse Fam", family_code="SNG001")
     db.add(fam)
@@ -864,20 +880,54 @@ def test_a5_reauth_token_single_use_atomic_consumption():
     )
     assert reauth_res.status_code == 200
     reauth_token = reauth_res.json()["reauth_token"]
+    jti = decode_access_token(reauth_token)["jti"]
+    headers = {"Authorization": f"Bearer {login_token}", "X-Reauth-Token": reauth_token}
 
-    # 1st delete attempt with this reauth token succeeds
-    del_res1 = client.delete(
-        "/api/auth/account",
-        headers={"Authorization": f"Bearer {login_token}", "X-Reauth-Token": reauth_token},
-    )
-    assert del_res1.status_code == 200
+    # 1st attempt consumes the reauth token, then aborts before anything is deleted,
+    # so the replay below runs while the account still exists and reaches the jti check
+    def _abort(*a, **k):
+        raise HTTPException(status_code=503, detail="simulated failure after reauth consumption")
 
-    # 2nd attempt with same reauth token must fail with 401 (already consumed)
-    del_res2 = client.delete(
-        "/api/auth/account",
-        headers={"Authorization": f"Bearer {login_token}", "X-Reauth-Token": reauth_token},
+    monkeypatch.setattr(auth_routes, "log_action", _abort)
+    first = client.delete("/api/auth/account", headers=headers)
+    monkeypatch.undo()
+    assert first.status_code == 503, first.text
+
+    check_db = SessionLocal()
+    try:
+        assert check_db.query(IdempotencyRecord).filter(
+            IdempotencyRecord.key == f"consumed_reauth:{jti}"
+        ).first() is not None
+        assert check_db.query(User).filter(User.id == user_id).first() is not None
+    finally:
+        check_db.close()
+
+    # 2nd attempt with the same reauth token must fail because it was already consumed
+    replay = client.delete("/api/auth/account", headers=headers)
+    assert replay.status_code == 401, replay.text
+    assert replay.json()["detail"] == "Re-authentication token has already been consumed"
+
+    # A fresh reauth token still deletes the account (happy path stays covered)
+    fresh_res = client.post(
+        "/api/auth/reauth",
+        json={"password": "Password123!"},
+        headers={"Authorization": f"Bearer {login_token}"},
     )
-    assert del_res2.status_code in (401, 403, 404)
+    assert fresh_res.status_code == 200
+    del_ok = client.delete(
+        "/api/auth/account",
+        headers={"Authorization": f"Bearer {login_token}", "X-Reauth-Token": fresh_res.json()["reauth_token"]},
+    )
+    assert del_ok.status_code == 200, del_ok.text
+
+    # The consumed marker has no family/user FK, so it survives the account cascade
+    check_db = SessionLocal()
+    try:
+        assert check_db.query(IdempotencyRecord).filter(
+            IdempotencyRecord.key == f"consumed_reauth:{jti}"
+        ).first() is not None
+    finally:
+        check_db.close()
 
 
 def test_a5_oauth_account_reauth_with_google_id_token():
@@ -1236,35 +1286,38 @@ async def test_ai_asgi_middleware_stream_capping():
     assert inner_called is False, "Inner app should never be called when ASGI stream exceeds limit!"
 
 
-def test_sha256_checksum_verified_against_physical_release_artifact():
+def test_sha256_checksum_verified_against_physical_release_artifact(tmp_path, monkeypatch):
     """Area 4: Mathematical verification that backend APP_SHA256 equals the SHA-256 of the physical released APK."""
     import hashlib
     import urllib.request
 
+    # Pin the published release under test (v1.1.4) and read what the backend actually advertises for it
+    monkeypatch.setenv("APP_VERSION", "1.1.4")
+    monkeypatch.setenv("APP_BUILD_NUMBER", "12")
+    res = client.get("/api/app/version")
+    assert res.status_code == 200
+    advertised = res.json()
+    assert advertised.get("sha256"), "Backend must advertise a SHA-256 for the released APK version"
+
     # Dynamic release artifact parameters
     expected_release_sha256 = (
         os.getenv("EXPECTED_RELEASE_SHA256")
-        or os.getenv("APP_SHA256")
-        or "21408d8dcde46b0a372b0b974324e990cf252815aa6716d572168ebaf288187c"
+        or advertised["sha256"]
     ).strip().lower()
 
-    # Check for release artifact locally or download from GitHub release asset
-    apk_candidates = [
-        os.getenv("RELEASE_APK_PATH", ""),
-        os.path.join(os.getcwd(), "release_artifacts", "app-release.apk"),
-        r"C:\Users\Tie\.gemini\antigravity\scratch\apk_check_v114\FinFamily-App\app-release.apk",
-    ]
+    # Only an explicit local override is trusted; no developer paths or cached downloads in the CWD
     apk_path = None
-    for cand in apk_candidates:
-        if cand and os.path.exists(cand):
-            apk_path = cand
-            break
+    local_apk = os.getenv("RELEASE_APK_PATH", "")
+    if local_apk and os.path.exists(local_apk):
+        apk_path = local_apk
 
     if not apk_path:
-        # Download from official GitHub release
-        os.makedirs("release_artifacts", exist_ok=True)
-        target = os.path.join("release_artifacts", "app-release.apk")
-        url = os.getenv("RELEASE_APK_URL") or "https://github.com/Mahmoud-Hashim-pro/finfamily-mobile-app/releases/download/v1.1.4/app-release.apk"
+        # The download needs network access: mandatory in CI (or when opted in), skipped in offline local runs
+        if not (os.getenv("CI") or os.getenv("REQUIRE_RELEASE_APK_CHECK")):
+            pytest.skip("Release APK check needs network access; set RELEASE_APK_PATH, CI or REQUIRE_RELEASE_APK_CHECK to run it")
+        # Download from official GitHub release into pytest's temp dir (no persistent stale cache)
+        target = str(tmp_path / "app-release.apk")
+        url = os.getenv("RELEASE_APK_URL") or advertised["download_url"]
         try:
             urllib.request.urlretrieve(url, target)
             apk_path = target
@@ -1282,10 +1335,7 @@ def test_sha256_checksum_verified_against_physical_release_artifact():
     assert physical_apk_sha256 == expected_release_sha256, (
         f"Physical APK hash '{physical_apk_sha256}' does not match expected release digest '{expected_release_sha256}'"
     )
-
-    res = client.get("/api/app/version")
-    assert res.status_code == 200
-    assert res.json()["sha256"] == physical_apk_sha256
+    assert advertised["sha256"].strip().lower() == physical_apk_sha256
 
 
 def test_verify_database_readiness_rejects_composite_only_unique_index():
@@ -1347,10 +1397,18 @@ def test_verify_database_readiness_multiple_heads_and_behind_revision():
     assert "do not match expected" in msg or "Database schema is behind" in msg
     assert "0001_initial_schema" in msg
 
-    # 3. Matching expected head -> succeeds
+    # 3. Matching expected head(s), read from the codebase's Alembic scripts -> succeeds
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+    backend_dir = os.path.dirname(os.path.abspath(__file__))
+    alembic_cfg = Config(os.path.join(backend_dir, "alembic.ini"))
+    alembic_cfg.set_main_option("script_location", os.path.join(backend_dir, "alembic"))
+    code_heads = ScriptDirectory.from_config(alembic_cfg).get_heads()
+    assert code_heads, "Alembic scripts must define at least one head revision"
     with test_engine.connect() as conn:
         conn.execute(text("DELETE FROM alembic_version"))
-        conn.execute(text("INSERT INTO alembic_version (version_num) VALUES ('0002_idemp_mfa_atomic')"))
+        for head in code_heads:
+            conn.execute(text("INSERT INTO alembic_version (version_num) VALUES (:rev)"), {"rev": head})
         conn.commit()
     is_ready, msg = verify_database_readiness(test_engine, is_production_mode=False)
     assert is_ready is True

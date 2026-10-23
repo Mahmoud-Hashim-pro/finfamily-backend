@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from db.models import User, UserRole, Wallet, Mission, MissionKind, MissionStatus, Transaction, TransactionType, CardPurchase, PurchaseStatus
 from services.scoring import _debit_spend_since
+from services.local_time import local_day_start_utc
 
 SEVERITY_ORDER = {"alert": 0, "warn": 1, "info": 2, "good": 3}
 
@@ -33,12 +34,14 @@ def build_family_insights(db: Session, parent: User) -> List[dict]:
         elif wallet.card_status.value == "deactivated":
             insights.append(_insight("shield-alert", "alert", f"{c.full_name}'s card is deactivated", "Claim a new card from Family Cards to reactivate."))
 
+        # `is not None` (مش truthiness): حد = 0 معناه "الصرف متوقف" وأي صرف فوقه تخطي — نفس _over_any_limit والـ scoring
+        # ونافذة اليوم = اليوم المحلي (بتوقيت مصر) نفس نافذة الإنفاذ
         exceeded = []
-        if wallet.daily_limit and _debit_spend_since(db, wallet.id, now.replace(hour=0, minute=0, second=0, microsecond=0)) > wallet.daily_limit:
+        if wallet.daily_limit is not None and _debit_spend_since(db, wallet.id, local_day_start_utc()) > wallet.daily_limit:
             exceeded.append("daily")
-        if wallet.weekly_limit and _debit_spend_since(db, wallet.id, now - timedelta(days=7)) > wallet.weekly_limit:
+        if wallet.weekly_limit is not None and _debit_spend_since(db, wallet.id, now - timedelta(days=7)) > wallet.weekly_limit:
             exceeded.append("weekly")
-        if wallet.monthly_limit and _debit_spend_since(db, wallet.id, now - timedelta(days=30)) > wallet.monthly_limit:
+        if wallet.monthly_limit is not None and _debit_spend_since(db, wallet.id, now - timedelta(days=30)) > wallet.monthly_limit:
             exceeded.append("monthly")
         if exceeded:
             insights.append(_insight("trending-down", "warn", f"{c.full_name} exceeded a spending limit", f"Over the {', '.join(exceeded)} limit — consider reviewing it."))
@@ -92,7 +95,12 @@ def build_family_activity(db: Session, parent: User, limit: int = 10) -> List[di
     for m in missions:
         name = children.get(m.assigned_to_id, "Someone")
         if m.status == MissionStatus.submitted:
-            events.append({"id": f"m-{m.id}-submitted", "title": f"{name} completed a task", "body": m.title, "color": "#f97316", "created_date": m.updated_date, "child_name": name})
+            # طلب الصرف (redemption) بيتعمل submitted على طول — ده طلب مكافأة مستني موافقة، مش مهمة خلصت
+            if m.kind == MissionKind.redemption:
+                title, body = f"{name} requested a reward", f"{m.title} · {m.reward:.0f} EGP"
+            else:
+                title, body = f"{name} completed a task", m.title
+            events.append({"id": f"m-{m.id}-submitted", "title": title, "body": body, "color": "#f97316", "created_date": m.updated_date, "child_name": name})
         elif m.status == MissionStatus.approved:
             verb = "reward was approved" if m.kind == MissionKind.redemption else "chore was approved & paid"
             events.append({"id": f"m-{m.id}-approved", "title": f"{name}'s {verb}", "body": f"{m.title} · {m.reward:.0f} EGP", "color": "#00B894", "created_date": m.reviewed_date or m.updated_date, "child_name": name})

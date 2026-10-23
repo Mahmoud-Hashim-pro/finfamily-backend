@@ -9,6 +9,7 @@ Verifies:
 """
 import os
 import uuid
+import atexit
 import tempfile
 import pytest
 from decimal import Decimal
@@ -58,6 +59,27 @@ Base.metadata.create_all(bind=concur_engine)
 app.state.limiter.enabled = False
 
 ConcurSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=concur_engine)
+
+
+def _cleanup_concur_db():
+    """Dispose the pool and delete the throwaway SQLite file (+ WAL/SHM) so runs don't litter the temp dir.
+    Idempotent: runs at module teardown and again at interpreter exit for collect-only or aborted runs."""
+    # Dispose first: on Windows a file with an open pooled connection cannot be deleted
+    concur_engine.dispose()
+    if not test_pg_url:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(db_file + suffix)
+            except OSError:
+                pass
+
+
+atexit.register(_cleanup_concur_db)
+
+
+def teardown_module(module):
+    _cleanup_concur_db()
+
 
 def _concur_get_db():
     db = ConcurSessionLocal()
@@ -415,6 +437,11 @@ def test_concurrent_reauth_token_single_use_consumption():
 
     for r in rejected_responses:
         assert r.status_code in (401, 403, 404)
+        # Losers either hit the single-use jti check, or arrive after the winner already deleted the account
+        assert r.json().get("detail") in (
+            "Re-authentication token has already been consumed",
+            "User no longer exists",
+        ), r.text
 
 
 def test_concurrent_totp_timestep_atomic_replay_prevention():

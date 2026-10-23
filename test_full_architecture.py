@@ -1,3 +1,4 @@
+import os
 import requests
 import json
 import time
@@ -8,7 +9,12 @@ sys.stdout.reconfigure(encoding='utf-8')
 import pytest
 pytestmark = pytest.mark.skip(reason="Manual integration script for deployed Vercel backend")
 
-BASE_URL = "https://finfamily-backend.vercel.app/api"
+# Manual smoke run only. Target and credentials come from the environment; never hard-code them here.
+#   FINFAMILY_SMOKE_BASE_URL  (default: local dev server)
+#   FINFAMILY_SMOKE_EMAIL / FINFAMILY_SMOKE_PASSWORD  (required, no fallback)
+BASE_URL = os.environ.get("FINFAMILY_SMOKE_BASE_URL", "http://localhost:8000/api").rstrip("/")
+SMOKE_EMAIL = os.environ.get("FINFAMILY_SMOKE_EMAIL")
+SMOKE_PASSWORD = os.environ.get("FINFAMILY_SMOKE_PASSWORD")
 
 results = []
 
@@ -18,10 +24,12 @@ def record(layer, test_name, passed, details=""):
     print(f"[{status}] [{layer}] {test_name}: {details}")
 
 def run_full_suite():
-if __name__ == "__main__":
-        print("================================================================================")
-        print("🚀 FINFAMILY FULL ARCHITECTURAL & LAYER INTEGRATION TEST SUITE (ROUND 2)")
-        print("================================================================================")
+    if not SMOKE_EMAIL or not SMOKE_PASSWORD:
+        sys.exit("FINFAMILY_SMOKE_EMAIL and FINFAMILY_SMOKE_PASSWORD must be set to run this smoke suite.")
+
+    print("================================================================================")
+    print("🚀 FINFAMILY FULL ARCHITECTURAL & LAYER INTEGRATION TEST SUITE (ROUND 2)")
+    print("================================================================================")
     
     # ==============================================================================
     # 1. CORE SYSTEM & VERSION LAYER
@@ -47,7 +55,7 @@ if __name__ == "__main__":
     try:
         res = requests.post(
             f"{BASE_URL}/admin/auth/login",
-            json={"email": "modyhashim2006@gmail.com", "password": "Admin@FinFamily2026!"},
+            json={"email": SMOKE_EMAIL, "password": SMOKE_PASSWORD},
             timeout=10
         )
         if res.status_code == 200:
@@ -114,7 +122,7 @@ if __name__ == "__main__":
     try:
         res = requests.post(
             f"{BASE_URL}/auth/login",
-            json={"email": "modyhashim2006@gmail.com", "password": "Admin@FinFamily2026!"},
+            json={"email": SMOKE_EMAIL, "password": SMOKE_PASSWORD},
             timeout=10
         )
         if res.status_code == 200:
@@ -263,3 +271,6 @@ if __name__ == "__main__":
     else:
         print("🌟 ALL ARCHITECTURAL AND INTEGRATION LAYERS PASSED 100%!")
         sys.exit(0)
+
+if __name__ == "__main__":
+    run_full_suite()

@@ -3,6 +3,8 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from db.models import User, Wallet, Mission, MissionKind, MissionStatus, Transaction, TransactionDirection, TransactionType
+from services.local_time import local_day_start_utc
+from services.streaks import effective_streak
 
 
 def _debit_spend_since(db: Session, wallet_id: str, since: datetime) -> float:
@@ -59,11 +61,13 @@ def compute_financial_score(db: Session, wallet: Wallet, child: User) -> int:
         score += (reliability - 0.5) * 40  # 100% موافق عليها = +20 / 100% مرفوضة = -20
 
     # 3) الـ streak (سقف 10 يوم عشان مايبقاش هو المتحكم الوحيد في الدرجة)
-    score += min(child.streak or 0, 10)
+    # effective_streak: الـ streak اللي اتكسر (آخر نشاط قبل امبارح) بيتحسب 0 مش آخر رقم متخزن
+    score += min(effective_streak(child), 10)
 
     # 4) الالتزام بحدود الصرف — خصم لو الطفل تخطى أي حد حدده الأب (FF-16: نافذة اليوم موحدة مع family_routes)
+    # نافذة "اليوم" = اليوم المحلي (بتوقيت مصر)، نفس نافذة _over_any_limit بالظبط
     now = datetime.utcnow()
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start = local_day_start_utc()
     penalty = 0
     d_lim = float(wallet.daily_limit) if wallet.daily_limit is not None else None
     w_lim = float(wallet.weekly_limit) if wallet.weekly_limit is not None else None

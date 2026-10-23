@@ -92,6 +92,8 @@ GAME_CATALOG: Dict[str, Dict[str, Any]] = {
 # مكافأة إضافية لو الطفل خلّص كل الألعاب في نفس اليوم — مرة واحدة بس في اليوم
 PERFECT_DAY_BONUS_XP = 100
 PERFECT_DAY_BONUS_COINS = 50
+# وصف معاملة البونص — نفس النص بيتكتب وبيتدوّر عليه عشان نعرف البونص اتصرف النهاردة ولا لأ
+PERFECT_DAY_BONUS_DESC = "Perfect Day bonus — all mini-games completed today! 🌟"
 
 
 def compute_reward(

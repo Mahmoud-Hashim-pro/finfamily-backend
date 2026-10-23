@@ -164,6 +164,8 @@ def matrix_env():
         "goal_b1_id": goal_b1.id,
         "mission_b1_id": mission_b1.id,
         "purchase_b1_id": purchase_b1.id,
+        "audit_a_id": log_a.id,
+        "audit_b_id": log_b.id,
         "tokens": tokens,
     }
 
@@ -247,6 +249,7 @@ def test_matrix_mission_family_listing_isolation(matrix_env):
     missions = res.json()
     returned_ids = {m["id"] for m in missions}
     assert matrix_env["mission_b1_id"] not in returned_ids, "Family B mission leaked into Family A listing!"
+    assert matrix_env["mission_a1_id"] in returned_ids, "Family A's own mission missing from its listing!"
 
 
 def test_matrix_card_purchase_review_isolation(matrix_env):
@@ -268,6 +271,14 @@ def test_matrix_card_purchase_family_listing_isolation(matrix_env):
     purchases = res.json()
     returned_ids = {p["id"] for p in purchases}
     assert matrix_env["purchase_b1_id"] not in returned_ids, "Family B purchase leaked into Family A listing!"
+    assert matrix_env["purchase_a1_id"] in returned_ids, "Family A's own purchase missing from its listing!"
+
+    # Same query the parent approvals screen uses
+    res_pending = client.get("/api/card/purchases/family", params={"status": "pending"}, headers=headers_pa)
+    assert res_pending.status_code == 200
+    pending_ids = {p["id"] for p in res_pending.json()}
+    assert matrix_env["purchase_a1_id"] in pending_ids, "Family A's pending purchase missing from approvals listing!"
+    assert matrix_env["purchase_b1_id"] not in pending_ids, "Family B purchase leaked into Family A approvals listing!"
 
 
 def test_matrix_savings_goals_deposit_and_withdraw_isolation(matrix_env):
@@ -316,12 +327,24 @@ def test_matrix_audit_logs_family_isolation(matrix_env):
     """GET /api/audit-logs returns only logs belonging to caller's family."""
     headers_pa = {"Authorization": f"Bearer {matrix_env['tokens']['parent_a']}"}
 
-    res = client.get("/api/audit-logs", headers=headers_pa)
+    # AuditLogOut has no family_id field, so assert on fields the response actually returns
+    res = client.get("/api/audit-logs", params={"limit": 200}, headers=headers_pa)
     assert res.status_code == 200
     logs = res.json()
-    for log_item in logs:
-        if "family_id" in log_item and log_item["family_id"]:
-            assert log_item["family_id"] == matrix_env["fam_a_id"]
+    actions = [log_item["action"] for log_item in logs]
+    log_ids = {log_item["id"] for log_item in logs}
+    assert "test_action_a" in actions
+    assert "test_action_b" not in actions, "Family B audit log leaked into Family A audit trail!"
+    assert matrix_env["audit_a_id"] in log_ids
+    assert matrix_env["audit_b_id"] not in log_ids
+
+    # Same check from Family B's side
+    headers_pb = {"Authorization": f"Bearer {matrix_env['tokens']['parent_b']}"}
+    res_b = client.get("/api/audit-logs", params={"limit": 200}, headers=headers_pb)
+    assert res_b.status_code == 200
+    log_ids_b = {log_item["id"] for log_item in res_b.json()}
+    assert matrix_env["audit_b_id"] in log_ids_b
+    assert matrix_env["audit_a_id"] not in log_ids_b, "Family A audit log leaked into Family B audit trail!"
 
 
 def test_matrix_non_admin_cannot_access_admin_endpoints(matrix_env):

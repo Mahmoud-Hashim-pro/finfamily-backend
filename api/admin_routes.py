@@ -6,7 +6,7 @@ from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import func
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, contains_eager
 
 from db.database import get_db, engine
 from db.models import (
@@ -15,7 +15,7 @@ from db.models import (
     CardStatus, CardPurchase, PurchaseStatus, AuditLog,
 )
 from core.security import (
-    verify_password, create_access_token, hash_password, decode_access_token
+    verify_password, create_access_token, hash_password, decode_access_token, DUMMY_PASSWORD_HASH
 )
 from core.deps import get_current_user, bearer_scheme
 from fastapi.security import HTTPAuthorizationCredentials
@@ -88,6 +88,27 @@ class SecurityBeaconRequest(BaseModel):
     details: Optional[Dict[str, Any]] = None
 
 
+def _reject_deactivated_admin(db: Session, user: User, email: str, client_ip: Optional[str]) -> None:
+    """Deactivated accounts can never complete admin sign-in, MFA enrollment or recovery-code issuance."""
+    if hasattr(user, "is_active") and not user.is_active:
+        audit = AuditLog(
+            family_id=user.family_id,
+            actor_id=user.id,
+            actor_role="admin",
+            action="admin_login_deactivated_rejected",
+            target_type="admin_console",
+            target_id=user.id,
+            ip_address=client_ip,
+            detail={"email": email, "timestamp": datetime.utcnow().isoformat()}
+        )
+        db.add(audit)
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is deactivated. Contact administration to restore access."
+        )
+
+
 # ---------------------------------------------------------------------------
 # 1. Admin Authentication
 # ---------------------------------------------------------------------------
@@ -101,6 +122,8 @@ def admin_login(request: Request, payload: AdminLoginRequest, db: Session = Depe
 
     # Reject non-allowlisted emails with generic 401 (same as invalid credentials) to prevent account enumeration
     if clean_email not in allowlist:
+        # #271: still spend one bcrypt verification so response timing does not reveal the allowlist
+        verify_password(payload.password, DUMMY_PASSWORD_HASH)
         audit = AuditLog(
             family_id=None,
             actor_id=None,
@@ -119,7 +142,13 @@ def admin_login(request: Request, payload: AdminLoginRequest, db: Session = Depe
         )
 
     user = db.query(User).filter(func.lower(User.email) == clean_email).first()
-    if not user or not user.password_hash or not verify_password(payload.password, user.password_hash):
+    if user and user.password_hash:
+        password_ok = verify_password(payload.password, user.password_hash)
+    else:
+        # #271: missing user / no password hash → same bcrypt cost as a real check (no timing oracle)
+        verify_password(payload.password, DUMMY_PASSWORD_HASH)
+        password_ok = False
+    if not user or not user.password_hash or not password_ok:
         audit = AuditLog(
             family_id=user.family_id if user else None,
             actor_id=user.id if user else None,
@@ -136,6 +165,10 @@ def admin_login(request: Request, payload: AdminLoginRequest, db: Session = Depe
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid admin credentials."
         )
+
+    # Reject deactivated admin accounts before any MFA secret is generated or committed
+    # (same 403 as parent login; runs after the password check so it is not an enumeration oracle).
+    _reject_deactivated_admin(db, user, clean_email, client_ip)
 
     from core import mfa
     # Enforce mandatory MFA for all admin accounts
@@ -235,11 +268,23 @@ def verify_admin_mfa(
     if not user.email or user.email.lower() not in allowlist:
         raise HTTPException(status_code=403, detail="Access denied: Admin privileges required")
 
-    from core import mfa
     client_ip = _client_ip(request)
+    # Account may have been deactivated during the temp token lifetime: no MFA promotion,
+    # no recovery codes and no admin_login_success for inactive users.
+    _reject_deactivated_admin(db, user, user.email.lower(), client_ip)
+
+    # #36: Per-account lockout on admin second-factor guesses (enrollment and regular branches),
+    # counted from audit_logs so it holds across serverless instances.
+    from api.auth_routes import _check_mfa_lockout
+    _check_mfa_lockout(user.id, db)
+
+    from core import mfa
 
     recovery_codes = None
     enrollment_completed = False
+    # Record only what was verified in THIS request (not the process-global timestep map)
+    mfa_method = "totp"
+    used_tc = None
 
     if token_type == "admin_mfa_enrollment" or not user.mfa_enabled:
         if not user.mfa_pending_secret:
@@ -260,6 +305,7 @@ def verify_admin_mfa(
             db.commit()
             raise HTTPException(status_code=401, detail="Invalid authentication code")
 
+        used_tc = mfa._LAST_USED_TIMESTEPS.get(user.id)
         # Promote pending secret to active and mark MFA enabled
         user.mfa_secret = user.mfa_pending_secret
         user.mfa_pending_secret = None
@@ -290,7 +336,11 @@ def verify_admin_mfa(
             db.commit()
             raise HTTPException(status_code=401, detail="Invalid authentication code")
 
-    used_tc = mfa._LAST_USED_TIMESTEPS.get(user.id)
+        if is_totp:
+            used_tc = mfa._LAST_USED_TIMESTEPS.get(user.id)
+        else:
+            mfa_method = "recovery_code"
+
     token_version = getattr(user, "token_version", 1)
     admin_token = create_access_token(
         data={"sub": user.id, "role": "admin", "email": user.email.lower(), "token_version": token_version, "is_admin": True},
@@ -305,7 +355,7 @@ def verify_admin_mfa(
         target_type="admin_console",
         target_id=user.id,
         ip_address=client_ip,
-        detail={"email": user.email, "mfa_used": True, "enrollment_completed": enrollment_completed, "totp_timestep": used_tc, "timestamp": datetime.utcnow().isoformat()}
+        detail={"email": user.email, "mfa_used": True, "mfa_method": mfa_method, "enrollment_completed": enrollment_completed, "totp_timestep": used_tc, "timestamp": datetime.utcnow().isoformat()}
     )
     db.add(audit)
     db.commit()
@@ -336,20 +386,33 @@ def get_admin_overview(admin: User = Depends(require_admin), db: Session = Depen
     total_children = db.query(User).filter(User.role == UserRole.child).count()
     total_users = total_parents + total_children
 
-    # Meeza Cards telemetry
-    total_cards = db.query(Wallet).count()
-    active_cards = db.query(Wallet).filter(Wallet.card_status == CardStatus.active).count()
-    frozen_cards = db.query(Wallet).filter(Wallet.card_status == CardStatus.frozen).count()
-    deactivated_cards = db.query(Wallet).filter(Wallet.card_status == CardStatus.deactivated).count()
+    # Meeza Cards telemetry — children's cards only (Google sign-in also creates a Wallet for parents)
+    child_wallets = db.query(Wallet).join(User, Wallet.owner_id == User.id).filter(User.role == UserRole.child)
+    total_cards = child_wallets.count()
+    active_cards = child_wallets.filter(Wallet.card_status == CardStatus.active).count()
+    frozen_cards = child_wallets.filter(Wallet.card_status == CardStatus.frozen).count()
+    deactivated_cards = child_wallets.filter(Wallet.card_status == CardStatus.deactivated).count()
 
     # System Liquidity (EGP)
     from decimal import Decimal
-    wallets_balance_sum = db.query(func.coalesce(func.sum(Wallet.balance), 0)).scalar() or 0
-    savings_balance_sum = db.query(func.coalesce(func.sum(Wallet.savings_balance), 0)).scalar() or 0
+    wallets_balance_sum = (
+        db.query(func.coalesce(func.sum(Wallet.balance), 0))
+        .join(User, Wallet.owner_id == User.id)
+        .filter(User.role == UserRole.child)
+        .scalar() or 0
+    )
+    savings_balance_sum = (
+        db.query(func.coalesce(func.sum(Wallet.savings_balance), 0))
+        .join(User, Wallet.owner_id == User.id)
+        .filter(User.role == UserRole.child)
+        .scalar() or 0
+    )
     total_system_liquidity = float(Decimal(str(wallets_balance_sum)) + Decimal(str(savings_balance_sum)))
 
     # Transactions & Purchases count
-    total_transactions = db.query(Transaction).count()
+    # Completed card purchases also write a Transaction(type=card_purchase) mirror row;
+    # exclude those so each purchase is counted once (via CardPurchase).
+    total_transactions = db.query(Transaction).filter(Transaction.type != TransactionType.card_purchase).count()
     total_card_purchases = db.query(CardPurchase).count()
 
     # Completed vs Rejected purchases
@@ -357,12 +420,10 @@ def get_admin_overview(admin: User = Depends(require_admin), db: Session = Depen
     rejected_purchases = db.query(CardPurchase).filter(CardPurchase.status == PurchaseStatus.rejected).count()
     pending_purchases = db.query(CardPurchase).filter(CardPurchase.status == PurchaseStatus.pending).count()
 
-    # Security alerts in last 24 hours (including all tampering and auth failure variants)
+    # Security alerts in last 24 hours (auth / second-factor failures actually emitted + client tampering beacons)
     since_24h = datetime.utcnow() - timedelta(hours=24)
     security_alerts_24h = db.query(AuditLog).filter(
-        (AuditLog.action.in_([
-            "login_failed", "admin_login_failed", "pin_locked", "card_frozen", "devtools_tampering_detected", "suspicious_activity"
-        ])) | (AuditLog.action.like("tampering_%")) | (AuditLog.action.like("untrusted_tampering_%")),
+        (AuditLog.action.in_(SECURITY_ALERT_ACTIONS)) | (AuditLog.action.like("untrusted_tampering_%")),
         AuditLog.created_date >= since_24h
     ).count()
 
@@ -481,13 +542,18 @@ def get_admin_transactions(
 @router.get("/cards")
 def get_admin_cards(
     status_filter: Optional[str] = Query(None),
+    search: Optional[str] = Query(None, max_length=100),
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db)
 ):
-    query = db.query(Wallet).options(
-        joinedload(Wallet.owner).joinedload(User.family)
+    # Children's Meeza cards only — parents' wallets (created by Google sign-in) are not fleet cards
+    query = (
+        db.query(Wallet)
+        .join(Wallet.owner)
+        .filter(User.role == UserRole.child)
+        .options(contains_eager(Wallet.owner).joinedload(User.family))
     )
 
     if status_filter and status_filter.lower() != "all":
@@ -499,6 +565,16 @@ def get_admin_cards(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid status filter '{status_filter}'. Allowed values: all, active, frozen, deactivated"
             )
+
+    # Server-side search (child name, family name or card number) so older cards beyond the first page
+    # can still be found and frozen. `users` is already joined above — do not join it again.
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        query = query.filter(
+            (Wallet.card_number.ilike(term)) |
+            (User.full_name.ilike(term)) |
+            (User.family.has(Family.name.ilike(term)))
+        )
 
     total = query.count()
     wallets = query.order_by(Wallet.created_date.desc()).offset(offset).limit(limit).all()
@@ -524,6 +600,8 @@ def get_admin_cards(
 
     return {
         "total": total,
+        "offset": offset,
+        "limit": limit,
         "items": items
     }
 
@@ -537,7 +615,8 @@ def update_card_status_as_admin(
     db: Session = Depends(get_db)
 ):
     wallet = db.query(Wallet).options(joinedload(Wallet.owner)).filter(Wallet.id == wallet_id).first()
-    if not wallet:
+    # Only children's cards belong to the fleet (parents' Google-created wallets are not Meeza cards)
+    if not wallet or wallet.owner is None or wallet.owner.role != UserRole.child:
         raise HTTPException(status_code=404, detail="Wallet/Card not found")
 
     old_status = wallet.card_status.value
@@ -547,7 +626,9 @@ def update_card_status_as_admin(
     client_ip = _client_ip(request) or (request.client.host if request.client else "unknown")
     target_family_id = wallet.owner.family_id if (wallet.owner and wallet.owner.family_id) else None
 
-    # Log administrative card intervention attributed to the affected family
+    # Log administrative card intervention attributed to the affected family.
+    # The row is family-visible (GET /api/audit-logs), so never store the admin's email in detail;
+    # the admin stays identified by actor_id in the admin-only security view.
     audit = AuditLog(
         family_id=target_family_id,
         actor_id=admin.id,
@@ -559,7 +640,6 @@ def update_card_status_as_admin(
         detail={
             "old_status": old_status,
             "new_status": payload.card_status.value,
-            "admin_email": admin.email,
         }
     )
     db.add(audit)
@@ -691,6 +771,20 @@ ALLOWED_BEACON_EVENTS = {
     "integrity_failure"
 }
 
+# Audit action names that are really emitted for failed / rejected authentication (passwords, child PINs,
+# deactivated accounts, parent & admin second factors). Counted by the overview "alerts_24h" tile.
+SECURITY_ALERT_ACTIONS = (
+    "login_failed",
+    "admin_login_failed",
+    "login_deactivated_rejected",
+    "admin_login_deactivated_rejected",
+    "mfa_failed",
+    "mfa_recovery_failed",
+    "google_login_mfa_failed",
+    "admin_mfa_failed",
+    "admin_mfa_enrollment_failed",
+)
+
 
 @router.post("/security/beacon")
 @limiter.limit("10/minute")
@@ -717,7 +811,9 @@ def record_security_beacon(request: Request, payload: SecurityBeaconRequest, db:
             )
         import json
         try:
-            serialized = json.dumps(payload.details)
+            # allow_nan=False: NaN/Infinity (accepted by the request JSON parser) are not valid JSON for
+            # the audit_logs.detail column and would break the admin alerts response.
+            serialized = json.dumps(payload.details, allow_nan=False)
             if len(serialized) > 4096:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,

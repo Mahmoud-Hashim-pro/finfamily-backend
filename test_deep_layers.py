@@ -1,3 +1,4 @@
+import os
 import requests
 import json
 import time
@@ -5,7 +6,15 @@ import sys
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-BASE_URL = "https://finfamily-backend.vercel.app/api"
+import pytest
+pytestmark = pytest.mark.skip(reason="Manual integration script for a deployed backend")
+
+# Manual smoke run only. Target and credentials come from the environment; never hard-code them here.
+#   FINFAMILY_SMOKE_BASE_URL  (default: local dev server)
+#   FINFAMILY_SMOKE_EMAIL / FINFAMILY_SMOKE_PASSWORD  (required, no fallback)
+BASE_URL = os.environ.get("FINFAMILY_SMOKE_BASE_URL", "http://localhost:8000/api").rstrip("/")
+SMOKE_EMAIL = os.environ.get("FINFAMILY_SMOKE_EMAIL")
+SMOKE_PASSWORD = os.environ.get("FINFAMILY_SMOKE_PASSWORD")
 
 def main():
     print("============================================================")
@@ -13,10 +22,13 @@ def main():
     print("============================================================")
 
 if __name__ == "__main__":
+    if not SMOKE_EMAIL or not SMOKE_PASSWORD:
+        sys.exit("FINFAMILY_SMOKE_EMAIL and FINFAMILY_SMOKE_PASSWORD must be set to run this smoke script.")
+
     # 1. Login parent
     login_payload = {
-        "email": "modyhashim2006@gmail.com",
-        "password": "Admin@FinFamily2026!"
+        "email": SMOKE_EMAIL,
+        "password": SMOKE_PASSWORD
     }
     res = requests.post(f"{BASE_URL}/auth/login", json=login_payload)
     assert res.status_code == 200, f"Login failed: {res.text}"

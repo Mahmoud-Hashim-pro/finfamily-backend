@@ -167,86 +167,88 @@ def test_admin_allowlist_solely_from_env():
 def test_admin_login_auth_and_no_enumeration():
     """BUG-003, BUG-126: Verify rate limiting, mandatory MFA enrollment, and generic 401 without allowlist enumeration."""
     from core.limiter import limiter
+    # Save the shared limiter flag so enabling it here never leaks into later tests
+    prev_enabled = limiter.enabled
     app.state.limiter.enabled = True
-    limiter.enabled = True
     limiter._storage.reset()
 
-    data = setup_test_data()
+    try:
+        data = setup_test_data()
 
-    # Case A: Non-allowlisted email -> 401 (NOT 403)
-    res = client.post("/api/admin/auth/login", json={
-        "email": "intruder@evil.com",
-        "password": "AnyPassword123"
-    })
-    assert res.status_code == 401, f"Expected 401, got {res.status_code}: {res.text}"
-    assert res.json()["detail"] == "Invalid admin credentials."
+        # Case A: Non-allowlisted email -> 401 (NOT 403)
+        res = client.post("/api/admin/auth/login", json={
+            "email": "intruder@evil.com",
+            "password": "AnyPassword123"
+        })
+        assert res.status_code == 401, f"Expected 401, got {res.status_code}: {res.text}"
+        assert res.json()["detail"] == "Invalid admin credentials."
 
-    # Case B: Allowlisted email with wrong password -> 401
-    res = client.post("/api/admin/auth/login", json={
-        "email": "admin@finfamily.com",
-        "password": "WrongPassword!"
-    })
-    assert res.status_code == 401, f"Expected 401, got {res.status_code}: {res.text}"
-    assert res.json()["detail"] == "Invalid admin credentials."
+        # Case B: Allowlisted email with wrong password -> 401
+        res = client.post("/api/admin/auth/login", json={
+            "email": "admin@finfamily.com",
+            "password": "WrongPassword!"
+        })
+        assert res.status_code == 401, f"Expected 401, got {res.status_code}: {res.text}"
+        assert res.json()["detail"] == "Invalid admin credentials."
 
-    # Case C: Un-enrolled admin (mfa_enabled=False) -> MUST require mandatory MFA enrollment
-    res = client.post("/api/admin/auth/login", json={
-        "email": "admin@finfamily.com",
-        "password": "AdminPass123!"
-    })
-    assert res.status_code == 200, f"Login failed: {res.text}"
-    token_data = res.json()
-    assert token_data.get("mfa_required") is True
-    assert token_data.get("mfa_enrollment_required") is True
-    assert "access_token" in token_data
-    assert "secret" in token_data
-    assert "provisioning_uri" in token_data
-    # A password alone can NEVER grant full administrative access
-    assert "admin" not in token_data
+        # Case C: Un-enrolled admin (mfa_enabled=False) -> MUST require mandatory MFA enrollment
+        res = client.post("/api/admin/auth/login", json={
+            "email": "admin@finfamily.com",
+            "password": "AdminPass123!"
+        })
+        assert res.status_code == 200, f"Login failed: {res.text}"
+        token_data = res.json()
+        assert token_data.get("mfa_required") is True
+        assert token_data.get("mfa_enrollment_required") is True
+        assert "access_token" in token_data
+        assert "secret" in token_data
+        assert "provisioning_uri" in token_data
+        # A password alone can NEVER grant full administrative access
+        assert "admin" not in token_data
 
-    # Complete mandatory enrollment via admin MFA verify endpoint
-    import pyotp
-    code = pyotp.TOTP(token_data["secret"]).now()
-    verify_res = client.post("/api/admin/auth/mfa/verify", json={
-        "temp_token": token_data["access_token"],
-        "code": code,
-    })
-    assert verify_res.status_code == 200
-    verify_data = verify_res.json()
-    assert "access_token" in verify_data
-    assert verify_data["admin"]["role"] == "admin"
-    assert "recovery_codes" in verify_data
+        # Complete mandatory enrollment via admin MFA verify endpoint
+        import pyotp
+        code = pyotp.TOTP(token_data["secret"]).now()
+        verify_res = client.post("/api/admin/auth/mfa/verify", json={
+            "temp_token": token_data["access_token"],
+            "code": code,
+        })
+        assert verify_res.status_code == 200
+        verify_data = verify_res.json()
+        assert "access_token" in verify_data
+        assert verify_data["admin"]["role"] == "admin"
+        assert "recovery_codes" in verify_data
 
-    # Case D: Admin with MFA already enabled -> returns regular mfa_required challenge
-    res = client.post("/api/admin/auth/login", json={
-        "email": "supervisor@finfamily.com",
-        "password": "SupervisorPass123!"
-    })
-    assert res.status_code == 200, f"MFA login check failed: {res.text}"
-    mfa_resp = res.json()
-    assert mfa_resp.get("mfa_required") is True
-    assert mfa_resp.get("mfa_enrollment_required") is False
-    assert "access_token" in mfa_resp
-    assert "admin" not in mfa_resp
+        # Case D: Admin with MFA already enabled -> returns regular mfa_required challenge
+        res = client.post("/api/admin/auth/login", json={
+            "email": "supervisor@finfamily.com",
+            "password": "SupervisorPass123!"
+        })
+        assert res.status_code == 200, f"MFA login check failed: {res.text}"
+        mfa_resp = res.json()
+        assert mfa_resp.get("mfa_required") is True
+        assert mfa_resp.get("mfa_enrollment_required") is False
+        assert "access_token" in mfa_resp
+        assert "admin" not in mfa_resp
 
-    # Case E: 5th attempt in same minute
-    res5 = client.post("/api/admin/auth/login", json={
-        "email": "admin@finfamily.com",
-        "password": "AdminPass123!"
-    })
-    assert res5.status_code == 200
+        # Case E: 5th attempt in same minute
+        res5 = client.post("/api/admin/auth/login", json={
+            "email": "admin@finfamily.com",
+            "password": "AdminPass123!"
+        })
+        assert res5.status_code == 200
 
-    # Case F: 6th attempt within 1 minute triggers 429 Too Many Requests (Rate limit enforced)
-    res6 = client.post("/api/admin/auth/login", json={
-        "email": "admin@finfamily.com",
-        "password": "AdminPass123!"
-    })
-    assert res6.status_code == 429, f"Expected 429 rate limit, got {res6.status_code}"
-
-    # Reset limiter for subsequent test methods
-    from core.limiter import limiter
-    limiter._storage.reset()
-    print("PASS: BUG-003 & BUG-126 - Admin login enforces auth, mandatory MFA enrollment, 5/min rate limit, and returns generic 401.")
+        # Case F: 6th attempt within 1 minute triggers 429 Too Many Requests (Rate limit enforced)
+        res6 = client.post("/api/admin/auth/login", json={
+            "email": "admin@finfamily.com",
+            "password": "AdminPass123!"
+        })
+        assert res6.status_code == 429, f"Expected 429 rate limit, got {res6.status_code}"
+        print("PASS: BUG-003 & BUG-126 - Admin login enforces auth, mandatory MFA enrollment, 5/min rate limit, and returns generic 401.")
+    finally:
+        # Reset limiter for subsequent test methods
+        limiter.enabled = prev_enabled
+        limiter._storage.reset()
 
 
 def test_admin_mfa_scenarios_and_security_guarantees():
@@ -565,15 +567,19 @@ def test_active_app_health_check():
     print("PASS: BUG-032 - Active DB health check ping executed on root endpoint.")
 
 
-def test_dynamic_app_version_endpoint():
+def test_dynamic_app_version_endpoint(monkeypatch):
     """BUG-124: Dynamic app version endpoint returns version, min_version, download URL."""
+    # Set this test's own env (restored afterwards) instead of relying on module import order
+    monkeypatch.setenv("APP_VERSION", "1.1.0")
+    monkeypatch.setenv("APP_BUILD_NUMBER", "8")
+    monkeypatch.setenv("MIN_SUPPORTED_VERSION", "1.0.0")
     # Test all aliases
     for path in ["/api/version", "/api/app/version", "/app/version"]:
         res = client.get(path)
         assert res.status_code == 200, f"Path {path} failed: {res.text}"
         body = res.json()
-        assert body["version"] in ["1.0.5", "1.0.6", "1.1.0"]
-        assert body["build"] in [6, 7, 8]
+        assert body["version"] == "1.1.0"
+        assert body["build"] == 8
         assert body["min_supported_version"] == "1.0.0"
         assert "download_url" in body
         assert "is_mandatory" in body

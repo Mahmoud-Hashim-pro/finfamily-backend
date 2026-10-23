@@ -293,6 +293,7 @@ PRIVACY_POLICY_HTML = """<!DOCTYPE html>
             <ul>
                 <li>يمكن تقديم طلب الحذف المباشر عبر إرسال بريد إلكتروني إلى فريق الدعم الفني: <a href="mailto:modyhashim2006@gmail.com">modyhashim2006@gmail.com</a>.</li>
                 <li>يتم حذف كافة السجلات والمعاملات وبيانات الحساب بصورة نهائية وغير قابلة للاسترجاع خلال 48 ساعة من تأكيد الطلب.</li>
+                <li>نحتفظ فقط بقيود تدقيق أمني مجهّلة الهوية (نوع الحدث وتوقيته) بدون أي أسماء أو عناوين بريد إلكتروني أو عناوين IP، وذلك لأغراض مكافحة الاحتيال وأمن الخدمة.</li>
             </ul>
         </div>
 
@@ -367,6 +368,7 @@ PRIVACY_POLICY_HTML = """<!DOCTYPE html>
             <ul>
                 <li>To request complete deletion of your account and all associated family and children records, email our support desk at <a href="mailto:modyhashim2006@gmail.com">modyhashim2006@gmail.com</a>.</li>
                 <li>All profile records, wallets, and transaction histories will be permanently wiped from production databases within 48 hours of verification.</li>
+                <li>We retain only minimal, de-identified security audit entries (event type and timestamp, with no names, email addresses, or IP addresses) for fraud prevention and service security.</li>
             </ul>
         </div>
 

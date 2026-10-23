@@ -8,6 +8,7 @@ from db.models import (
     User, UserRole, Wallet, Mission, MissionStatus, MissionKind,
     Transaction, TransactionDirection, TransactionType,
 )
+from services.streaks import effective_streak
 
 
 def redact_name(name: Optional[str]) -> str:
@@ -181,7 +182,7 @@ def build_child_context(db: Session, child: User) -> str:
 
     lines = [
         f"- Name: {safe_name}",
-        f"- Level {child.level}, {child.xp} XP, {child.streak}-day streak",
+        f"- Level {child.level}, {child.xp} XP, {effective_streak(child)}-day streak",
         f"- Wallet balance: {balance_desc}",
         f"- Savings reserve: {savings_desc}",
         f"- Card status: {card_status}",
@@ -233,8 +234,9 @@ def build_family_context(db: Session, parent: User) -> str:
                 )
                 .all()
             )
-            spend_total = sum(t.amount for t in debits)
-            total_savings += wallet.savings_balance if wallet.savings_balance else 0.0
+            # أعمدة Numeric بترجع Decimal — نحوّل لـ float صراحةً عشان float += Decimal بيعمل TypeError
+            spend_total = float(sum((t.amount for t in debits), 0))
+            total_savings += float(wallet.savings_balance or 0)
 
         total_spending += spend_total
 
@@ -254,7 +256,7 @@ def build_family_context(db: Session, parent: User) -> str:
         child_savings_desc = describe_savings_qualitatively(wallet.savings_balance if wallet else 0)
 
         lines.append(
-            f"  - {safe_child_name}: Level {c.level}, {c.xp} XP, {c.streak}-day streak, "
+            f"  - {safe_child_name}: Level {c.level}, {c.xp} XP, {effective_streak(c)}-day streak, "
             f"balance tier ({child_balance_desc}), savings tier ({child_savings_desc}), "
             f"spent (last 30 days) {spend_total:.0f} EGP, limits: {limits_str}, "
             f"card {wallet.card_status.value if wallet else 'n/a'} ({card_display})"

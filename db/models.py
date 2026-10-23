@@ -214,6 +214,10 @@ class Mission(Base):
     reward = Column(Numeric(12, 2), nullable=False)  # قيمة المكافأة (chore) أو التكلفة (redemption)
     due_label = Column(String, nullable=True)  # نص وصفي زي "Today" / "Tomorrow" (مش تاريخ دقيق دلوقتي)
 
+    # إثبات الطفل إنه خلّص المهمة (وصف + لينك اختياري) — بيظهر للأب في شاشة الموافقات
+    proof_text = Column(String, nullable=True)
+    proof_url = Column(String, nullable=True)
+
     reviewed_by_id = Column(String, nullable=True)
     reviewed_date = Column(DateTime, nullable=True)
     review_note = Column(String, nullable=True)

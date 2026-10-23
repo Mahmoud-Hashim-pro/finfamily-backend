@@ -49,7 +49,7 @@ functions_router = APIRouter(tags=["AI Coach & Backend Functions"])
 @functions_router.post("/ai-coach/chat", dependencies=[Depends(validate_ai_request_body_size)])
 @functions_router.post("/functions/aiCoach", dependencies=[Depends(validate_ai_request_body_size)])
 @limiter.limit("15/minute")
-async def chat_ai_coach(
+def chat_ai_coach(
     request: Request,
     chat: ChatMessage,
     user: User = Depends(get_current_user),
@@ -63,6 +63,8 @@ async def chat_ai_coach(
     - Generates context with PII redaction and qualitative balance tiers (BUG-019)
     - Multi-turn conversation history and safety guardrails (BUG-136, BUG-137)
     - 10-second provider timeout and friendly Arabic fallbacks (BUG-016, BUG-018, BUG-138)
+    - Plain `def` on purpose: FastAPI runs it in the threadpool, so the blocking DB queries and
+      OpenAI call never freeze the event loop (and the threading semaphore really bounds concurrency)
     - Supported route aliases:
         * /api/ai/coach/chat
         * /api/ai-coach/chat

@@ -56,6 +56,37 @@ def mock_verifier(token: str, client_id=None):
     raise ValueError("Invalid Google ID token signature or expired")
 
 
+class MockResponse:
+    """Stand-in for Google's tokeninfo HTTP response so the REAL verify_google_id_token runs offline."""
+    def __init__(self, data, status_code=200):
+        self._data = data
+        self.status_code = status_code
+        self.headers = {"content-type": "application/json"}
+    def json(self):
+        return self._data
+    @property
+    def text(self):
+        return str(self._data)
+
+
+def _tokeninfo_claims(**overrides):
+    """Valid tokeninfo claims for audience 'expected_client_id'; a value of None drops that claim."""
+    claims = {
+        "iss": "https://accounts.google.com",
+        "aud": "expected_client_id",
+        "exp": 9999999999,
+        "email_verified": True,
+        "email": "test@gmail.com",
+        "sub": "sub-123",
+    }
+    for key, value in overrides.items():
+        if value is None:
+            claims.pop(key, None)
+        else:
+            claims[key] = value
+    return claims
+
+
 @pytest.fixture(autouse=True)
 def setup_google_mock():
     set_mock_google_verifier(mock_verifier)
@@ -213,10 +244,73 @@ def test_google_login_deactivated_account_rejected():
 
 
 def test_google_login_unverified_email_claim_rejected():
-    """Verify token where email_verified is False is rejected."""
+    """Route passes the verifier's rejection message through as 401 (mock verifier only; the real
+    email_verified claim check is covered by test_verify_google_id_token_rejects_unverified_email and
+    test_google_login_real_verifier_rejects_unverified_email_claim below)."""
     res = client.post("/api/auth/google", json={"id_token": "token_unverified_email"})
     assert res.status_code == 401
     assert "Google email is not verified" in res.text
+
+
+def test_verify_google_id_token_rejects_unverified_email(monkeypatch):
+    """Unit test: the real verify_google_id_token rejects email_verified False / 'false' / missing."""
+    from core.google_auth import verify_google_id_token
+    import requests
+
+    set_mock_google_verifier(None)
+    try:
+        for ev in (False, "false", None):
+            claims = _tokeninfo_claims(email_verified=ev)
+            monkeypatch.setattr(requests, "get", lambda url, params, timeout, _c=claims: MockResponse(_c))
+            with pytest.raises(ValueError, match="not verified"):
+                verify_google_id_token("valid_jwt", client_id="expected_client_id")
+
+        # Positive control: the same claims with a verified email pass, so the failures above come from the email check
+        monkeypatch.setattr(requests, "get", lambda url, params, timeout: MockResponse(_tokeninfo_claims(email_verified="true")))
+        verified = verify_google_id_token("valid_jwt", client_id="expected_client_id")
+        assert verified["email"] == "test@gmail.com"
+        assert verified["sub"] == "sub-123"
+    finally:
+        set_mock_google_verifier(mock_verifier)
+
+
+def test_verify_google_id_token_rejects_expired_token(monkeypatch):
+    """Unit test: the real verify_google_id_token rejects a token whose exp is in the past."""
+    from core.google_auth import verify_google_id_token
+    import requests
+
+    set_mock_google_verifier(None)
+    try:
+        monkeypatch.setattr(requests, "get", lambda url, params, timeout: MockResponse(_tokeninfo_claims(exp=1000)))
+        with pytest.raises(ValueError, match="expired|Invalid expiration"):
+            verify_google_id_token("valid_jwt", client_id="expected_client_id")
+    finally:
+        set_mock_google_verifier(mock_verifier)
+
+
+def test_google_login_real_verifier_rejects_unverified_email_claim(monkeypatch):
+    """POST /api/auth/google runs the real claim checks: email_verified 'false' -> 401 and no account is created."""
+    import requests
+
+    email = f"unverified_{uuid.uuid4().hex[:8]}@gmail.com"
+    set_mock_google_verifier(None)
+    try:
+        # The route verifies against GOOGLE_CLIENT_ID (no explicit client_id)
+        monkeypatch.setenv("GOOGLE_CLIENT_ID", "expected_client_id")
+        monkeypatch.setattr(requests, "get", lambda url, params, timeout: MockResponse(
+            _tokeninfo_claims(email_verified="false", email=email, sub=f"sub-{email}")
+        ))
+        res = client.post("/api/auth/google", json={"id_token": "any_jwt", "create_if_missing": True})
+        assert res.status_code == 401, res.text
+        assert "Google email is not verified" in res.text
+
+        db = SessionLocal()
+        try:
+            assert db.query(User).filter(User.email == email).first() is None
+        finally:
+            db.close()
+    finally:
+        set_mock_google_verifier(mock_verifier)
 
 
 def test_verify_google_id_token_fails_closed_when_client_id_missing():
@@ -240,17 +334,6 @@ def test_verify_google_id_token_audience_mismatch_and_sub_enforcement(monkeypatc
     """Unit test: verify_google_id_token must enforce audience matching and sub identifier."""
     from core.google_auth import verify_google_id_token
     import requests
-
-    class MockResponse:
-        def __init__(self, data, status_code=200):
-            self._data = data
-            self.status_code = status_code
-            self.headers = {"content-type": "application/json"}
-        def json(self):
-            return self._data
-        @property
-        def text(self):
-            return str(self._data)
 
     set_mock_google_verifier(None)
     try:

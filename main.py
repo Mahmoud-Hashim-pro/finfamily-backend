@@ -65,7 +65,37 @@ CRITICAL_NUMERIC_COLUMNS = {
 }
 
 
-def verify_database_readiness(target_engine, is_production_mode: bool = False) -> tuple[bool, str]:
+# Alembic head المتوقع لو مقدرناش نقرا alembic/versions (لازم يتحدّث مع كل migration جديدة)
+EXPECTED_ALEMBIC_HEAD = "0003_mission_proof"
+
+# الـ revision اللي الـ startup shim بيطبّق تغييراتها كاملة، والـ revision اللي قبلها مباشرة.
+# أي migration جديدة لازم تتضاف هنا (وفي _plan_schema_compatibility) وإلا الـ shim مش هيلمس alembic_version.
+SCHEMA_SHIM_REVISION = "0003_mission_proof"
+SCHEMA_SHIM_PREVIOUS_REVISION = "0002_idemp_mfa_atomic"
+
+# الأعمدة اللي الـ shim بيضيفها (لو ناقصة فعلاً بس): table -> {column: PostgreSQL type}
+SCHEMA_SHIM_COLUMNS = {
+    "users": {"last_totp_timestep": "INTEGER"},
+    "card_purchases": {"idempotency_key": "VARCHAR(128)"},
+    "idempotency_records": {"response_id": "VARCHAR"},
+    "missions": {"proof_text": "VARCHAR", "proof_url": "VARCHAR"},
+}
+
+
+def get_codebase_alembic_heads() -> set:
+    """Head revision(s) of this codebase's Alembic scripts (empty set when alembic.ini is not deployed)."""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+    alembic_ini = os.path.abspath(os.path.join(os.path.dirname(__file__), "alembic.ini"))
+    if not os.path.exists(alembic_ini):
+        return set()
+    cfg = Config(alembic_ini)
+    # Resolve the scripts folder from this file, not from the process CWD
+    cfg.set_main_option("script_location", os.path.join(os.path.dirname(alembic_ini), "alembic"))
+    return set(ScriptDirectory.from_config(cfg).get_heads())
+
+
+def verify_database_readiness(target_engine, is_production_mode: bool = False, check_alembic_revision: bool = True) -> tuple[bool, str]:
     """
     FF-34, FF-35 & G2: Deep verification of database connectivity, schema tables, critical columns,
     fixed-point numeric data types, primary keys, unique constraints, and Alembic revision without mutating DDL.
@@ -76,12 +106,17 @@ def verify_database_readiness(target_engine, is_production_mode: bool = False) -
     4. Validation of fixed-point NUMERIC/DECIMAL types for financial columns.
     5. Presence of primary key constraints on all required domain tables.
     6. Presence of unique constraints/indexes on critical unique identifiers (users.email, idempotency_records.key).
-    7. If alembic_version is tracked, ensures the schema revision matches the expected head ('0002_idemp_mfa_atomic').
+    7. If alembic_version is tracked (and check_alembic_revision is set), ensures the schema revision matches
+       the codebase head (EXPECTED_ALEMBIC_HEAD when the scripts cannot be read).
+    target_engine may be an Engine or an already-open Connection (e.g. inside the startup compatibility transaction).
     Returns (is_ready, detail_message).
     """
+    from contextlib import nullcontext
     from sqlalchemy import text, inspect
+    from sqlalchemy.engine import Connection
     try:
-        with target_engine.connect() as conn:
+        conn_ctx = nullcontext(target_engine) if isinstance(target_engine, Connection) else target_engine.connect()
+        with conn_ctx as conn:
             conn.execute(text("SELECT 1"))
             inspector = inspect(conn)
             tables = set(inspector.get_table_names())
@@ -130,7 +165,7 @@ def verify_database_readiness(target_engine, is_production_mode: bool = False) -
                 return False, "Table 'users' is missing a unique constraint on column 'email'."
 
             # 4. Verify Alembic schema migration tracking
-            if "alembic_version" in tables:
+            if check_alembic_revision and "alembic_version" in tables:
                 rows = conn.execute(text("SELECT version_num FROM alembic_version")).fetchall()
                 applied_revs = {str(r[0]).strip() for r in rows if r and r[0]}
                 if not applied_revs:
@@ -138,22 +173,13 @@ def verify_database_readiness(target_engine, is_production_mode: bool = False) -
 
                 expected_heads = set()
                 try:
-                    import os
-                    from alembic.config import Config
-                    from alembic.script import ScriptDirectory
-                    alembic_ini = os.path.abspath(os.path.join(os.path.dirname(__file__), "alembic.ini"))
-                    if os.path.exists(alembic_ini):
-                        cfg = Config(alembic_ini)
-                        script_dir = ScriptDirectory.from_config(cfg)
-                        dynamic_heads = set(script_dir.get_heads())
-                        if dynamic_heads:
-                            expected_heads = dynamic_heads
+                    expected_heads = get_codebase_alembic_heads()
                 except Exception as ex:
                     if is_production_mode:
                         return False, f"Failed to inspect Alembic migration heads in production: {ex}"
 
                 if not expected_heads:
-                    expected_heads = {"0002_idemp_mfa_atomic"}
+                    expected_heads = {EXPECTED_ALEMBIC_HEAD}
 
                 if applied_revs != expected_heads:
                     applied_str = "', '".join(sorted(applied_revs))
@@ -163,7 +189,7 @@ def verify_database_readiness(target_engine, is_production_mode: bool = False) -
                     if expected_heads.issubset(applied_revs):
                         return False, f"Database contains extra/unknown revision(s) '{applied_str}' beyond expected codebase head(s) '{heads_str}'."
                     return False, f"Alembic applied revision(s) '{applied_str}' do not match expected codebase head(s) '{heads_str}'."
-            elif is_production_mode:
+            elif check_alembic_revision and is_production_mode:
                 return False, "Production database is missing 'alembic_version' migration tracking table."
 
         return True, "Database connectivity, critical columns, data types, constraints, and schema readiness verified."
@@ -171,23 +197,132 @@ def verify_database_readiness(target_engine, is_production_mode: bool = False) -
         return False, f"Database readiness check failed: {e}"
 
 
+def _plan_schema_compatibility(inspector) -> tuple[list[str], bool]:
+    """
+    Read-only catalog inspection (takes no locks on user tables).
+    Returns (statements, tables_present): the minimal PostgreSQL statements that bring the existing tables up to
+    SCHEMA_SHIM_REVISION, and whether every table the shim covers exists at all.
+    """
+    tables = set(inspector.get_table_names())
+    statements = []
+
+    for tbl, cols in SCHEMA_SHIM_COLUMNS.items():
+        if tbl not in tables:
+            continue
+        existing_cols = {c["name"] for c in inspector.get_columns(tbl)}
+        for col_name, col_type in cols.items():
+            if col_name not in existing_cols:
+                statements.append(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS {col_name} {col_type}")
+
+    # 0003: wallets.is_simulated backfilled to TRUE and NOT NULL with a server default
+    if "wallets" in tables:
+        simulated_col = next((c for c in inspector.get_columns("wallets") if c["name"] == "is_simulated"), None)
+        if simulated_col is None:
+            statements.append("ALTER TABLE wallets ADD COLUMN IF NOT EXISTS is_simulated BOOLEAN NOT NULL DEFAULT TRUE")
+        elif simulated_col.get("nullable", True):
+            statements.append("UPDATE wallets SET is_simulated = TRUE WHERE is_simulated IS NULL")
+            statements.append("ALTER TABLE wallets ALTER COLUMN is_simulated SET DEFAULT TRUE, ALTER COLUMN is_simulated SET NOT NULL")
+
+    # 0002/0003: lookup index on card_purchases.idempotency_key
+    if "card_purchases" in tables:
+        if not any(idx.get("column_names") == ["idempotency_key"] for idx in inspector.get_indexes("card_purchases")):
+            statements.append("CREATE INDEX IF NOT EXISTS ix_card_purchases_idempotency_key ON card_purchases (idempotency_key)")
+
+    tables_present = (set(SCHEMA_SHIM_COLUMNS) | {"wallets"}).issubset(tables)
+    return statements, tables_present
+
+
+def _model_schema_mismatches(inspector) -> list[str]:
+    """
+    Read-only parity check against db.models: tables/columns the database lacks, and fixed-point money
+    columns (Numeric) that are not NUMERIC/DECIMAL in the database (e.g. a pre-0001 FLOAT schema).
+    """
+    from sqlalchemy import Float, Numeric
+    import db.models  # noqa: F401  (بيسجّل كل الـ models في Base.metadata)
+    tables = set(inspector.get_table_names())
+    mismatches = []
+    for tbl_name, model_table in Base.metadata.tables.items():
+        if tbl_name not in tables:
+            mismatches.append(tbl_name)
+            continue
+        db_types = {c["name"]: str(c["type"]).upper() for c in inspector.get_columns(tbl_name)}
+        for col in model_table.columns:
+            if col.name not in db_types:
+                mismatches.append(f"{tbl_name}.{col.name}")
+            elif isinstance(col.type, Numeric) and not isinstance(col.type, Float):
+                if not any(t in db_types[col.name] for t in ("NUMERIC", "DECIMAL")):
+                    mismatches.append(f"{tbl_name}.{col.name} ({db_types[col.name]})")
+    return mismatches
+
+
 def ensure_schema_compatibility(target_engine):
     """
-    Non-destructive, idempotent forward schema compatibility.
-    Ensures missing critical columns from newer revisions exist without dropping data.
+    Non-destructive, idempotent forward schema compatibility (PostgreSQL only).
+    - Inspects the catalog first and returns without any DDL (and without exclusive locks) when nothing is missing.
+    - Otherwise adds only the missing columns/index and backfills wallets.is_simulated, under a short
+      lock_timeout so a cold start fails fast instead of queueing every request behind an exclusive lock.
+    - Never adds a second alembic_version row: an absent/empty table is stamped with the codebase head only when
+      the full schema passes the readiness checks; a single SCHEMA_SHIM_PREVIOUS_REVISION row is moved forward to
+      SCHEMA_SHIM_REVISION once that revision's changes are in place; any other state is left to `alembic upgrade head`.
     """
-    if target_engine.dialect.name == "postgresql":
-        from sqlalchemy import text
-        try:
-            with target_engine.begin() as conn:
-                conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_totp_timestep INTEGER;"))
-                conn.execute(text("ALTER TABLE card_purchases ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(128);"))
-                conn.execute(text("ALTER TABLE idempotency_records ADD COLUMN IF NOT EXISTS response_id VARCHAR;"))
-                conn.execute(text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL, CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num));"))
-                conn.execute(text("INSERT INTO alembic_version (version_num) VALUES ('0002_idemp_mfa_atomic') ON CONFLICT DO NOTHING;"))
-            logger.info("Database schema compatibility verified and applied successfully.")
-        except Exception as e:
-            logger.warning(f"Schema compatibility notice: {e}")
+    if target_engine.dialect.name != "postgresql":
+        return
+    from sqlalchemy import text, inspect
+    try:
+        with target_engine.begin() as conn:
+            conn.execute(text("SET LOCAL lock_timeout = '3s'"))
+            inspector = inspect(conn)
+            statements, tables_present = _plan_schema_compatibility(inspector)
+
+            version_rows = []
+            if "alembic_version" in set(inspector.get_table_names()):
+                rows = conn.execute(text("SELECT version_num FROM alembic_version")).fetchall()
+                version_rows = [str(r[0]).strip() for r in rows if r and r[0]]
+            stamp_bootstrap = not version_rows
+            stamp_forward = version_rows == [SCHEMA_SHIM_PREVIOUS_REVISION]
+
+            if not statements and not stamp_forward and not (stamp_bootstrap and tables_present):
+                logger.info("Database schema compatibility verified: nothing to apply.")
+                return
+
+            for stmt in statements:
+                conn.execute(text(stmt))
+            if statements:
+                logger.info(f"Database schema compatibility applied: {statements}")
+
+            if stamp_forward or stamp_bootstrap:
+                remaining, tables_present = _plan_schema_compatibility(inspect(conn))
+                if remaining or not tables_present:
+                    logger.warning("Schema compatibility: alembic_version left unchanged (schema shim changes are incomplete).")
+                elif stamp_forward:
+                    conn.execute(
+                        text("UPDATE alembic_version SET version_num = :new_rev WHERE version_num = :old_rev"),
+                        {"new_rev": SCHEMA_SHIM_REVISION, "old_rev": SCHEMA_SHIM_PREVIOUS_REVISION},
+                    )
+                    logger.info(f"Alembic revision moved forward: {SCHEMA_SHIM_PREVIOUS_REVISION} -> {SCHEMA_SHIM_REVISION}")
+                else:
+                    # Untracked DB: stamp only the codebase head, and only when the whole schema is really there
+                    try:
+                        heads = get_codebase_alembic_heads() or {EXPECTED_ALEMBIC_HEAD}
+                    except Exception as ex:
+                        heads = set()
+                        logger.warning(f"Schema compatibility: cannot read Alembic heads: {ex}")
+                    if heads != {SCHEMA_SHIM_REVISION}:
+                        logger.warning(f"Schema compatibility: codebase head(s) {sorted(heads)} are not {SCHEMA_SHIM_REVISION}; alembic_version not stamped.")
+                    else:
+                        is_ready, msg = verify_database_readiness(conn, is_production_mode=False, check_alembic_revision=False)
+                        mismatches = _model_schema_mismatches(inspect(conn)) if is_ready else []
+                        if not is_ready or mismatches:
+                            logger.warning(f"Schema compatibility: untracked schema is incomplete, alembic_version not stamped: {msg if not is_ready else mismatches}")
+                        else:
+                            conn.execute(text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL, CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num))"))
+                            conn.execute(
+                                text("INSERT INTO alembic_version (version_num) SELECT :rev WHERE NOT EXISTS (SELECT 1 FROM alembic_version) ON CONFLICT DO NOTHING"),
+                                {"rev": SCHEMA_SHIM_REVISION},
+                            )
+                            logger.info(f"Untracked database schema verified; Alembic revision stamped as {SCHEMA_SHIM_REVISION}.")
+    except Exception as e:
+        logger.warning(f"Schema compatibility notice: {e}")
 
 
 @asynccontextmanager
@@ -288,6 +423,13 @@ def read_root():
         content=content
     )
 
+# SHA-256 لكل APK منشور على GitHub Releases (v{version}/app-release.apk)
+RELEASE_APK_SHA256 = {
+    "1.1.4": "21408d8dcde46b0a372b0b974324e990cf252815aa6716d572168ebaf288187c",
+    "1.1.5": "41d195fb3feacc2cc00a834a41f9ac05817d128a7b0bbef5304b62e56fa8cfcc",
+}
+
+
 @app.get("/api/version")
 @app.get("/api/app/version")
 @app.get("/app/version")
@@ -305,7 +447,10 @@ def get_app_version():
         "APP_RELEASE_NOTES",
         f"إصدار رسمي v{version} (Build {build_num}): تحسينات أمان شاملة، توثيق صارم لمسارات حذف الحساب، ترقيات ذرية لرموز MFA لمنع هجمات Replay، وحماية من تكرار المعاملات المالية."
     )
-    file_hash = os.getenv("APP_SHA256", "21408d8dcde46b0a372b0b974324e990cf252815aa6716d572168ebaf288187c")
+    # FF-22: الـ hash لازم يخص نفس الإصدار اللي download_url بيشاور عليه — مش digest ثابت لإصدار قديم
+    file_hash = (os.getenv("APP_SHA256") or RELEASE_APK_SHA256.get(version) or "").strip().lower() or None
+    if file_hash is None:
+        logger.error(f"No SHA-256 configured for app version {version}: set APP_SHA256 (or add it to RELEASE_APK_SHA256). Advertising sha256=null.")
 
     return {
         "version": version,

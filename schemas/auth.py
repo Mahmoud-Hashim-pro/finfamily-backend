@@ -1,12 +1,20 @@
 from datetime import datetime
 from typing import Optional, List
 
-from pydantic import BaseModel, EmailStr, ConfigDict, Field, field_validator
+from pydantic import BaseModel, EmailStr, ConfigDict, Field, field_validator, computed_field, model_validator, AliasChoices
 
 from db.models import UserRole
+from services.streaks import effective_streak
 
 
 # ---------- Shared ----------
+
+def _apply_live_streak(source, obj):
+    # #68 / #139: الـ streak المتخزن مبيرجعش لصفر لوحده لو الطفل وقف نشاط — نرجّع القيمة الفعلية وقت القراءة
+    if hasattr(source, "last_active_date"):
+        obj.streak = effective_streak(source)
+    return obj
+
 
 class UserResponse(BaseModel):
     id: str
@@ -20,9 +28,28 @@ class UserResponse(BaseModel):
     streak: int = 0
     mfa_enabled: bool = False
     is_active: bool = True
+    # C13: الموبايل محتاج يعرف لو الحساب Google بس (مفيش باسورد) عشان يطلب تأكيد بجوجل بدل الباسورد.
+    # بيتقري من password_hash في الـ ORM ويتحول لـ bool فوراً — الـ hash نفسه عمره ما بيطلع في الرد.
+    has_password: bool = Field(default=True, validation_alias=AliasChoices("has_password", "password_hash"))
     created_date: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("has_password", mode="before")
+    @classmethod
+    def _password_hash_to_flag(cls, v):
+        return bool(v)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _live_streak(cls, data, handler):
+        return _apply_live_streak(data, handler(data))
+
+    # C9 / #39: الموبايل بيقرا 'avatar' — نفس قيمة avatar_url (الإيموجي بتاع الطفل)
+    @computed_field
+    @property
+    def avatar(self) -> Optional[str]:
+        return self.avatar_url
 
 
 class TokenResponse(BaseModel):
@@ -57,7 +84,7 @@ class ParentRegister(BaseModel):
 class ParentLogin(BaseModel):
     email: EmailStr = Field(max_length=255)
     password: str = Field(min_length=1, max_length=72)
-    otp_code: Optional[str] = Field(default=None, max_length=16)       # كود TOTP عادي من تطبيق الـ Authenticator
+    otp_code: Optional[str] = Field(default=None, max_length=64)       # كود TOTP عادي من تطبيق الـ Authenticator (أو كود استرجاع XXXX-XXXX-XXXX-XXXX — C1)
     recovery_code: Optional[str] = Field(default=None, max_length=64)  # بديل لو فقد جهاز الـ Authenticator (زي "7K4M-QX2P-...")
 
     @field_validator("email", mode="before")
@@ -84,7 +111,7 @@ class ParentLoginResult(BaseModel):
 class GoogleLoginRequest(BaseModel):
     id_token: str = Field(min_length=1, description="Cryptographically signed Google ID Token")
     family_name: Optional[str] = Field(default=None, max_length=100)
-    otp_code: Optional[str] = Field(default=None, max_length=10, description="Optional TOTP code if MFA enabled")
+    otp_code: Optional[str] = Field(default=None, max_length=64, description="Optional TOTP code or recovery code (XXXX-XXXX-XXXX-XXXX) if MFA enabled")
     create_if_missing: Optional[bool] = Field(default=True, description="Whether to automatically register if user does not exist")
     # The fields below may be sent by client wrappers but are ignored by backend authentication
     email: Optional[EmailStr] = None
@@ -111,7 +138,7 @@ class GoogleAuthRequest(BaseModel):
 
 class MfaVerifyRequest(BaseModel):
     temp_token: str = Field(min_length=1, max_length=2048)
-    code: str = Field(min_length=6, max_length=16)
+    code: str = Field(min_length=6, max_length=64)  # 6-digit TOTP or recovery code (XXXX-XXXX-XXXX-XXXX, dashes optional) — C1
 
 
 # ---------- MFA (الأب بس) ----------
@@ -127,7 +154,9 @@ class MfaSetupResponse(BaseModel):
 
 
 class MfaSetupRequest(BaseModel):
-    password: str = Field(min_length=1, max_length=72)
+    # C13: الحسابات اللي مالهاش باسورد (Google بس) بتبعت google_id_token بدل الباسورد
+    password: Optional[str] = Field(default=None, min_length=1, max_length=72)
+    google_id_token: Optional[str] = Field(default=None, max_length=4096)
 
 
 class MfaEnableRequest(BaseModel):
@@ -135,7 +164,8 @@ class MfaEnableRequest(BaseModel):
 
 
 class MfaDisableRequest(BaseModel):
-    password: str = Field(min_length=1, max_length=72)  # تأكيد بالباسورد الحالي
+    password: Optional[str] = Field(default=None, min_length=1, max_length=72)  # تأكيد بالباسورد الحالي
+    google_id_token: Optional[str] = Field(default=None, max_length=4096)  # C13: بديل الباسورد لحساب Google بس
     code: Optional[str] = Field(default=None, max_length=16)  # TOTP code second factor (BUG-116)
     recovery_code: Optional[str] = Field(default=None, max_length=64)  # Recovery code alternative (BUG-116)
 
@@ -169,7 +199,7 @@ class ForgotPasswordResponse(BaseModel):
 
 
 class ResetPasswordRequest(BaseModel):
-    token: str = Field(min_length=1, max_length=255)
+    token: str = Field(min_length=1, max_length=2048)  # C12: الكود نفسه أو اللينك كله لو الأب لصقه
     new_password: str = Field(min_length=8, max_length=72)
 
     @field_validator("new_password", mode="after")
@@ -181,7 +211,9 @@ class ResetPasswordRequest(BaseModel):
 
 
 class ChangePasswordRequest(BaseModel):
-    current_password: str = Field(min_length=1, max_length=72)
+    # C13: حساب Google بس يقدر يحط أول باسورد بعد تأكيد بـ google_id_token بدل current_password
+    current_password: Optional[str] = Field(default=None, min_length=1, max_length=72)
+    google_id_token: Optional[str] = Field(default=None, max_length=4096)
     new_password: str = Field(min_length=8, max_length=72)
 
     @field_validator("new_password", mode="after")
@@ -197,6 +229,7 @@ class ChangePasswordRequest(BaseModel):
 class ChildCreate(BaseModel):
     full_name: str = Field(min_length=1, max_length=100)
     pin: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")  # 6 أرقام بالظبط — 4 كانت ضعيفة لتطبيق فيه فلوس
+    avatar: Optional[str] = Field(default=None, max_length=16)  # C9: إيموجي الطفل (بيتخزن في avatar_url)
 
 
 class ChildResetPinRequest(BaseModel):
@@ -216,6 +249,17 @@ class ChildSummary(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+    @model_validator(mode="wrap")
+    @classmethod
+    def _live_streak(cls, data, handler):
+        return _apply_live_streak(data, handler(data))
+
+    # C9 / #39: نفس avatar_url تحت الاسم اللي الموبايل بيقراه
+    @computed_field
+    @property
+    def avatar(self) -> Optional[str]:
+        return self.avatar_url
+
 
 class ChildPublicSummary(BaseModel):
     id: str
@@ -223,6 +267,12 @@ class ChildPublicSummary(BaseModel):
     avatar_url: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+    # C9 / #39: نفس avatar_url تحت الاسم اللي الموبايل بيقراه
+    @computed_field
+    @property
+    def avatar(self) -> Optional[str]:
+        return self.avatar_url
 
 
 class FamilyChildrenResponse(BaseModel):

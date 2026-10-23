@@ -585,11 +585,11 @@ def test_full_cycle_lifecycle():
     print("  ✅ Daily anti-cheat guard confirmed: Duplicate completion awarded 0 additional coins/XP")
 
     # Educational lesson completion
-    lesson_res = client.post("/api/lessons/complete", json={"lesson_id": "budgeting_basics"}, headers=child_headers)
+    lesson_res = client.post("/api/lessons/complete", json={"lesson_id": "les_3"}, headers=child_headers)
     assert lesson_res.status_code == 200
     completed_lessons = client.get("/api/lessons/completed", headers=child_headers).json()
-    assert "budgeting_basics" in completed_lessons
-    print("  ✅ Lesson 'budgeting_basics' recorded in completed lessons list")
+    assert "les_3" in completed_lessons
+    print("  ✅ Lesson 'les_3' recorded in completed lessons list")
 
     # Check badges
     badges_res = client.get("/api/badges/mine", headers=child_headers)

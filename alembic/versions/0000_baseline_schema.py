@@ -136,7 +136,7 @@ def upgrade() -> None:
             if 'card_theme' not in existing_cols:
                 batch_op.add_column(sa.Column('card_theme', sa.String(), default='blue'))
             if 'is_simulated' not in existing_cols:
-                batch_op.add_column(sa.Column('is_simulated', sa.Boolean(), default=True))
+                batch_op.add_column(sa.Column('is_simulated', sa.Boolean(), server_default='1', default=True, nullable=False))
             if 'updated_date' not in existing_cols:
                 batch_op.add_column(sa.Column('updated_date', sa.DateTime(), nullable=True))
 

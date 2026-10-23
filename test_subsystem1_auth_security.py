@@ -95,7 +95,8 @@ def test_bug_002_and_006_admin_email_registration_blocked():
         }
         res = client.post("/api/auth/register", json=payload)
         assert res.status_code == 400, f"Expected 400 for {email}, got {res.status_code}: {res.text}"
-        assert "Admin email reserved" in res.json().get("detail", "")
+        # #271: same response as any already-registered address, so the admin allowlist cannot be enumerated
+        assert res.json().get("detail", "") == "Email already registered"
     print("PASS: BUG-002 & BUG-006")
 
 
@@ -347,6 +348,11 @@ def test_bug_057_child_pin_reset_and_account_deletion():
     # Verify child is deleted
     res = client.post("/api/auth/child/login", json={"family_code": family_code, "child_id": child_id, "pin": "222222"})
     assert res.status_code in (401, 404)
+
+    # Wrong password confirmation is rejected (the account survives, so the real delete below still succeeds)
+    res = client.delete("/api/auth/account", headers={**headers, "X-Confirm-Password": "WrongPassword123!"})
+    assert res.status_code == 401, res.text
+    assert res.json()["detail"] == "Invalid password confirmation"
 
     # Delete account (with mandatory password confirmation)
     res = client.delete("/api/auth/account", headers={**headers, "X-Confirm-Password": "Password123!"})

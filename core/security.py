@@ -53,6 +53,12 @@ def verify_password(plain_password: str, password_hash: str) -> bool:
     return pwd_context.verify(plain_password, password_hash)
 
 
+# BUG-113 (P2) & #271: Constant-time dummy hash — any login path (parent or admin) that has no real
+# hash to check (unknown email / missing user / no password) must still run one bcrypt verification
+# against this hash so response timing does not reveal which accounts exist.
+DUMMY_PASSWORD_HASH = hash_password("dummy_password_for_constant_timing_check_123")
+
+
 # ---------- PIN (child) ----------
 # بنستخدم نفس الـ hashing algorithm بتاع الباسورد — الـ PIN قصير (4 أو 6 أرقام) بس
 # bcrypt برضه بيحميه كويس من أي حد يقرا الداتابيز مباشرة.

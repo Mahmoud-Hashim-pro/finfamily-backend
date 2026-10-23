@@ -5,3 +5,11 @@ __pycache__
 .env.*
 .git
 .pytest_cache
+.venv
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+release_artifacts
+test_*.py
+.github

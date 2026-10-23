@@ -25,9 +25,14 @@ load_dotenv(override=False)
 raw_key = os.getenv("OPENAI_API_KEY")
 api_key = raw_key.strip() if raw_key else None
 
-# BUG-018: Strict 10.0s timeout and bounded concurrency for OpenAI provider calls
-http_client = httpx.Client(timeout=httpx.Timeout(10.0, connect=5.0, read=10.0, write=10.0))
-client = OpenAI(api_key=api_key, http_client=http_client, timeout=10.0) if api_key else None
+# BUG-018: Strict 10s provider budget (2s connect + 8s read) and bounded concurrency for OpenAI calls.
+# max_retries=0: the SDK default (2 retries + backoff, honouring Retry-After) pushed a hung provider to ~31s,
+# beyond Vercel maxDuration (15s), so the friendly fallback replies never reached the user.
+# Worst case: semaphore wait (2s) + connect (2s) + read (8s) ≈ 12s < 15s.
+AI_PROVIDER_TIMEOUT = httpx.Timeout(8.0, connect=2.0)
+AI_SEMAPHORE_WAIT_SECONDS = 2.0
+http_client = httpx.Client(timeout=AI_PROVIDER_TIMEOUT)
+client = OpenAI(api_key=api_key, http_client=http_client, timeout=AI_PROVIDER_TIMEOUT, max_retries=0) if api_key else None
 
 AI_CONCURRENCY_LIMIT = 10
 _ai_semaphore = threading.BoundedSemaphore(AI_CONCURRENCY_LIMIT)
@@ -153,9 +158,16 @@ def moderate_message(message: str, mode: str = "child") -> ModerationResult:
 
     # 2. Violence, Weapons, Hate, Bullying, Drugs
     harm_patterns = [
-        r'\b(سلاح|مسدس|بندقية|قنبلة|تفجير|إرهاب|ارهاب|قتل|اغتيال|مخدرات|حشيش|كوكايين|هيروين|سرقة|اختراق|قرصنة)\b',
-        r'\b(gun|bomb|weapon|assault|kill|murder|drugs|cocaine|weed|steal|theft|hack|bypass)\b',
+        r'\b(سلاح|مسدس|بندقية|قنبلة|تفجير|إرهاب|ارهاب|قتل|اغتيال|مخدرات|حشيش|كوكايين|هيروين)\b',
+        r'\b(gun|bomb|weapon|assault|kill|murder|drugs|cocaine|weed)\b',
     ]
+    # Theft / hacking words are blocked for children only: for parents they are exactly the
+    # fraud and card-security topics Coach Nour is instructed to cover (PARENT_PROMPT).
+    if mode != "parent":
+        harm_patterns += [
+            r'\b(سرقة|اختراق|قرصنة)\b',
+            r'\b(steal|theft|hack|bypass)\b',
+        ]
     for pattern in harm_patterns:
         if re.search(pattern, text_lower, re.IGNORECASE):
             refusal = (
@@ -180,10 +192,19 @@ def moderate_message(message: str, mode: str = "child") -> ModerationResult:
             return ModerationResult(is_safe=False, reason="gambling_prevention", refusal_message=refusal)
 
     # 4. PII and Credentials Protection (passwords, PINs, OTPs, Card numbers)
-    credentials_patterns = [
-        r'\b(كلمة سر|كلمة السر|باسورد|رقم سري|الرقم السري|البين كود|رمز التحقق|cvv|otp|pin code)\b',
-        r'\b(password|pin|cvv|otp|secret key)\b',
-    ]
+    if mode == "parent":
+        # Parents: flag actual credential sharing (keyword followed by a value), not bare mentions,
+        # so safety questions like "how do I protect my kid's card PIN?" still reach the coach.
+        credentials_patterns = [
+            r'\b(password|passcode|pin(?: code)?|cvv|otp|secret key)\b\s*(?:[:=]\s*\S+|(?:is|was)\s+\S*\d)',
+            r'\b(pin|cvv|otp)\b[^\d\n]{0,12}\d{3,8}\b',
+            r'(كلمة سر|كلمة السر|باسورد|رقم سري|الرقم السري|البين كود|رمز التحقق)\s*(?:[:=]\s*\S+|[^\d\n]{0,12}\d{3,})',
+        ]
+    else:
+        credentials_patterns = [
+            r'\b(كلمة سر|كلمة السر|باسورد|رقم سري|الرقم السري|البين كود|رمز التحقق|cvv|otp|pin code)\b',
+            r'\b(password|pin|cvv|otp|secret key)\b',
+        ]
     for pattern in credentials_patterns:
         if re.search(pattern, text_lower, re.IGNORECASE):
             refusal = (
@@ -229,13 +250,23 @@ def _format_history_messages(history: Optional[List[Any]]) -> List[Dict[str, str
     for item in history[-10:]:
         role = "user"
         content = ""
+        # Text extraction matches HistoryItem.get_text() and the size validator (content / text / message)
         if isinstance(item, dict):
             r = item.get("role", "user")
-            content = item.get("content") or item.get("text") or ""
+            content = item.get("content") or item.get("text") or item.get("message") or ""
+            role = "assistant" if r in ("assistant", "ai", "bot", "coach", "finbuddy") else "user"
+        elif isinstance(item, HistoryItem):
+            r = item.role
+            content = item.get_text()
             role = "assistant" if r in ("assistant", "ai", "bot", "coach", "finbuddy") else "user"
         elif hasattr(item, "role"):
             r = getattr(item, "role", "user")
-            content = getattr(item, "content", None) or getattr(item, "text", "") or ""
+            content = (
+                getattr(item, "content", None)
+                or getattr(item, "text", None)
+                or getattr(item, "message", None)
+                or ""
+            )
             role = "assistant" if r in ("assistant", "ai", "bot", "coach", "finbuddy") else "user"
 
         clean_content = str(content).strip()
@@ -284,8 +315,8 @@ def get_ai_response(chat_data: ChatMessage, context: str, child_name: str = "the
     clean_user_message = redact_sensitive_text(chat_data.message)
     messages.append({"role": "user", "content": f"{user_prefix}{clean_user_message}"})
 
-    # 5. Concurrency bounding and execution with 10s timeout (BUG-018)
-    acquired = _ai_semaphore.acquire(timeout=5.0)
+    # 5. Concurrency bounding and execution with 10s provider budget, no retries (BUG-018)
+    acquired = _ai_semaphore.acquire(timeout=AI_SEMAPHORE_WAIT_SECONDS)
     if not acquired:
         logger.warning("AI Coach concurrency capacity saturated")
         if chat_data.mode == "parent":
@@ -298,7 +329,7 @@ def get_ai_response(chat_data: ChatMessage, context: str, child_name: str = "the
             messages=messages,
             max_tokens=250,
             temperature=0.7,
-            timeout=10.0,   # BUG-018: Strict 10-second timeout
+            timeout=AI_PROVIDER_TIMEOUT,   # BUG-018: Strict 10-second budget (2s connect + 8s read)
         )
         raw_reply = response.choices[0].message.content or ""
 
