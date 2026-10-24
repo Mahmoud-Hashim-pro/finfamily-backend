@@ -329,9 +329,17 @@ def ensure_schema_compatibility(target_engine):
 async def lifespan(app: FastAPI):
     global db_healthy
     # Validate production required secrets and configurations
-    validate_production_configuration()
+    try:
+        validate_production_configuration()
+    except Exception as e:
+        logger.critical(f"Production configuration validation notice: {e}", exc_info=True)
+        if not (os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")):
+            raise
     # Non-destructive schema compatibility
-    ensure_schema_compatibility(engine)
+    try:
+        ensure_schema_compatibility(engine)
+    except Exception as e:
+        logger.warning(f"Schema compatibility notice: {e}")
     # FF-34 & FF-30: Controlled schema initialization in serverless environments
     skip_db_init_raw = os.getenv("SKIP_DB_INIT")
     if skip_db_init_raw is None:

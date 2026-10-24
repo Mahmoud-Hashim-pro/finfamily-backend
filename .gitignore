@@ -5,3 +5,5 @@ __pycache__/
 .env
 release_artifacts/
 *.db
+*.db-shm
+*.db-wal
