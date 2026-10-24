@@ -418,7 +418,7 @@ def read_root():
             current_health = True
             db_healthy = True
 
-    status_str = "healthy" if (current_health and is_live) else "unhealthy"
+    status_str = "healthy" if (current_health and is_live) else ("degraded" if is_live else "unhealthy")
     from fastapi.responses import JSONResponse
     content = {
         "status": status_str,
@@ -427,7 +427,7 @@ def read_root():
         "version": os.getenv("APP_VERSION", "1.1.8")
     }
     return JSONResponse(
-        status_code=200 if status_str == "healthy" else 503,
+        status_code=200 if is_live else 503,
         content=content
     )
 
